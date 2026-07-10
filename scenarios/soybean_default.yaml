@@ -1,0 +1,111 @@
+# DTDC Simulator — first-estimate scenario (soybean base case)
+# Companion to DTDC_Simulator_BuildSpec.md. Units are SI.
+#
+# Material physical properties (GAB isotherm, latent heats, densities, ...)
+# live in properties/soybean.yaml (BuildSpec §11: "one file per material
+# property set under properties/"), resolved automatically from `material:`
+# below. This file binds that property set to geometry + model params +
+# operating/disturbance defaults + sim config, per §11's scenario-file shape.
+#
+# PROVENANCE TAGS (read before trusting any number):
+#   [PAPER]  taken from a cited paper's stated value or base case
+#   [DERIVED] computed from other [PAPER] values or standard correlations
+#   [PLACE]  order-of-magnitude PLACEHOLDER — must be calibrated before quantitative use
+#   [STD]    standard/handbook physical constant
+#
+# Primary sources:
+#   Coletto, Bandoni & Blanco (2022) J. Food Eng. 318, 110870   -> geometry, base operating point, C0/C1, correlations
+#   Chen et al. (2014) Food Chem. 154, 108                      -> TIA biexponential inactivation basis
+
+material: soybean
+
+# ------------------------------------------------------------------ geometry
+# Coletto base case: 6 trays x 4 m dia; 3 pre-desolv (0.3 m), tray4 1.0 m, trays5-6 0.6 m.
+# DC (dryer/cooler) stages appended (not in Coletto) as first-estimate.
+geometry:
+  stages:
+    - {id: PD1, role: PREDESOLV, diameter_m: 4.0, bed_height_m: 0.30}   # [PAPER]
+    - {id: PD2, role: PREDESOLV, diameter_m: 4.0, bed_height_m: 0.30}   # [PAPER]
+    - {id: PD3, role: PREDESOLV, diameter_m: 4.0, bed_height_m: 0.30}   # [PAPER]
+    - {id: MN1, role: MAIN,      diameter_m: 4.0, bed_height_m: 1.00}   # [PAPER] tray4 (FTRZ starts here)
+    - {id: MN2, role: MAIN,      diameter_m: 4.0, bed_height_m: 0.60}   # [PAPER] tray5
+    - {id: SP1, role: SPARGE,    diameter_m: 4.0, bed_height_m: 0.60}   # [PAPER] tray6 (direct steam)
+    - {id: DR1, role: DRYER,     diameter_m: 3.0, bed_height_m: 0.50}   # [PLACE]
+    - {id: CL1, role: COOLER,    diameter_m: 3.0, bed_height_m: 0.50}   # [PLACE]
+
+# ------------------------------------------------------------------ model params
+model:
+  D_eff: 1.0e-9               # m2/s  [PLACE] intraparticle hexane diffusivity (Cardarelli 2002 range 1e-10..1e-8)
+  D_ax:  1.0e-4               # m2/s  [PLACE] axial dispersion (bed scale)
+  n_particle_layers: 12       # -     [PAPER] Coletto uses 12 spherical FVM shells
+  nz_per_zone: 20             # -     [PLACE] axial cells per zone per tray
+  D_HW: 1.0e-5               # m2/s  [PLACE] hexane-water gas diffusivity for Schmidt no. (B.10)
+  htc_correlation: {form: faner, c: 0.6949, m: 0.579, n: 0.3333}  # [PAPER] Nu=0.6949 Re^0.579 Pr^(1/3) (B.7)
+  # DT fixed-point sweep controls (§7.8)
+  outer_relaxation: 0.5       # [PLACE] under-relaxation
+  outer_tol: 1.0e-5           # [PLACE]
+  outer_max_iter: 100         # [PLACE]
+  # TIA biexponential + protein denaturation (Chen 2014 basis) — Arrhenius
+  tia_k0_1: 1.0e10            # 1/s   [PLACE]
+  tia_Ea_1: 9.0e4            # J/mol [PLACE] ~90 kJ/mol
+  tia_k0_2: 1.0e8            # 1/s   [PLACE]
+  tia_Ea_2: 7.5e4            # J/mol [PLACE]
+  tia_A_fraction: 0.6         # -     [PLACE] fast-inhibitor fraction
+  denat_k0: 1.0e12           # 1/s   [PLACE]
+  denat_Ea: 1.1e5            # J/mol [PLACE] ~110 kJ/mol (protein/lysine sensitive)
+  denat_moisture_cap: 0.30    # kg/kg [PAPER] moisture influence saturates ~0.30
+  sweep_arm_transfer_gain: 0.2   # [PLACE] hQ/hM sensitivity to sweep-arm speed (renamed from agitator)
+
+# ---------------------------------------------------- operating defaults (HOT seeds)
+# Coletto base case direction: feed ~26% solvent, ~35% at rotary lock; steam split DT.
+operating_defaults:
+  feed_flow_rate: 25.0        # kg/s dry solid  [PLACE] (scale to your throughput)
+  feed_temperature: 330.0     # K  [PLACE] meal from extractor ~57 C
+  indirect_steam:             # W per DT tray (jacket duty)  [PLACE]
+    PD1: 4.0e5
+    PD2: 4.0e5
+    PD3: 4.0e5
+    MN1: 1.2e6
+    MN2: 8.0e5
+    SP1: 4.0e5
+  direct_steam:               # kg/s sparge steam  [PLACE]
+    SP1: 1.5
+  sweep_arm_speed:            # rpm  [PLACE] central-shaft sweep/rake arms (NOT agitation)
+    PD1: 3.0
+    PD2: 3.0
+    PD3: 3.0
+    MN1: 3.0
+    MN2: 3.0
+    SP1: 3.0
+  gate_opening:               # 0-100 % level/discharge gate per stage  [PLACE]
+    PD1: 50
+    PD2: 50
+    PD3: 50
+    MN1: 50
+    MN2: 50
+    SP1: 50
+  heated_air_temp: 380.0      # K  [PLACE] dryer inlet air
+  heated_air_flow: 5.0        # kg/s  [PLACE]
+  ambient_air_temp: 298.0     # K  [PLACE] cooler inlet air
+  ambient_air_flow: 8.0       # kg/s  [PLACE]
+
+# --------------------------------------------------- disturbance defaults (HOT seeds)
+disturbance_defaults:
+  feed_moisture: 0.12         # kg/kg dry solid  [PAPER-ish] ~12% incoming
+  feed_hexane:   0.26         # kg/kg dry solid  [PAPER] ~26% solvent entering DT
+  ambient_temp:  298.0        # K  [PLACE]
+  ambient_humidity: 0.010     # kg/kg  [PLACE]
+
+# ------------------------------------------------------------------ simulation
+sim:
+  speed_factor: 1.0           # 1x real time
+  dt_wall_s: 0.2              # [PLACE] wall tick (keep small; see §8.4 undersampling)
+  max_control_interval_s: 10.0 # [PLACE] set to <= your APC sample time
+  clock: realtime             # realtime | freerun
+
+# ------------------------------------------------------------- validation targets
+# Expected qualitative behavior to check against (Coletto 2022), not inputs:
+#   residual hexane in meal:  DCZ inlet ~4000 ppm  ->  outlet ~100 ppm
+#   FTRZ thickness:           order of cm (< a few cm)
+#   meal moisture after DC:   < ~12 %
+#   protein solubility (KOH):  ~78-85 % (drops <70-72% if over-processed)

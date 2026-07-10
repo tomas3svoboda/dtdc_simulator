@@ -1,0 +1,52 @@
+# Soybean material property set — BuildSpec §11: "one file per material
+# property set under properties/". Referenced by a scenario file's top-level
+# `material: soybean` key (dtdc_simulator.config.loader resolves
+# properties/<material>.yaml automatically when a scenario has no inline
+# `physical:` block).
+#
+# PROVENANCE TAGS (read before trusting any number):
+#   [PAPER]  taken from a cited paper's stated value or base case
+#   [DERIVED] computed from other [PAPER] values or standard correlations
+#   [PLACE]  order-of-magnitude PLACEHOLDER — must be calibrated before quantitative use
+#   [STD]    standard/handbook physical constant
+#
+# Primary sources:
+#   Coletto, Bandoni & Blanco (2022) J. Food Eng. 318, 110870   -> geometry, base operating point, C0/C1, correlations
+#   Cardarelli & Crapiste (1996) JAOCS 73(12) 1657              -> GAB isotherm + oil power-law structure (soybean)
+#   Cardarelli, Crapiste & Mattea (2002) J. Food Eng. 52, 127   -> DCZ dual-scale basis, D_eff/D_ax ranges
+# NOTE: several isotherm/kinetic coefficients are not printed as plain numbers in the
+#       sources; those are tagged [PLACE] and MUST be fitted to the source curves/tables.
+
+material_name: soybean
+
+# latent heats
+dH_vap_hexane: 3.34e5        # J/kg  [STD] n-hexane at bp
+dH_vap_water:  2.26e6        # J/kg  [STD] water at 100 C
+T_boil_hexane: 341.9         # K     [STD] 68.7 C at 1 atm
+# densities
+rho_solid:   1250.0          # kg/m3 [PLACE] dry meal solids
+rho_ps:      1250.0          # kg/m3 [PLACE] particle solid-phase density
+rho_vapor_ref: 0.6           # kg/m3 [DERIVED] steam/hexane mix near 1 atm, ~373 K
+rho_hexane_liquid_ref: 615.0 # kg/m3 [DERIVED] Daubert-Danner B.11-B.12 near bp
+# specific heats
+cp_solid:        1800.0      # J/kgK [PLACE] dry oilseed meal
+cp_vapor:        2000.0      # J/kgK [PLACE] steam/hexane vapor mix
+cp_water_liquid: 4186.0      # J/kgK [STD]
+cp_oil:          2000.0      # J/kgK [PLACE] soybean oil
+# porosity / volume fractions
+bed_porosity:      0.45      # -     [PLACE] eps_b
+particle_porosity: 0.40      # -     [PLACE] eps_p
+alpha_ps:          0.55      # -     [PLACE] particle solid volume fraction (=1-eps_p)
+alpha_pg:          0.40      # -     [PLACE] particle pore-gas volume fraction
+particle_radius:   1.5e-3    # m     [PLACE] rP (flake/collet effective radius)
+oil_fraction:      0.01      # kg/kg [PAPER-ish] residual oil in meal (X3), ~1% after extraction
+# heat of sorption  dH_s = dH_lv2 + C0 * W2^C1   (A.31)
+sorption_C0: 3.0e5           # [PLACE] soybean; fit to Cardarelli 1998 / Faner 2008
+sorption_C1: -0.5            # [PLACE] soybean; fit to source
+# GAB isotherm (solid-phase hexane), W2_eq = GAB(ah,T)  — fit to Cardarelli&Crapiste 1996 soybean
+gab_params: {Xm: 0.05, C: 10.0, K: 0.9, temp_dependence: linear}   # [PLACE] all — FIT REQUIRED
+# hexane-in-oil power law  qo = A0 * ah^B   (eq. 7, oil basis)
+oil_isotherm: {A0: 0.8, B: 1.0}   # [PLACE] fit to Cardarelli&Crapiste 1996
+# Antoine (log10 P[bar] = A - B/(C+T[K])) — support for VLLE/dew point
+antoine_hexane: {A: 4.00266, B: 1171.53, C: -48.784}   # [STD] NIST n-hexane
+antoine_water:  {A: 5.11564, B: 1687.54, C: -42.98}    # [STD] NIST water

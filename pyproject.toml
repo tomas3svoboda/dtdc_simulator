@@ -1,0 +1,42 @@
+[project]
+name = "dtdc-simulator"
+version = "0.1.0"
+description = "Soft real-time dynamic simulator of a Desolventizer-Toaster-Dryer-Cooler (DTDC)"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy",
+    "scipy",
+    "pydantic>=2",
+    "pyyaml",
+    "asyncua",
+    "nicegui",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "black",
+]
+
+[project.scripts]
+dtdc-sim = "dtdc_simulator.main:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.black]
+line-length = 100
+target-version = ["py314"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

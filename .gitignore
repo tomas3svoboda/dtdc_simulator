@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Third-party copyrighted journal articles — keep local only, do not publish.
+literature_sources/
