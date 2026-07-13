@@ -7,7 +7,9 @@ dataclasses and computes the initial condition.
 
 from __future__ import annotations
 
-from dtdc_simulator.config.schema import ScenarioConfig
+import math
+
+from dtdc_simulator.config.schema import AntoineParams, ScenarioConfig
 from dtdc_simulator.core.model import (
     Model,
     ModelConstants,
@@ -16,6 +18,13 @@ from dtdc_simulator.core.model import (
     StageSpec,
     State,
 )
+
+_ATM_PRESSURE_BAR = 1.01325
+
+
+def _antoine_boiling_point_k(antoine: AntoineParams, p_bar: float = _ATM_PRESSURE_BAR) -> float:
+    """Solve `log10(P) = A - B/(C+T)` for T at the given pressure (K)."""
+    return antoine.B / (antoine.A - math.log10(p_bar)) - antoine.C
 
 
 def assemble_model(config: ScenarioConfig) -> tuple[Model, State]:
@@ -32,7 +41,13 @@ def assemble_model(config: ScenarioConfig) -> tuple[Model, State]:
         dH_vap_hexane=config.physical.dH_vap_hexane,
         dH_vap_water=config.physical.dH_vap_water,
         T_boil_hexane=config.physical.T_boil_hexane,
+        T_boil_water=_antoine_boiling_point_k(config.physical.antoine_water),
         cp_solid=config.physical.cp_solid,
+        cp_water_liquid=config.physical.cp_water_liquid,
+        cp_oil=config.physical.cp_oil,
+        oil_fraction=config.physical.oil_fraction,
+        rho_solid=config.physical.rho_solid,
+        bed_porosity=config.physical.bed_porosity,
         tia_k0_1=config.model.tia_k0_1,
         tia_Ea_1=config.model.tia_Ea_1,
         tia_k0_2=config.model.tia_k0_2,
@@ -42,10 +57,14 @@ def assemble_model(config: ScenarioConfig) -> tuple[Model, State]:
         denat_Ea=config.model.denat_Ea,
         denat_moisture_cap=config.model.denat_moisture_cap,
     )
-    model = Model(stages=stages, constants=constants)
+    model = Model(
+        stages=stages,
+        constants=constants,
+        base_residence_s=config.model.base_residence_s,
+    )
 
     seed = OperatingSeed(
-        feed_temperature=config.operating_defaults.feed_temperature,
+        feed_temperature=config.disturbance_defaults.feed_temperature,
         feed_moisture=config.disturbance_defaults.feed_moisture,
         feed_hexane=config.disturbance_defaults.feed_hexane,
     )

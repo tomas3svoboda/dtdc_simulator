@@ -16,7 +16,7 @@ def _default_inputs(cfg):
     dd = cfg.disturbance_defaults
     return Inputs(
         feed_flow_rate=od.feed_flow_rate,
-        feed_temperature=od.feed_temperature,
+        feed_temperature=dd.feed_temperature,
         indirect_steam=dict(od.indirect_steam),
         direct_steam=dict(od.direct_steam),
         sweep_arm_speed=dict(od.sweep_arm_speed),
@@ -77,3 +77,23 @@ def test_tia_decays_faster_when_hot() -> None:
 
     assert x.C_TIA[-1] < 1.0
     assert x.S_prot[-1] <= 1.0
+
+
+def test_narrower_gate_raises_steady_state_bed_level() -> None:
+    """gate_opening (§5.2: "sets inter-stage solid flow / holdup (level)") was
+    previously read into Inputs and never used anywhere. Confirm it now
+    genuinely affects the bed-holdup mass balance: a narrower gate should
+    back meal up (higher steady-state level) relative to a wider one."""
+    (model, x0), cfg = _load()
+
+    u_narrow = _default_inputs(cfg)
+    u_narrow.gate_opening = {k: 20.0 for k in u_narrow.gate_opening}
+    u_wide = _default_inputs(cfg)
+    u_wide.gate_opening = {k: 80.0 for k in u_wide.gate_opening}
+
+    x_narrow, x_wide = x0.copy(), x0.copy()
+    for _ in range(500):
+        x_narrow, y_narrow = model.step(x_narrow, u_narrow, 0.0, 5.0)
+        x_wide, y_wide = model.step(x_wide, u_wide, 0.0, 5.0)
+
+    assert y_narrow.stage_level_pct["MN1"] > y_wide.stage_level_pct["MN1"]

@@ -7,3 +7,6 @@ __pycache__/
 
 # Third-party copyrighted journal articles — keep local only, do not publish.
 literature_sources/
+
+# Local Claude Code session config (machine-specific tool permissions).
+.claude/

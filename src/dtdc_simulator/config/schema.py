@@ -54,10 +54,16 @@ class Geometry(BaseModel):
 
 
 class GabParams(BaseModel):
-    Xm: float = Field(gt=0)
-    C: float = Field(gt=0)
-    K: float = Field(gt=0)
-    temp_dependence: str = "linear"
+    """GAB isotherm, Cardarelli & Crapiste (1996) eq. [2]-[4]: `C = C0*exp(dHC_R/T)`,
+    `K = K0*exp(dHK_R/T)`, `Xm` (their `Hm`) is temperature-independent — NOT a linear
+    T-dependence (an earlier placeholder assumed a "linear" form; the real correlation
+    is exponential/van't Hoff, per the cited paper's Table 2)."""
+
+    Xm: float = Field(gt=0, description="kg/kg dry solid, monolayer capacity (Hm)")
+    C0: float = Field(gt=0)
+    dHC_R: float = Field(description="K, delta_H_C / R")
+    K0: float = Field(gt=0)
+    dHK_R: float = Field(description="K, delta_H_K / R")
 
 
 class OilIsotherm(BaseModel):
@@ -87,9 +93,13 @@ class PhysicalParams(BaseModel):
     rho_solid: float = Field(gt=0, description="kg/m3")
     rho_vapor_ref: float = Field(gt=0, description="kg/m3")
     cp_solid: float = Field(gt=0, description="J/(kg K)")
-    cp_vapor: float = Field(gt=0, description="J/(kg K)")
+    cp_vapor: float = Field(gt=0, description="J/(kg K), mixed steam/hexane vapor (legacy mean)")
     cp_water_liquid: float = Field(gt=0, description="J/(kg K)")
+    cp_water_vapor: float = Field(gt=0, description="J/(kg K), for B.6 CPVip per-component sum")
+    cp_hexane_vapor: float = Field(gt=0, description="J/(kg K), for B.6 CPVip per-component sum")
+    cp_hexane_liquid: float = Field(gt=0, description="J/(kg K), for B.5 CPL per-component sum")
     cp_oil: float = Field(gt=0, description="J/(kg K)")
+    mu_vapor: float = Field(gt=0, description="Pa.s, vapor dynamic viscosity (B.10 Sc_p)")
     bed_porosity: float = Field(gt=0, lt=1, description="eps_b")
     particle_porosity: float = Field(gt=0, lt=1, description="eps_p")
     oil_fraction: float = Field(ge=0, description="kg/kg dry solid, X3")
@@ -136,13 +146,15 @@ class ModelParams(BaseModel):
     denat_Ea: float = Field(gt=0)
     denat_moisture_cap: float = Field(gt=0)
     sweep_arm_transfer_gain: float = Field(ge=0)
+    base_residence_s: float = Field(
+        gt=0, default=90.0, description="s, nominal per-stage residence at reference sweep/gate"
+    )
 
 
 class OperatingDefaults(BaseModel):
     """Seed values for HOT MV state (BuildSpec §5.2). Not part of the frozen Model."""
 
     feed_flow_rate: float = Field(gt=0, description="kg/s dry solid")
-    feed_temperature: float = Field(gt=0, description="K")
     indirect_steam: dict[str, float] = Field(default_factory=dict, description="W per DT tray")
     direct_steam: dict[str, float] = Field(default_factory=dict, description="kg/s per SPARGE tray")
     sweep_arm_speed: dict[str, float] = Field(default_factory=dict, description="rpm per stage")
@@ -154,6 +166,7 @@ class OperatingDefaults(BaseModel):
 
 
 class DisturbanceDefaults(BaseModel):
+    feed_temperature: float = Field(gt=0, description="K")
     feed_moisture: float = Field(ge=0, description="kg/kg dry solid")
     feed_hexane: float = Field(ge=0, description="kg/kg dry solid")
     ambient_temp: float = Field(gt=0, description="K")

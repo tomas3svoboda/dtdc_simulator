@@ -5,11 +5,15 @@ I/O, or touch wall-clock/threading. It must be fully unit-testable with plain
 arrays and deterministic given (x, u, t, dt).
 
 PLACEHOLDER PHYSICS (M0, BuildSpec §14): each DT/DC stage is modeled as a
-first-order-lag holdup relaxing toward a duty-dependent equilibrium, chained
-top-to-bottom. This is deliberately NOT the Coletto (2022) dual-scale zonal
-model (PHZ/FTRZ/DCZ, receding front, 12-layer particle FVM) — that lands in
-M1/M2 (BuildSpec §7, §14) behind this same `Model.init_state/step/outputs`
-interface, so callers (engine/, interfaces/) do not change.
+first-order-lag holdup relaxing toward an equilibrium, chained top-to-bottom.
+This is deliberately NOT the Coletto (2022) dual-scale zonal model (PHZ/FTRZ/
+DCZ, receding front, 12-layer particle FVM) — that lands in M1/M2 (BuildSpec
+§7, §14) behind this same `Model.init_state/step/outputs` interface, so
+callers (engine/, interfaces/) do not change. The DT equilibrium *is*,
+however, a mechanistic lumped energy balance (see `_stage_equilibrium`): a
+sequential flash/sensible-heat cascade driven only by real dH_vap/cp/T_boil
+properties (no fitted "duty saturation curve" or hand-picked ceiling) — a
+lumped (0-D per tray) simplification of the same physics, not a curve fit.
 
 The quality kinetics (§7.11: TIA biexponential-rate blend, protein
 denaturation) ARE implemented per the spec's Arrhenius formulas, simplified to
@@ -57,7 +61,13 @@ class ModelConstants:
     dH_vap_hexane: float
     dH_vap_water: float
     T_boil_hexane: float
+    T_boil_water: float  # K, from Antoine(antoine_water) at 1 atm — see config/builder.py
     cp_solid: float
+    cp_water_liquid: float
+    cp_oil: float
+    oil_fraction: float  # kg oil/kg dry solid (X3)
+    rho_solid: float  # kg/m3, bulk solid-phase density (bed-holdup mass balance)
+    bed_porosity: float  # eps_b, bulk void fraction (bed-holdup mass balance)
     tia_k0_1: float
     tia_Ea_1: float
     tia_k0_2: float
@@ -87,6 +97,7 @@ class State:
     X2: np.ndarray  # hexane, kg/kg dry solid
     C_TIA: np.ndarray  # trypsin-inhibitor activity, fraction of initial
     S_prot: np.ndarray  # protein solubility, fraction of initial
+    M: np.ndarray  # kg dry solid currently retained (bed holdup)
 
     def copy(self) -> "State":
         return State(
@@ -95,6 +106,7 @@ class State:
             X2=self.X2.copy(),
             C_TIA=self.C_TIA.copy(),
             S_prot=self.S_prot.copy(),
+            M=self.M.copy(),
         )
 
 
@@ -128,6 +140,7 @@ class Outputs:
     stage_TIA: dict[str, float]
     stage_Sprot: dict[str, float]
     stage_vapor_temp: dict[str, float]
+    stage_level_pct: dict[str, float]
     kpi_residual_hexane_ppm: float
     kpi_meal_moisture_pct: float
     kpi_urease_proxy: float
@@ -153,7 +166,6 @@ class Model:
 
     stages: tuple[StageSpec, ...]
     constants: ModelConstants
-    nominal_duty_w: float = 1.0e6  # reference tray duty for the placeholder saturation curve
     base_residence_s: float = 90.0  # nominal per-stage lag time constant at 3 rpm sweep speed
 
     def stage_index(self, stage_id: str) -> int:
@@ -164,19 +176,36 @@ class Model:
 
     def init_state(self, seed: OperatingSeed) -> State:
         n = len(self.stages)
+        # Bed holdup seeds at half its max capacity, matching the scenario's
+        # default 50% gate_opening — starts near its own implied steady state
+        # (see _stage_tau's gate normalization) so it settles quickly.
+        M0 = np.array([0.5 * self._stage_M_max(s) for s in self.stages], dtype=float)
         return State(
             T=np.full(n, seed.feed_temperature, dtype=float),
             X1=np.full(n, seed.feed_moisture, dtype=float),
             X2=np.full(n, seed.feed_hexane, dtype=float),
             C_TIA=np.ones(n, dtype=float),
             S_prot=np.ones(n, dtype=float),
+            M=M0,
         )
+
+    def _stage_M_max(self, stage: StageSpec) -> float:
+        """Max dry-solid holdup (kg) implied by tray geometry and bulk density."""
+        c = self.constants
+        return stage.volume_m3 * c.rho_solid * (1.0 - c.bed_porosity)
 
     def _stage_tau(self, stage: StageSpec, u: Inputs) -> float:
         rpm = u.sweep_arm_speed.get(stage.id, 3.0)
+        # gate_opening restricts discharge, so it sets residence time too (§5.2:
+        # gate_opening "sets inter-stage solid flow / holdup (level)"). Normalized
+        # against the scenario's default 50% so today's default config produces
+        # the same tau as before this MV was wired up.
+        gate_norm = min(max(u.gate_opening.get(stage.id, 50.0) / 50.0, 0.1), 3.0)
         if stage.role in DC_ROLES:
-            return self.base_residence_s * 1.5
-        return self.base_residence_s / max(rpm / 3.0, 0.1)
+            base = self.base_residence_s * 1.5
+        else:
+            base = self.base_residence_s
+        return base / max(rpm / 3.0, 0.1) / gate_norm
 
     def _stage_equilibrium(
         self, stage: StageSpec, T_in: float, X1_in: float, X2_in: float, u: Inputs
@@ -185,15 +214,61 @@ class Model:
         if stage.role in DT_ROLES:
             q_ind = u.indirect_steam.get(stage.id, 0.0)
             q_dir_mass = u.direct_steam.get(stage.id, 0.0)
-            q_dir = q_dir_mass * c.dH_vap_water
-            duty_frac = (q_ind + q_dir) / self.nominal_duty_w
-            sat_frac = 1.0 - math.exp(-max(duty_frac, 0.0))
-            T_eq = T_in + (c.T_boil_hexane - T_in) * sat_frac
-            X2_eq = X2_in * math.exp(-3.0 * sat_frac)
-            cond_gain = 0.03 * q_dir_mass / max(u.feed_flow_rate, 1e-9)
-            evap_loss = 0.002 * max(0.0, T_eq - 350.0)
-            X1_eq = min(max(X1_in + cond_gain - evap_loss, 0.0), 1.0)
-            return T_eq, X1_eq, X2_eq
+            q_dir = q_dir_mass * c.dH_vap_water  # W, direct steam's condensation latent heat
+            Q_total = q_ind + q_dir  # W, total heat duty delivered to this tray
+            m_dry = max(u.feed_flow_rate, 1e-9)  # kg/s dry solid throughput
+            q_specific = Q_total / m_dry  # J/kg dry solid processed
+
+            # Direct steam that condenses adds its mass to the moisture stream —
+            # an exact mass balance, independent of what its released heat (q_dir,
+            # already inside Q_total) subsequently does below.
+            moisture_gain = q_dir_mass / m_dry
+
+            # Mechanistic sequential flash / sensible-heat cascade: no fitted
+            # "duty saturation curve" or hand-picked ceiling anywhere. Heat first
+            # sensibly warms the meal to hexane's boiling point (if not already
+            # there), then evaporates residual hexane isothermally (a pot doesn't
+            # exceed its liquid's boiling point while that liquid is still
+            # boiling), then sensibly warms further toward water's boiling point
+            # (from the Antoine correlation — see config/builder.py, not
+            # hardcoded), then evaporates moisture isothermally, then finally
+            # heats further (the toasting regime) if energy still remains. Every
+            # transition is bounded purely by dH_vap/cp/T_boil physical
+            # properties, so e.g. a heavily-dutied sparge tray naturally reaches
+            # ~100 C+ once it has fully desolventized, instead of being capped.
+            C_dry = c.cp_solid + c.oil_fraction * c.cp_oil  # J/(kg dry solid.K), hexane/water-free
+            C_wet_in = C_dry + X1_in * c.cp_water_liquid
+
+            E_preheat = C_wet_in * max(c.T_boil_hexane - T_in, 0.0)
+            if q_specific < E_preheat:
+                T_eq = T_in + q_specific / max(C_wet_in, 1e-9)
+                X1_eq = X1_in + moisture_gain
+                return T_eq, min(max(X1_eq, 0.0), 1.0), X2_in
+            q_r = q_specific - E_preheat
+
+            L_hex = X2_in * c.dH_vap_hexane
+            if q_r < L_hex:
+                X2_eq = X2_in - q_r / c.dH_vap_hexane
+                X1_eq = X1_in + moisture_gain
+                return c.T_boil_hexane, min(max(X1_eq, 0.0), 1.0), max(X2_eq, 0.0)
+            q_r -= L_hex
+
+            X1_after_gain = X1_in + moisture_gain
+            C_wet = C_dry + X1_after_gain * c.cp_water_liquid
+            E_to_water_bp = C_wet * max(c.T_boil_water - c.T_boil_hexane, 0.0)
+            if q_r < E_to_water_bp:
+                T_eq = c.T_boil_hexane + q_r / max(C_wet, 1e-9)
+                return T_eq, min(max(X1_after_gain, 0.0), 1.0), 0.0
+            q_r -= E_to_water_bp
+
+            L_water = X1_after_gain * c.dH_vap_water
+            if q_r < L_water:
+                X1_eq = X1_after_gain - q_r / c.dH_vap_water
+                return c.T_boil_water, min(max(X1_eq, 0.0), 1.0), 0.0
+            q_r -= L_water
+
+            T_eq = c.T_boil_water + q_r / max(C_dry, 1e-9)
+            return T_eq, 0.0, 0.0
 
         if stage.role is StageRole.DRYER:
             air_ratio = u.heated_air_flow / max(u.feed_flow_rate, 1e-9)
@@ -219,6 +294,7 @@ class Model:
         c = self.constants
 
         T_in, X1_in, X2_in = u.feed_temperature, u.feed_moisture, u.feed_hexane
+        m_in = u.feed_flow_rate  # kg/s dry solid, chained bed-holdup mass balance
         for i, stage in enumerate(self.stages):
             T_eq, X1_eq, X2_eq = self._stage_equilibrium(stage, T_in, X1_in, X2_in, u)
             tau = self._stage_tau(stage, u)
@@ -227,6 +303,12 @@ class Model:
             T_new = T_eq + (x.T[i] - T_eq) * decay
             X1_new = X1_eq + (x.X1[i] - X1_eq) * decay
             X2_new = X2_eq + (x.X2[i] - X2_eq) * decay
+
+            # Bed holdup: same closed-form relaxation as T/X1/X2, toward the
+            # steady-state mass implied by current inflow and residence time.
+            M_eq = m_in * tau
+            M_new = M_eq + (x.M[i] - M_eq) * decay
+            m_out = M_new / tau
 
             k_tia = _tia_rate(T_new, c)
             k_den = _denat_rate(T_new, X1_new, c)
@@ -238,8 +320,10 @@ class Model:
             x_next.X2[i] = X2_new
             x_next.C_TIA[i] = C_TIA_new
             x_next.S_prot[i] = S_prot_new
+            x_next.M[i] = M_new
 
             T_in, X1_in, X2_in = T_new, X1_new, X2_new
+            m_in = m_out
 
         return x_next, self.outputs(x_next, u)
 
@@ -251,6 +335,11 @@ class Model:
         stage_TIA = {s.id: float(x.C_TIA[i] * 100.0) for i, s in enumerate(self.stages)}
         stage_Sprot = {s.id: float(x.S_prot[i] * 85.0) for i, s in enumerate(self.stages)}
         stage_vapor_temp = dict(stage_T)  # placeholder: no distinct vapor-phase state yet
+        # Not clamped to 100: an over-restricted gate can genuinely overfill a
+        # tray, and showing >100% is the useful HMI "flood" signal for that.
+        stage_level_pct = {
+            s.id: float(x.M[i] / self._stage_M_max(s) * 100.0) for i, s in enumerate(self.stages)
+        }
 
         total_steam_kg_s = (
             sum(u.direct_steam.values()) + sum(u.indirect_steam.values()) / c.dH_vap_water
@@ -266,6 +355,7 @@ class Model:
             stage_TIA=stage_TIA,
             stage_Sprot=stage_Sprot,
             stage_vapor_temp=stage_vapor_temp,
+            stage_level_pct=stage_level_pct,
             kpi_residual_hexane_ppm=float(x.X2[-1] * 1.0e6),
             kpi_meal_moisture_pct=float(x.X1[-1] * 100.0),
             kpi_urease_proxy=float(x.C_TIA[-1] * 100.0),

@@ -55,6 +55,8 @@ class Snapshot:
     mvs: dict[str, MVSnapshot]
     dvs: dict[str, float]
     outputs: Outputs | None
+    stage_roles: dict[str, str]
+    stage_order: list[str]
 
 
 class RuntimeFacade:
@@ -70,7 +72,8 @@ class RuntimeFacade:
         self._x: State | None = None
         self._mvs: dict[str, ManipulatedVariable] = {}
         self._dvs: dict[str, DisturbanceVariable] = {}
-        self._feed_temperature = 300.0
+        self._stage_roles: dict[str, str] = {}
+        self._stage_order: list[str] = []
         self._sim_time = 0.0
         self._actual_speed = 0.0
         self._speed_factor = 1.0
@@ -205,15 +208,17 @@ class RuntimeFacade:
             add(f"gate_opening/{sid}", od.gate_opening.get(sid, 50.0), "gate_opening")
 
         self._mvs = mvs
+        self._stage_roles = {s.id: s.role.value for s in config.geometry.stages}
+        self._stage_order = all_ids
 
         dd = config.disturbance_defaults
         self._dvs = {
+            "feed_temperature": DisturbanceVariable("feed_temperature", dd.feed_temperature),
             "feed_moisture": DisturbanceVariable("feed_moisture", dd.feed_moisture),
             "feed_hexane": DisturbanceVariable("feed_hexane", dd.feed_hexane),
             "ambient_temp": DisturbanceVariable("ambient_temp", dd.ambient_temp),
             "ambient_humidity": DisturbanceVariable("ambient_humidity", dd.ambient_humidity),
         }
-        self._feed_temperature = od.feed_temperature
 
     # ------------------------------------------------------------------ hot writes
     def set_mv_mode(self, key: str, mode: Mode) -> None:
@@ -280,7 +285,7 @@ class RuntimeFacade:
 
         return Inputs(
             feed_flow_rate=self._mvs["feed_flow_rate"].tick(dt),
-            feed_temperature=self._feed_temperature,
+            feed_temperature=self._dvs["feed_temperature"].value,
             indirect_steam=indirect_steam,
             direct_steam=direct_steam,
             sweep_arm_speed=sweep_arm_speed,
@@ -358,4 +363,6 @@ class RuntimeFacade:
                 mvs=mvs,
                 dvs=dvs,
                 outputs=self._latest_outputs,
+                stage_roles=dict(self._stage_roles),
+                stage_order=list(self._stage_order),
             )

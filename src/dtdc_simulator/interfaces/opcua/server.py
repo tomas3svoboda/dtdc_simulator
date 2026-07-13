@@ -54,6 +54,11 @@ class OpcUaAdapter:
         self._pv_kpi_nodes: dict[str, Node] = {}
         self._sim_nodes: dict[str, Node] = {}
         self._last_global_mode = Mode.MANUAL.value
+        self._last_speed_factor: float | None = None
+        self._last_mv_mode: dict[str, str] = {}
+        self._last_mv_manual: dict[str, float] = {}
+        self._last_mv_auto: dict[str, float] = {}
+        self._last_dv: dict[str, float] = {}
 
     async def build(self) -> None:
         server = Server()
@@ -76,6 +81,7 @@ class OpcUaAdapter:
 
         speed = await sim.add_variable(idx, "SpeedFactor", float(snap.speed_factor))
         await speed.set_writable()
+        self._last_speed_factor = float(snap.speed_factor)
         sim_time = await sim.add_variable(idx, "SimTime", float(snap.sim_time))
         actual_speed = await sim.add_variable(idx, "ActualSpeed", float(snap.actual_speed))
         state = await sim.add_variable(idx, "State", snap.state.value)
@@ -159,6 +165,9 @@ class OpcUaAdapter:
                 "Min": min_n,
                 "Max": max_n,
             }
+            self._last_mv_mode[key] = mv.mode.value
+            self._last_mv_manual[key] = float(mv.manual_setpoint)
+            self._last_mv_auto[key] = float(mv.auto_setpoint)
 
     async def _build_dv_folder(self, parent: Node) -> None:
         idx = self._idx
@@ -168,6 +177,7 @@ class OpcUaAdapter:
             n = await dv_root.add_variable(idx, key, float(value))
             await n.set_writable()
             self._dv_nodes[key] = n
+            self._last_dv[key] = float(value)
 
     async def _build_pv_folder(self, parent: Node) -> None:
         idx = self._idx
@@ -188,6 +198,7 @@ class OpcUaAdapter:
                 "TIA": outputs.stage_TIA[stage_id],
                 "Sprot": outputs.stage_Sprot[stage_id],
                 "VaporTemp": outputs.stage_vapor_temp[stage_id],
+                "Level": outputs.stage_level_pct[stage_id],
             }
             node_map: dict[str, Node] = {}
             for fname, fval in fields.items():
@@ -208,10 +219,18 @@ class OpcUaAdapter:
             )
 
     async def _pull_writes(self) -> None:
+        """Apply a node's value to the facade only if it actually changed since
+        our own last `_push_snapshot` wrote it. Nodes are re-written every
+        cycle regardless of origin, so without this guard a value the UI (or
+        anything else) set directly on the facade would be read back here as
+        "unchanged from the node" and instantly stomped by the node's stale
+        copy — see module docstring's push-follows-pull assumption."""
         facade = self._facade
 
-        speed_val = await self._sim_nodes["SpeedFactor"].read_value()
-        facade.set_speed_factor(float(speed_val))
+        speed_val = float(await self._sim_nodes["SpeedFactor"].read_value())
+        if speed_val != self._last_speed_factor:
+            facade.set_speed_factor(speed_val)
+            self._last_speed_factor = speed_val
 
         global_mode_val = await self._sim_nodes["GlobalMode"].read_value()
         if global_mode_val != self._last_global_mode:
@@ -223,18 +242,28 @@ class OpcUaAdapter:
 
         for key, nodes in self._mv_nodes.items():
             mode_val = await nodes["Mode"].read_value()
-            try:
-                facade.set_mv_mode(key, Mode(mode_val))
-            except ValueError:
-                logger.warning("MV/%s/Mode: invalid mode %r", key, mode_val)
-            manual_val = await nodes["ManualSetpoint"].read_value()
-            facade.set_mv_manual_setpoint(key, float(manual_val))
-            auto_val = await nodes["AutoSetpoint"].read_value()
-            facade.set_mv_auto_setpoint(key, float(auto_val))
+            if mode_val != self._last_mv_mode[key]:
+                try:
+                    facade.set_mv_mode(key, Mode(mode_val))
+                except ValueError:
+                    logger.warning("MV/%s/Mode: invalid mode %r", key, mode_val)
+                self._last_mv_mode[key] = mode_val
+
+            manual_val = float(await nodes["ManualSetpoint"].read_value())
+            if manual_val != self._last_mv_manual[key]:
+                facade.set_mv_manual_setpoint(key, manual_val)
+                self._last_mv_manual[key] = manual_val
+
+            auto_val = float(await nodes["AutoSetpoint"].read_value())
+            if auto_val != self._last_mv_auto[key]:
+                facade.set_mv_auto_setpoint(key, auto_val)
+                self._last_mv_auto[key] = auto_val
 
         for key, node in self._dv_nodes.items():
-            val = await node.read_value()
-            facade.set_dv(key, float(val))
+            val = float(await node.read_value())
+            if val != self._last_dv[key]:
+                facade.set_dv(key, val)
+                self._last_dv[key] = val
 
     async def _push_snapshot(self) -> None:
         snap = self._facade.get_snapshot()
@@ -266,6 +295,7 @@ class OpcUaAdapter:
             await nodes["TIA"].write_value(float(outputs.stage_TIA[stage_id]))
             await nodes["Sprot"].write_value(float(outputs.stage_Sprot[stage_id]))
             await nodes["VaporTemp"].write_value(float(outputs.stage_vapor_temp[stage_id]))
+            await nodes["Level"].write_value(float(outputs.stage_level_pct[stage_id]))
 
         kpi_map = {
             "residual_hexane": outputs.kpi_residual_hexane_ppm,
