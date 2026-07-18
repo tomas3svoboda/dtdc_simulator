@@ -27,9 +27,9 @@ MV_LIMITS: dict[str, tuple[float, float, float | None]] = {
     "sweep_arm_speed": (0.0, 10.0, None),
     "gate_opening": (0.0, 100.0, None),
     "heated_air_temp": (280.0, 450.0, None),
-    "heated_air_flow": (0.0, 30.0, None),
+    "heated_air_flow": (0.0, 100.0, None),
     "ambient_air_temp": (250.0, 320.0, None),
-    "ambient_air_flow": (0.0, 30.0, None),
+    "ambient_air_flow": (0.0, 100.0, None),
 }
 
 

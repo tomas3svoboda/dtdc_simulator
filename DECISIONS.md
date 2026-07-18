@@ -3,6 +3,33 @@
 Log of `DECIDE` choices made while building the DTDC simulator, per
 `Specifications/DTDC_Simulator_BuildSpec.md`. Newest entries at the top.
 
+## Stale MV air-flow cap silently halved the tuned DC air flows (2026-07-18)
+
+**Trigger.** After the previous entry's fixes, the user ran the actual GUI (not the headless
+verification this session had relied on) and saw the exact symptom the DC recalibration entry
+above was supposed to have fixed: DR1/CL1 barely different from the Toaster, residual hexane back
+up around 1250 ppm instead of the tuned ~114 ppm.
+
+**Root cause.** `engine/facade.py`'s `MV_LIMITS` table -- the hard min/max clamp every MV is seeded
+and rate-limited against -- still capped `heated_air_flow`/`ambient_air_flow` at `(0.0, 30.0)`, a
+leftover from the ORIGINAL 5.0/8.0 kg/s placeholder era. When the DC recalibration entry above
+retuned `operating_defaults.heated_air_flow`/`ambient_air_flow` to 60.0 kg/s, `_build_registry`'s
+own `add()` helper (`seed = min(max(seed, lo), hi)`) silently clamped that seed back down to 30.0 --
+exactly half -- with no warning, because config-value validation (`config/schema.py`) and the
+facade's own separate MV-limits table were never cross-checked against each other. The scenario
+YAML, `assemble_model`, and every headless test in this session called `Model.step` directly with
+hand-built `Inputs` (bypassing the MV registry entirely), so this was invisible everywhere except
+the actual running GUI/OPC UA path -- explaining why this session's own "well behaved DTDC
+demonstrated in GUI" checks (headless `model.step` calls) didn't catch it.
+
+**Fix.** Raised both caps to `(0.0, 100.0)` in `MV_LIMITS`, giving headroom above the current 60.0
+kg/s tuned point for further tuning. Verified via the real `RuntimeFacade` (not just `Model.step`)
+with a `FreeRunClock`: `heated_air_flow`/`ambient_air_flow` effective values now read 60.0 (not
+30.0), and a 3200s run reproduces the DC recalibration entry's own target numbers (Cooler ~39.7 C,
+residual hexane ~114 ppm). Take-away for future retuning: a change to `operating_defaults` in the
+scenario YAML is NOT sufficient by itself when the changed field is also MV-gated -- `MV_LIMITS`
+must be checked too, since it silently overrides config on that path.
+
 ## Protein-denaturation modeling removed; GUI graceful-shutdown control added (2026-07-18)
 
 **Trigger.** Immediately after the TIA removal below, the user asked to also remove protein
