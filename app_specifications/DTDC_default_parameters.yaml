@@ -11,7 +11,6 @@
 #   Coletto, Bandoni & Blanco (2022) J. Food Eng. 318, 110870   -> geometry, base operating point, C0/C1, correlations
 #   Cardarelli & Crapiste (1996) JAOCS 73(12) 1657              -> GAB isotherm + oil power-law structure (soybean)
 #   Cardarelli, Crapiste & Mattea (2002) J. Food Eng. 52, 127   -> DCZ dual-scale basis, D_eff/D_ax ranges
-#   Chen et al. (2014) Food Chem. 154, 108                      -> protein denaturation Arrhenius basis
 # NOTE: several isotherm/kinetic coefficients are not printed as plain numbers in the
 #       sources; those are tagged [PLACE] and MUST be fitted to the source curves/tables.
 
@@ -77,10 +76,6 @@ model:
   outer_relaxation: 0.5       # [PLACE] under-relaxation
   outer_tol: 1.0e-5           # [PLACE]
   outer_max_iter: 100         # [PLACE]
-  # Protein denaturation (Chen 2014 basis) — Arrhenius
-  denat_k0: 1.0e12           # 1/s   [PLACE]
-  denat_Ea: 1.1e5            # J/mol [PLACE] ~110 kJ/mol (protein/lysine sensitive)
-  denat_moisture_cap: 0.30    # kg/kg [PAPER] moisture influence saturates ~0.30
   sweep_arm_transfer_gain: 0.2   # [PLACE] hQ/hM sensitivity to sweep-arm speed (renamed from agitator)
 
 # ---------------------------------------------------- operating defaults (HOT seeds)
@@ -135,4 +130,3 @@ sim:
 #   residual hexane in meal:  DCZ inlet ~4000 ppm  ->  outlet ~100 ppm
 #   FTRZ thickness:           order of cm (< a few cm)
 #   meal moisture after DC:   < ~12 %
-#   protein solubility (KOH):  ~78-85 % (drops <70-72% if over-processed)

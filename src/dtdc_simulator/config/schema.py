@@ -156,9 +156,6 @@ class ModelParams(BaseModel):
     outer_relaxation: float = Field(gt=0, le=1)
     outer_tol: float = Field(gt=0)
     outer_max_iter: int = Field(gt=0)
-    denat_k0: float = Field(gt=0)
-    denat_Ea: float = Field(gt=0)
-    denat_moisture_cap: float = Field(gt=0)
     sweep_arm_transfer_gain: float = Field(ge=0)
     base_residence_s: float = Field(
         gt=0, default=90.0, description="s, nominal per-stage residence at reference sweep/gate"

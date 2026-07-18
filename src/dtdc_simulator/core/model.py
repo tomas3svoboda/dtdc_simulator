@@ -20,11 +20,8 @@ See `DECISIONS.md`'s M3a entry for why a literal every-tick re-solve isn't
 achievable without the (explicitly out-of-scope, deferred to M3b) persistent
 -particle-state redesign of `core/zones/dcz.py`.
 
-The protein-denaturation quality kinetic (§7.11) IS implemented per the
-spec's Arrhenius formula, simplified to a single first-order decay per tick
-(see `_denat_rate`) — documented as an engineering approximation in
-DECISIONS.md. DC (dryer/cooler) stages now use `core/dc.py`'s real
-air-contacting balance (§7.10), not a placeholder.
+DC (dryer/cooler) stages now use `core/dc.py`'s real air-contacting balance
+(§7.10), not a placeholder.
 """
 
 from __future__ import annotations
@@ -77,9 +74,6 @@ class ModelConstants:
     oil_fraction: float  # kg oil/kg dry solid (X3)
     rho_solid: float  # kg/m3, bulk solid-phase density (bed-holdup mass balance)
     bed_porosity: float  # eps_b, bulk void fraction (bed-holdup mass balance)
-    denat_k0: float
-    denat_Ea: float
-    denat_moisture_cap: float
     # --- M3a additions ---
     dt_constants: dt_solver.DTSolverConstants
     # dt_resolve_interval_s is NOT here -- it's a HOT, live-tunable value on
@@ -125,7 +119,6 @@ class State:
     T: np.ndarray  # K
     X1: np.ndarray  # moisture, kg/kg dry solid
     X2: np.ndarray  # hexane, kg/kg dry solid
-    S_prot: np.ndarray  # protein solubility, fraction of initial
     M: np.ndarray  # kg dry solid currently retained (bed holdup)
     # --- M3a: cached DT-solve targets + warm-start, one entry per DT-role stage ---
     dt_target_T: np.ndarray
@@ -143,7 +136,6 @@ class State:
             T=self.T.copy(),
             X1=self.X1.copy(),
             X2=self.X2.copy(),
-            S_prot=self.S_prot.copy(),
             M=self.M.copy(),
             dt_target_T=self.dt_target_T.copy(),
             dt_target_X1=self.dt_target_X1.copy(),
@@ -213,22 +205,15 @@ class Outputs:
     stage_T: dict[str, float]
     stage_X_hex_ppm: dict[str, float]
     stage_X_w_pct: dict[str, float]
-    stage_Sprot: dict[str, float]
     stage_vapor_temp: dict[str, float]
     stage_level_pct: dict[str, float]
     kpi_residual_hexane_ppm: float
     kpi_meal_moisture_pct: float
-    kpi_protein_solubility_pct: float
     kpi_steam_consumption_kg_per_t: float
     kpi_throughput_t_per_day: float
     dt_solver_converged: bool
     dt_solver_outer_iterations: int
     mass_inventory: MassInventory
-
-
-def _denat_rate(T: float, X_water: float, c: ModelConstants) -> float:
-    moisture_factor = min(max(X_water / c.denat_moisture_cap, 0.0), 1.0)
-    return c.denat_k0 * math.exp(-c.denat_Ea / (R_GAS * T)) * moisture_factor
 
 
 def _dt_role_stages(stages: tuple[StageSpec, ...]) -> list[StageSpec]:
@@ -380,7 +365,6 @@ class Model:
             T=T0,
             X1=X10,
             X2=X20,
-            S_prot=np.ones(n, dtype=float),
             M=M0,
             dt_target_T=dt_target_T,
             dt_target_X1=dt_target_X1,
@@ -501,7 +485,6 @@ class Model:
 
     def step(self, x: State, u: Inputs, t: float, dt: float) -> tuple[State, Outputs]:
         x_next = x.copy()
-        c = self.constants
         dt_stages = _dt_role_stages(self.stages)
 
         if t - x.dt_last_solve_sim_time >= u.dt_resolve_interval_s:
@@ -533,13 +516,9 @@ class Model:
             M_new = M_eq + (x.M[i] - M_eq) * decay
             m_out = M_new / tau
 
-            k_den = _denat_rate(T_new, X1_new, c)
-            S_prot_new = x.S_prot[i] * math.exp(-k_den * dt)
-
             x_next.T[i] = T_new
             x_next.X1[i] = X1_new
             x_next.X2[i] = X2_new
-            x_next.S_prot[i] = S_prot_new
             x_next.M[i] = M_new
 
             T_in, X1_in, X2_in = T_new, X1_new, X2_new
@@ -552,7 +531,6 @@ class Model:
         stage_T = {s.id: float(x.T[i]) for i, s in enumerate(self.stages)}
         stage_X_hex_ppm = {s.id: float(x.X2[i] * 1.0e6) for i, s in enumerate(self.stages)}
         stage_X_w_pct = {s.id: float(x.X1[i] * 100.0) for i, s in enumerate(self.stages)}
-        stage_Sprot = {s.id: float(x.S_prot[i] * 85.0) for i, s in enumerate(self.stages)}
         stage_vapor_temp = dict(stage_T)  # placeholder: no distinct vapor-phase state yet
         # Not clamped to 100: an over-restricted gate can genuinely overfill a
         # tray, and showing >100% is the useful HMI "flood" signal for that.
@@ -586,12 +564,10 @@ class Model:
             stage_T=stage_T,
             stage_X_hex_ppm=stage_X_hex_ppm,
             stage_X_w_pct=stage_X_w_pct,
-            stage_Sprot=stage_Sprot,
             stage_vapor_temp=stage_vapor_temp,
             stage_level_pct=stage_level_pct,
             kpi_residual_hexane_ppm=float(x.X2[-1] * 1.0e6),
             kpi_meal_moisture_pct=float(x.X1[-1] * 100.0),
-            kpi_protein_solubility_pct=float(x.S_prot[-1] * 85.0),
             kpi_steam_consumption_kg_per_t=steam_kg_per_t,
             kpi_throughput_t_per_day=throughput_t_per_day,
             dt_solver_converged=bool(x.dt_converged),

@@ -54,9 +54,8 @@ def test_init_state_matches_seed(loaded) -> None:
     """M3a: init_state() now seeds DT-role stages from a real solve_dt() at
     the operating defaults (BuildSpec §4), not a uniform copy of the feed
     state -- so X2 differs (processed) rather than matching feed_hexane
-    everywhere. S_prot is untouched by the DT solve and still starts at 1.0."""
+    everywhere."""
     (model, x0), cfg = loaded
-    assert (x0.S_prot == 1.0).all()
     # The DT genuinely desolventizes: exit hexane content is well below feed,
     # for the DT's own exit tray (dt_target_X2's last entry -- NOT
     # necessarily x0.X2's last entry, since the scenario's own last STAGE is
@@ -106,21 +105,6 @@ def test_more_steam_raises_dt_target_temperature(loaded) -> None:
     x_hot, _ = model.step(x0, u_hot, 1.0, 1.0)
 
     assert x_hot.dt_target_T[-1] > x_cold.dt_target_T[-1]
-
-
-def test_denat_decays_over_time(loaded) -> None:
-    # t=0.0 held constant (cheap: no resolve fires, DT-role targets stay at
-    # x0's own operating-defaults solve, which already implies an elevated
-    # temperature) -- decay is driven by that already-realistic temperature,
-    # not by varying indirect_steam within this test.
-    (model, x0), cfg = loaded
-    u = _default_inputs(cfg)
-
-    x = x0.copy()
-    for _ in range(500):
-        x, _ = model.step(x, u, 0.0, 5.0)
-
-    assert x.S_prot[-1] <= 1.0
 
 
 def test_narrower_gate_raises_steady_state_bed_level(loaded) -> None:

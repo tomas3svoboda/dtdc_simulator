@@ -15,7 +15,6 @@
 #
 # Primary sources:
 #   Coletto, Bandoni & Blanco (2022) J. Food Eng. 318, 110870   -> geometry, base operating point, C0/C1, correlations
-#   Chen et al. (2014) Food Chem. 154, 108                      -> protein denaturation Arrhenius basis
 
 material: soybean
 
@@ -50,10 +49,6 @@ model:
   outer_relaxation: 0.5       # [PLACE] under-relaxation
   outer_tol: 1.0e-5           # [PLACE]
   outer_max_iter: 100         # [PLACE]
-  # Protein denaturation (Chen 2014 basis) — Arrhenius
-  denat_k0: 1.0e12           # 1/s   [PLACE]
-  denat_Ea: 1.1e5            # J/mol [PLACE] ~110 kJ/mol (protein/lysine sensitive)
-  denat_moisture_cap: 0.30    # kg/kg [PAPER] moisture influence saturates ~0.30
   # Retuned this session, empirically, once wired into bed_transport_coefficients (previously
   # declared but never connected to anything -- confirmed by a repo-wide search before this
   # fix): a real DT bed is continuously mechanically swept/agitated, a fundamentally stronger
@@ -224,4 +219,3 @@ sim:
 #   [literature, whole tower] DT exit (post-SP1): ~105-110 C, moisture 18-22%, hexane <500-800 ppm
 #   [literature, whole tower] DRYER exit:        moisture ~13%
 #   [literature, whole tower] COOLER exit:       ~35-40 C, moisture ~11-12.5%, hexane <300-500 ppm
-#   [literature, whole tower] protein solubility (KOH): ~78-85 % (drops <70-72% if over-processed)

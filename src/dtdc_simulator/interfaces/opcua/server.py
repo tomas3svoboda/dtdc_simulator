@@ -35,7 +35,6 @@ REFRESH_S = 0.2
 _KPI_FIELDS = (
     "residual_hexane",
     "meal_moisture",
-    "protein_solubility",
     "steam_consumption",
     "throughput",
 )
@@ -210,7 +209,6 @@ class OpcUaAdapter:
                 "T": outputs.stage_T[stage_id],
                 "X_hex": outputs.stage_X_hex_ppm[stage_id],
                 "X_w": outputs.stage_X_w_pct[stage_id],
-                "Sprot": outputs.stage_Sprot[stage_id],
                 "VaporTemp": outputs.stage_vapor_temp[stage_id],
                 "Level": outputs.stage_level_pct[stage_id],
             }
@@ -222,7 +220,6 @@ class OpcUaAdapter:
         kpi_map = {
             "residual_hexane": outputs.kpi_residual_hexane_ppm,
             "meal_moisture": outputs.kpi_meal_moisture_pct,
-            "protein_solubility": outputs.kpi_protein_solubility_pct,
             "steam_consumption": outputs.kpi_steam_consumption_kg_per_t,
             "throughput": outputs.kpi_throughput_t_per_day,
         }
@@ -315,14 +312,12 @@ class OpcUaAdapter:
             await nodes["T"].write_value(float(outputs.stage_T[stage_id]))
             await nodes["X_hex"].write_value(float(outputs.stage_X_hex_ppm[stage_id]))
             await nodes["X_w"].write_value(float(outputs.stage_X_w_pct[stage_id]))
-            await nodes["Sprot"].write_value(float(outputs.stage_Sprot[stage_id]))
             await nodes["VaporTemp"].write_value(float(outputs.stage_vapor_temp[stage_id]))
             await nodes["Level"].write_value(float(outputs.stage_level_pct[stage_id]))
 
         kpi_map = {
             "residual_hexane": outputs.kpi_residual_hexane_ppm,
             "meal_moisture": outputs.kpi_meal_moisture_pct,
-            "protein_solubility": outputs.kpi_protein_solubility_pct,
             "steam_consumption": outputs.kpi_steam_consumption_kg_per_t,
             "throughput": outputs.kpi_throughput_t_per_day,
         }

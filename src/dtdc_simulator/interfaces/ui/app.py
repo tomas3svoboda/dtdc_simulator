@@ -42,7 +42,6 @@ OUTLET_WINDOW_S = 3600.0  # moving window for the outlet quality trend chart
 _KPI_TILES = (
     ("kpi_residual_hexane_ppm", "Residual hexane [ppm]", "{:.0f}"),
     ("kpi_meal_moisture_pct", "Meal moisture [%]", "{:.2f}"),
-    ("kpi_protein_solubility_pct", "Protein solubility [%]", "{:.1f}"),
     ("kpi_steam_consumption_kg_per_t", "Steam [kg/t]", "{:.2f}"),
     ("kpi_throughput_t_per_day", "Throughput [t/day]", "{:.1f}"),
 )
@@ -235,9 +234,23 @@ def create_app(
             .classes("items-center justify-between px-4")
             .style(f"background-color: {_SIEMENS_DARK};")
         ):
-            ui.label("DTDC Real-Time Simulator").classes("text-xl font-bold text-white")
-            ui.label("Digital Twin — Desolventizer / Toaster / Dryer / Cooler").classes(
-                "text-xs text-gray-300"
+            with ui.column().classes("gap-0"):
+                ui.label("DTDC Real-Time Simulator").classes("text-xl font-bold text-white")
+                ui.label("Digital Twin — Desolventizer / Toaster / Dryer / Cooler").classes(
+                    "text-xs text-gray-300"
+                )
+            # Lets the process be stopped from the browser instead of only via an
+            # external kill/Task Manager -- otherwise a stray dashboard process
+            # keeps holding its port and the next `main.py` launch fails to bind.
+            with ui.dialog() as shutdown_dialog, ui.card():
+                ui.label("Shut down the DTDC simulator process?")
+                with ui.row().classes("w-full justify-end gap-2"):
+                    ui.button("Cancel", on_click=shutdown_dialog.close).props("flat")
+                    ui.button(
+                        "Shut down", on_click=lambda: (ui.notify("Shutting down…"), app.shutdown())
+                    ).props("color=negative")
+            ui.button("Shutdown", on_click=shutdown_dialog.open).props(
+                "flat color=negative icon=power_settings_new"
             )
 
         setup_container = ui.column().classes("w-full gap-4 p-4")

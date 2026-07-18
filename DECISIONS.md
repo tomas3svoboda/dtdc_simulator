@@ -3,6 +3,38 @@
 Log of `DECIDE` choices made while building the DTDC simulator, per
 `Specifications/DTDC_Simulator_BuildSpec.md`. Newest entries at the top.
 
+## Protein-denaturation modeling removed; GUI graceful-shutdown control added (2026-07-18)
+
+**Trigger.** Immediately after the TIA removal below, the user asked to also remove protein
+solubility/denaturation modeling entirely ("clean the code from protein solubility... make it
+leaner") -- the one quality kinetic explicitly kept during the TIA removal is no longer wanted
+either, so nothing of the original `§7.11 Quality kinetics` section remains. Separately, the user
+hit `[Errno 10048] ... only one usage of each socket address` trying to restart `main.py` -- a prior
+NiceGUI dev-server process (started for this session's own GUI verification) never exited and was
+still holding port 8080, with no way to stop it short of killing the process from outside the app.
+
+**Protein denaturation removed.** Same surgical, layer-by-layer approach as the TIA removal:
+`core/model.py` (`ModelConstants.denat_k0/denat_Ea/denat_moisture_cap`, `State.S_prot`,
+`_denat_rate`, the `step()`/`outputs()` wiring, `Outputs.stage_Sprot`/`kpi_protein_solubility_pct`,
+plus the now-unused `c = self.constants` local in `step()`), config (`config/schema.py`'s
+`ModelParams` fields, `config/builder.py`'s `assemble_model` wiring, `scenarios/soybean_default.yaml`'s
+`denat_*` keys and the now-orphaned Chen 2014 citation), the GUI (`interfaces/ui/app.py`'s one
+`_KPI_TILES` entry -- protein solubility had no per-tray widget or profile chart, unlike TIA), the
+OPC UA server (`_KPI_FIELDS` entry, per-stage `Sprot` node, both `kpi_map["protein_solubility"]`
+occurrences), and tests (`test_model.py`: dropped the `S_prot` assertion from
+`test_init_state_matches_seed` and deleted `test_denat_decays_over_time` outright, since nothing is
+left to assert). Docs updated to match: BuildSpec.md's `§7.11` is now a stub noting both kinetics
+were implemented then removed (kept the section number since other sections cross-reference it, and
+the M3 milestone description below still uses it as a historical pointer); `DTDC_default_parameters.yaml`
+lost the same keys/citation. Full suite: 117 tests pass (118 minus the deleted test), `ruff check`
+clean.
+
+**GUI shutdown button added.** `interfaces/ui/app.py`'s header now has a "Shutdown" button
+(`app.shutdown()`, NiceGUI's own clean-exit call, which also fires `main.py`'s existing
+`app.on_shutdown(facade.shutdown)` hook) so the dashboard process can be stopped from inside the
+browser instead of only via an external `kill`/Task Manager -- directly addresses the port-8080
+collision, which was caused by a stale process with no in-app way to end it.
+
 ## TIA modeling removed; tuned scenario confirmed as the shipped default (2026-07-18)
 
 **Trigger.** With the DC recalibration and overshoot fix landed and the scenario producing sane
@@ -1356,14 +1388,13 @@ stable at any `dt`, including the large `dt` produced by high `speed_factor`
 in `RealTimeClock` — important since M0 already has to survive the full
 speed-factor/undersampling machinery in §8.4.
 
-The quality kinetics (§7.11: protein denaturation) **are** implemented from
-the spec's exact Arrhenius parameters, but simplified to a single
-first-order decay per tick (`S_prot(t+dt) = S_prot(t)*exp(-k_den(T)*dt)`)
+The quality kinetics (§7.11) **were** implemented from the spec's exact
+Arrhenius parameters (TIA as a biexponential blend, protein denaturation as
+a single first-order decay per tick, `S_prot(t+dt) = S_prot(t)*exp(-k_den(T)*dt)`,
 rather than a literal elapsed-time-integrated form, since the elapsed-time
 formulation assumes a batch/plug-flow frame that doesn't map cleanly onto
-per-tick recurrence. (This paragraph originally also covered a TIA
-biexponential-blend kinetic; TIA modeling was removed entirely on
-2026-07-17 — see the dated entry below.)
+per-tick recurrence) — both were later removed entirely (TIA on 2026-07-17,
+protein denaturation on 2026-07-18) — see the dated entries above.
 
 `feed_temperature` (an `OperatingDefaults` field) is treated as a fixed
 boundary value captured at `assemble()` time, not a runtime-adjustable
