@@ -122,6 +122,45 @@ def ypg2_equilibrium(rho_hexV: float, alpha_ps: float, rho_ps: float) -> float:
     return rho_hexV * (1.0 - alpha_ps) / (rho_ps * alpha_ps)
 
 
+def x2_so_and_slope(
+    a_h: float,
+    T: float,
+    X3: float,
+    gab: GabParams,
+    oil: OilIsotherm,
+    h: float = 1.0e-5,
+) -> tuple[float, float]:
+    """X2,so(a_h) = W2(a_h,T) + X3*qo(a_h) (eq. A.26) and its slope dX2,so/da_h
+    (the DCZ particle scale's `Ca`, eq. A.28, treats the local pore-gas mass
+    fraction `wpg2` itself as the isotherm's activity variable `a_h` -- the
+    same convention `x2_equilibrium`/`x2_critical` already use at the fixed
+    point `a_h=1`, generalized here to an arbitrary local value).
+
+    The slope is a centered finite difference on `gab_hexane_content`/
+    `oil_hexane_content` (both already smooth, closed-form isotherms) rather
+    than a hand-derived analytical derivative -- keeps this module's isotherm
+    functions as the single source of truth instead of duplicating their
+    algebra a second time as derivatives.
+    """
+
+    def x2_so(a: float) -> float:
+        return gab_hexane_content(a, T, gab) + X3 * oil_hexane_content(a, oil)
+
+    value = x2_so(a_h)
+    step = min(h, a_h, 1.0 - a_h)
+    if step <= 0.0:
+        # a_h sits exactly on a boundary (0 or 1): fall back to a one-sided
+        # difference of a tiny step into the valid interior.
+        step = h
+        if a_h <= 0.0:
+            slope = (x2_so(a_h + step) - value) / step
+        else:
+            slope = (value - x2_so(a_h - step)) / step
+        return value, slope
+    slope = (x2_so(a_h + step) - x2_so(a_h - step)) / (2.0 * step)
+    return value, slope
+
+
 def x2_equilibrium(
     T: float,
     X3: float,
@@ -176,6 +215,33 @@ def cp_l(
     matching `cps = (cp_water_liquid, cp_hexane_liquid, cp_oil, cp_solid)`."""
     weights = (w_water, w_hexane, w_oil, w_ds)
     return sum(w * cp for w, cp in zip(weights, cps))
+
+
+def mixture_cp_per_kg_dry_solid(
+    X1: float,
+    X2: float,
+    X3: float,
+    cp_water_liquid: float,
+    cp_hexane_liquid: float,
+    cp_oil: float,
+    cp_solid: float,
+) -> float:
+    """Effective heat capacity of the wet solid stream, J/(kg dry solid . K)
+    -- `cp_l` (eq. B.5) applied to the solid's own composition (X1/X2/X3 are
+    kg-per-kg-dry-solid ratios, converted to the mass fractions `cp_l` itself
+    expects). Promoted from `zones/phz.py`'s own private
+    `_mixture_cp_per_kg_dry_solid` (that module's only prior caller, which now
+    delegates here) so `core/balance.py`'s independent solid-side energy
+    checks can share the exact same, already-tested constitutive formula
+    without duplicating it -- a balance CHECK duplicating physics ad hoc would
+    itself be a maintenance/drift risk, whereas this is pure composition
+    -weighting, not a suspect balance term."""
+    m_total = 1.0 + X1 + X2 + X3
+    w_water, w_hexane, w_oil, w_ds = X1 / m_total, X2 / m_total, X3 / m_total, 1.0 / m_total
+    cp_per_kg_wet = cp_l(
+        w_water, w_hexane, w_oil, w_ds, (cp_water_liquid, cp_hexane_liquid, cp_oil, cp_solid)
+    )
+    return cp_per_kg_wet * m_total  # J/(kg WET . K) -> J/(kg DRY solid . K)
 
 
 def cp_vip(w_water_vapor: float, w_hexane_vapor: float, cps: tuple[float, float]) -> float:
@@ -278,6 +344,66 @@ def dew_point_temperature(
         return antoine_pressure_pa(T, antoine_water) - target
 
     return brentq(residual, *T_bounds)
+
+
+def water_activity(
+    Y_V2: float, T: float, antoine_water: AntoineParams, P: float = ATM_PRESSURE_PA
+) -> float:
+    """a_w = y_water*P / P_water,sat(T) -- water's own partial pressure
+    (Raoult's law, same convention as `dew_point_temperature`) relative to
+    its saturation pressure at the LOCAL temperature. Deliberately NOT
+    clamped to [0,1]: `a_w >= 1` is mathematically the same condition as
+    `T <= dew_point_temperature(Y_V2, ...)` (both say "water can't stay
+    vapor here") -- callers route that case to condensation, not this
+    isotherm (see `luikov_equilibrium_moisture`'s own docstring)."""
+    return _y_water_mole_fraction(Y_V2) * P / antoine_pressure_pa(T, antoine_water)
+
+
+@dataclass(frozen=True)
+class LuikovParams:
+    """Modified LUIKOV (1978) desorption isotherm coefficients -- Gianini,
+    Luz, Sousa, Jorge & Paraíso (2006), *Ciênc. Tecnol. Aliment.* 26(2):
+    408-413, Table 7, fit to soybean meal sampled DIRECTLY from a
+    desolventizer/toaster's own outlet (not a generic food-science
+    isotherm) across a combined 15-70 °C dataset -- temperature-INDEPENDENT
+    by design (the paper's own finding: T has no significant effect on
+    equilibrium moisture in that range, confirmed both graphically and
+    statistically, Tables 5 vs. 7)."""
+
+    A1: float
+    A2: float
+
+
+LUIKOV_MAX_VALIDATED_UR = 0.799
+"""Gianini et al.'s own highest tested water activity (their KCl saturated
+-salt-solution data point) -- callers must clamp `a_w` here before calling
+`luikov_equilibrium_moisture` (see that function's own docstring): the fitted
+curve climbs steeply toward its asymptote `A1` as `a_w -> 1` with zero
+supporting data past this point (confirmed: evaluating it unclamped where the
+local vapor phase sits close to saturation gives `Xe > 0.5`, a pure
+extrapolation artifact, not a real equilibrium). Shared here (not left as a
+private per-caller constant) because more than one caller now needs the exact
+same bound (`core/zones/dcz.py`'s DCZ moisture balance, `core/dc.py`'s
+dryer/cooler air-contact isotherm)."""
+
+
+def luikov_equilibrium_moisture(a_w: float, p: LuikovParams) -> float:
+    """Xe(a_w) = A1 / (1 + A2*ln(1/a_w)) -- equilibrium solid moisture (kg
+    water/kg dry solid) at water activity `a_w`. Valid domain is (0, 1),
+    matching the cited paper's own tested range (its own UR never exceeded
+    ~0.8) -- callers must keep `a_w` there themselves (e.g. `min(a_w, 1.0 -
+    eps)`); `a_w >= 1` is a genuinely different regime (condensation, not
+    sorption) with its own separate mechanism, not this isotherm extrapolated
+    past its own domain.
+
+    EXTRAPOLATION CAVEAT, stated not hidden: the cited paper's own
+    temperature range (15-70 °C / 288-343 K) sits below this project's own
+    DT-internal operating temperatures (DCZ currently reaches ~380 K+). Its
+    finding that temperature barely matters is reassuring but doesn't cover
+    that gap -- applying it there is a documented assumption, not a
+    validated one.
+    """
+    return p.A1 / (1.0 + p.A2 * math.log(1.0 / a_w))
 
 
 @dataclass(frozen=True)

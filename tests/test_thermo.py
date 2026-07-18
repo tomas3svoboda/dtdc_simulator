@@ -12,7 +12,7 @@ from dtdc_simulator.core import thermo as th
 # Real soybean GAB parameters, Cardarelli & Crapiste (1996) Table 2 (see
 # properties/soybean.yaml for the same values with provenance comments).
 SOYBEAN_GAB = th.GabParams(Xm=5.183e-3, C0=3.117e-3, dHC_R=2262.0, K0=9.172e-2, dHK_R=729.6)
-SOYBEAN_OIL = th.OilIsotherm(A0=0.8, B=1.0)  # [PLACE], no source available
+SOYBEAN_OIL = th.OilIsotherm(A0=0.9635, B=2.7036)  # [PAPER] Coletto supp. Table 1 (Cardarelli 1998)
 ANTOINE_WATER = th.AntoineParams(A=5.11564, B=1687.54, C=-42.98)
 ANTOINE_HEXANE = th.AntoineParams(A=4.00266, B=1171.53, C=-48.784)
 
@@ -50,6 +50,28 @@ def test_oil_hexane_content_monotonic_and_bounded() -> None:
     values = [th.oil_hexane_content(a, SOYBEAN_OIL) for a in (0.1, 0.5, 0.9)]
     assert values == sorted(values)
     assert th.oil_hexane_content(0.0, SOYBEAN_OIL) == 0.0
+
+
+def test_x2_so_and_slope_matches_direct_isotherm_sum_and_is_positive_slope() -> None:
+    T = 338.15
+    X3 = 0.0139
+    value, slope = th.x2_so_and_slope(0.5, T, X3, SOYBEAN_GAB, SOYBEAN_OIL)
+    expected_value = th.gab_hexane_content(0.5, T, SOYBEAN_GAB) + X3 * th.oil_hexane_content(
+        0.5, SOYBEAN_OIL
+    )
+    assert value == pytest.approx(expected_value)
+    assert slope > 0.0  # both isotherms increase with activity
+
+
+def test_x2_so_and_slope_handles_boundary_activities() -> None:
+    T = 338.15
+    X3 = 0.0139
+    # Near a_h=0 and a_h=1 the centered-difference step degenerates to a
+    # one-sided difference -- should not raise and should stay finite.
+    _, slope_low = th.x2_so_and_slope(0.0, T, X3, SOYBEAN_GAB, SOYBEAN_OIL)
+    _, slope_high = th.x2_so_and_slope(1.0, T, X3, SOYBEAN_GAB, SOYBEAN_OIL)
+    assert math.isfinite(slope_low)
+    assert math.isfinite(slope_high)
 
 
 # ------------------------------------------------------------------ heat of sorption
@@ -114,6 +136,23 @@ def test_cp_l_and_cp_vip_weighted_sums() -> None:
 
     cp_V = th.cp_vip(0.8, 0.2, (1900.0, 1650.0))
     assert cp_V == pytest.approx(0.8 * 1900.0 + 0.2 * 1650.0)
+
+
+def test_mixture_cp_per_kg_dry_solid_matches_cp_l_converted_to_dry_basis() -> None:
+    # X1/X2/X3 are kg-per-kg-DRY-solid ratios; cp_l works in mass FRACTIONS of
+    # the wet total -- mixture_cp_per_kg_dry_solid must convert one to the
+    # other consistently (this is exactly the conversion zones/phz.py's own
+    # now-delegating _mixture_cp_per_kg_dry_solid used to do inline).
+    X1, X2, X3 = 0.15, 0.005, 0.02
+    cps = (4186.0, 2260.0, 2000.0, 1800.0)
+    m_total = 1.0 + X1 + X2 + X3
+    expected_per_kg_wet = th.cp_l(X1 / m_total, X2 / m_total, X3 / m_total, 1.0 / m_total, cps)
+    result = th.mixture_cp_per_kg_dry_solid(X1, X2, X3, *cps)
+    assert result == pytest.approx(expected_per_kg_wet * m_total)
+    # Sanity: per-kg-DRY-solid capacity must exceed per-kg-WET capacity (a kg
+    # of dry solid carries MORE than a kg of wet mixture, since 1 kg dry solid
+    # corresponds to m_total kg wet).
+    assert result > expected_per_kg_wet
 
 
 def test_faner_nusselt_and_heat_transfer_coefficient() -> None:

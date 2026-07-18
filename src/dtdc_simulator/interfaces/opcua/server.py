@@ -35,7 +35,6 @@ REFRESH_S = 0.2
 _KPI_FIELDS = (
     "residual_hexane",
     "meal_moisture",
-    "urease_proxy",
     "protein_solubility",
     "steam_consumption",
     "throughput",
@@ -55,6 +54,7 @@ class OpcUaAdapter:
         self._sim_nodes: dict[str, Node] = {}
         self._last_global_mode = Mode.MANUAL.value
         self._last_speed_factor: float | None = None
+        self._last_dt_resolve_interval_s: float | None = None
         self._last_mv_mode: dict[str, str] = {}
         self._last_mv_manual: dict[str, float] = {}
         self._last_mv_auto: dict[str, float] = {}
@@ -82,6 +82,13 @@ class OpcUaAdapter:
         speed = await sim.add_variable(idx, "SpeedFactor", float(snap.speed_factor))
         await speed.set_writable()
         self._last_speed_factor = float(snap.speed_factor)
+        # M3a follow-up ("C"): live-tunable DT resolve cadence, same
+        # writable-node/change-detection pattern as SpeedFactor.
+        dt_resolve_interval = await sim.add_variable(
+            idx, "DTResolveIntervalS", float(snap.dt_resolve_interval_s)
+        )
+        await dt_resolve_interval.set_writable()
+        self._last_dt_resolve_interval_s = float(snap.dt_resolve_interval_s)
         sim_time = await sim.add_variable(idx, "SimTime", float(snap.sim_time))
         actual_speed = await sim.add_variable(idx, "ActualSpeed", float(snap.actual_speed))
         state = await sim.add_variable(idx, "State", snap.state.value)
@@ -91,15 +98,23 @@ class OpcUaAdapter:
             idx, "UndersampleWarning", bool(snap.undersample_warning)
         )
         solver_stress = await sim.add_variable(idx, "SolverStress", bool(snap.solver_stress))
+        # M3a: raw convergence diagnostic behind SolverStress's bool summary (§7.9/§9.1).
+        dt_outer_iters = await sim.add_variable(
+            idx,
+            "DTSolverOuterIterations",
+            int(snap.outputs.dt_solver_outer_iterations) if snap.outputs else 0,
+        )
 
         self._sim_nodes = {
             "SpeedFactor": speed,
+            "DTResolveIntervalS": dt_resolve_interval,
             "SimTime": sim_time,
             "ActualSpeed": actual_speed,
             "State": state,
             "GlobalMode": global_mode,
             "UndersampleWarning": undersample,
             "SolverStress": solver_stress,
+            "DTSolverOuterIterations": dt_outer_iters,
         }
 
         facade = self._facade
@@ -195,7 +210,6 @@ class OpcUaAdapter:
                 "T": outputs.stage_T[stage_id],
                 "X_hex": outputs.stage_X_hex_ppm[stage_id],
                 "X_w": outputs.stage_X_w_pct[stage_id],
-                "TIA": outputs.stage_TIA[stage_id],
                 "Sprot": outputs.stage_Sprot[stage_id],
                 "VaporTemp": outputs.stage_vapor_temp[stage_id],
                 "Level": outputs.stage_level_pct[stage_id],
@@ -208,7 +222,6 @@ class OpcUaAdapter:
         kpi_map = {
             "residual_hexane": outputs.kpi_residual_hexane_ppm,
             "meal_moisture": outputs.kpi_meal_moisture_pct,
-            "urease_proxy": outputs.kpi_urease_proxy,
             "protein_solubility": outputs.kpi_protein_solubility_pct,
             "steam_consumption": outputs.kpi_steam_consumption_kg_per_t,
             "throughput": outputs.kpi_throughput_t_per_day,
@@ -231,6 +244,11 @@ class OpcUaAdapter:
         if speed_val != self._last_speed_factor:
             facade.set_speed_factor(speed_val)
             self._last_speed_factor = speed_val
+
+        dt_resolve_val = float(await self._sim_nodes["DTResolveIntervalS"].read_value())
+        if dt_resolve_val != self._last_dt_resolve_interval_s:
+            facade.set_dt_resolve_interval_s(dt_resolve_val)
+            self._last_dt_resolve_interval_s = dt_resolve_val
 
         global_mode_val = await self._sim_nodes["GlobalMode"].read_value()
         if global_mode_val != self._last_global_mode:
@@ -272,8 +290,13 @@ class OpcUaAdapter:
         await self._sim_nodes["ActualSpeed"].write_value(float(snap.actual_speed))
         await self._sim_nodes["State"].write_value(snap.state.value)
         await self._sim_nodes["SpeedFactor"].write_value(float(snap.speed_factor))
+        await self._sim_nodes["DTResolveIntervalS"].write_value(float(snap.dt_resolve_interval_s))
         await self._sim_nodes["UndersampleWarning"].write_value(bool(snap.undersample_warning))
         await self._sim_nodes["SolverStress"].write_value(bool(snap.solver_stress))
+        if snap.outputs is not None:
+            await self._sim_nodes["DTSolverOuterIterations"].write_value(
+                int(snap.outputs.dt_solver_outer_iterations)
+            )
 
         for key, mv in snap.mvs.items():
             nodes = self._mv_nodes[key]
@@ -292,7 +315,6 @@ class OpcUaAdapter:
             await nodes["T"].write_value(float(outputs.stage_T[stage_id]))
             await nodes["X_hex"].write_value(float(outputs.stage_X_hex_ppm[stage_id]))
             await nodes["X_w"].write_value(float(outputs.stage_X_w_pct[stage_id]))
-            await nodes["TIA"].write_value(float(outputs.stage_TIA[stage_id]))
             await nodes["Sprot"].write_value(float(outputs.stage_Sprot[stage_id]))
             await nodes["VaporTemp"].write_value(float(outputs.stage_vapor_temp[stage_id]))
             await nodes["Level"].write_value(float(outputs.stage_level_pct[stage_id]))
@@ -300,7 +322,6 @@ class OpcUaAdapter:
         kpi_map = {
             "residual_hexane": outputs.kpi_residual_hexane_ppm,
             "meal_moisture": outputs.kpi_meal_moisture_pct,
-            "urease_proxy": outputs.kpi_urease_proxy,
             "protein_solubility": outputs.kpi_protein_solubility_pct,
             "steam_consumption": outputs.kpi_steam_consumption_kg_per_t,
             "throughput": outputs.kpi_throughput_t_per_day,

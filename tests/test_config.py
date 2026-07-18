@@ -14,7 +14,7 @@ def test_load_scenario_ok() -> None:
     cfg = load_scenario(SCENARIO_PATH)
     assert isinstance(cfg, ScenarioConfig)
     assert cfg.material == "soybean"
-    assert cfg.geometry.n_stages == 8
+    assert cfg.geometry.n_stages == 6
 
 
 def test_scenario_resolves_physical_from_properties_dir() -> None:

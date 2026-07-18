@@ -12,13 +12,17 @@
 #
 # Primary sources:
 #   Coletto, Bandoni & Blanco (2022) J. Food Eng. 318, 110870   -> geometry, base operating point, correlations
+#   Coletto, Bandoni & Blanco (2022) Supplementary material     -> Table 1: oil isotherm (A0/B), D_ax, D_HW,
+#                                                                   cp_ps, cp_vapor, mu_vapor, k_ps, k_pg, k_mixL
 #   Cardarelli & Crapiste (1996) JAOCS 73(12) 1657-1661         -> GAB isotherm (Table 2, soybean, exact)
 #   Cardarelli, Crapiste & Mattea (2002) J. Food Eng. 52, 127   -> Table 1: rho_solid, porosities, D_eff,
-#                                                                   particle radius, vapor viscosity (exact)
-# NOTE: the oil-in-hexane power law (A0/B) and the heat-of-sorption constants (sorption_C0/C1) are cited
-#       by Coletto (2022) to two unpublished PhD theses (Cardarelli 1998; Faner 2008) not available to
-#       us — no source we have states their fitted values. Tagged [PLACE] (order-of-magnitude, NOT fit to
-#       data) until/unless those theses (or another source stating the fitted numbers) surface.
+#                                                                   particle radius (exact)
+# NOTE: the heat-of-sorption constants (sorption_C0/C1) are still cited by Coletto (2022) to an unpublished
+#       PhD thesis (Cardarelli 1998; Faner 2008) not available to us, even after the supplementary material
+#       (whose own nomenclature lists C0/C1 without stating their values). Tagged [PLACE] (order-of-magnitude,
+#       NOT fit to data) until/unless that thesis (or another source stating the fitted numbers) surfaces.
+#       The oil-in-hexane isotherm (A0/B), previously in the same boat, was recovered from the supplementary
+#       material's own parameters table and is now [PAPER] — see DECISIONS.md's M2 Phase 3 entry.
 
 material_name: soybean
 
@@ -32,14 +36,18 @@ rho_ps:      1513.0          # kg/m3 [PAPER] particle solid-phase density, same 
 rho_vapor_ref: 0.6           # kg/m3 [DERIVED] steam/hexane mix near 1 atm, ~373 K
 rho_hexane_liquid_ref: 615.0 # kg/m3 [DERIVED] Daubert-Danner B.11-B.12 near bp
 # specific heats
-cp_solid:        1800.0      # J/kgK [PLACE] dry oilseed meal
-cp_vapor:        2000.0      # J/kgK [PLACE] steam/hexane vapor mix (legacy mean, superseded by the two below)
+cp_solid:        2317.0      # J/kgK [PAPER] Coletto supp. Table 1, "Solid specific heat" (ASHRAE 2006)
+cp_vapor:        1926.0      # J/kgK [PAPER] Coletto supp. Table 1, "Vapor specific heat" (Cardarelli 1998)
 cp_water_liquid: 4186.0      # J/kgK [STD]
 cp_water_vapor:  1900.0      # J/kgK [STD] steam, ~370 K (B.6 CPVip)
 cp_hexane_vapor: 1650.0      # J/kgK [STD] n-hexane gas, ~340-370 K (B.6 CPVip)
 cp_hexane_liquid: 2260.0     # J/kgK [STD] liquid n-hexane, ~25-70 C (B.5 CPL)
 cp_oil:          2000.0      # J/kgK [PLACE] soybean oil
-mu_vapor:        1.3e-5      # Pa.s  [PAPER] Cardarelli, Crapiste & Mattea (2002) Table 1
+mu_vapor:        1.329e-5    # Pa.s  [PAPER] Coletto supp. Table 1, "Vapor viscosity" (Cardarelli, Crapiste & Mattea 2002)
+# thermal conductivities (DCZ particle + bed scale, A.23/A.32) — all [PAPER] Coletto supp. Table 1
+k_ps:    0.29                # W/mK  "Solid thermal conductivity" (American Society of Heating and Engineers 2006)
+k_pg:    0.02371              # W/mK  "Vapor thermal conductivity" (NIST 2020) -- pore gas ~ hexane/water vapor
+k_mixL:  0.24                 # W/mK  "Porous solid mixture thermal conductivity" (ASHRAE 2006)
 # porosity / volume fractions
 bed_porosity:      0.40      # -     [PAPER] eps_b, Cardarelli, Crapiste & Mattea (2002) Table 1 ("void fraction in the bed")
 particle_porosity: 0.50      # -     [PAPER] eps_p, same source ("particle porosity")
@@ -50,6 +58,36 @@ oil_fraction:      0.01      # kg/kg [PAPER-ish] residual oil in meal (X3), ~1% 
 # heat of sorption  dH_s = dH_lv2 + C0 * W2^C1   (A.31)
 sorption_C0: 3.0e5           # [PLACE] no source available (see note above); order-of-magnitude only
 sorption_C1: -0.5            # [PLACE] no source available (see note above); order-of-magnitude only
+# Water's own bed-scale equilibration rate (DCZ moisture, subsaturated regime) -- found this
+# session (DECISIONS.md): reusing hexane's own hM here (a Faner-correlation, hexane-vapor-tuned
+# value) was ~25-100x too fast once genuinely coupled to an energy balance (confirmed: inverted
+# the basic "more indirect duty -> hotter exit" relationship). Tried the water-specific
+# CONVECTIVE coefficient from literature_sources/Touffet_Moisture_sorption_and_diffusion_in_
+# pellet_animal_feed.pdf (2026, dynamic vapor sorption on pelleted animal feed) next, but their
+# own reported ~6-7.2e-3 m/s (Fig. 5) still implies near-instant equilibration at this project's
+# own bed geometry -- confirmed directly, still ~500x faster than the DT's own per-cell
+# residence time. Their own Biot-number analysis explains why: INTERNAL particle diffusion, not
+# external convection, is the actual rate-limiting step for their material (as it is for
+# hexane's own D_eff in this project). Using their own diffusion coefficient instead, via the
+# standard Glueckauf linear-driving-force approximation for a sphere (k_LDF = 15*D/rP^2, core/
+# zones/dcz.py's own `kappa_w`) -- their highest MEASURED value (60 C, Fig. 7) is 6.2e-9 m2/s.
+# Using it directly still produced a volumetric latent-heat source (`water_latent_w_m3`) that
+# came out COMPARABLE TO OR LARGER than the indirect-steam duty itself in every DCZ cell of the
+# real scenario, dominating the energy balance and inverting the basic "more indirect duty ->
+# hotter exit" relationship a second time (this time via a real, not double-counted, adsorption
+# /desorption thermostat effect: hotter -> lower water activity -> lower isotherm target ->
+# desorption releases negative "credit" faster than direct duty can outrun it) -- confirmed by
+# zeroing the term and by a direct q_Iv-vs-water_latent magnitude dump (DECISIONS.md). Touffet's
+# own material (pelleted ANIMAL FEED, tested only 25-65 C) is a different matrix than toasted
+# SOYBEAN MEAL operating at DCZ's own ~100-140 C -- a genuine extrapolation gap, not just a
+# calibration nicety. Derated by a documented, ENGINEERING-JUDGMENT factor of 20 (not literature
+# -derived) as the minimum correction found to keep `water_latent_w_m3` comfortably below
+# `q_Iv_profile`'s own magnitude and restore monotonicity, confirmed via a sweep (10x: still
+# marginal/inverted at some cells; 15x: monotonic but thin margin; 20x: comfortable margin;
+# swept up to 50x with diminishing extra benefit) -- pending better literature data specific to
+# this material/temperature range.
+water_diffusivity: 3.1e-11   # m2/s  [PAPER-adjacent, DERATED 20x] Touffet et al. 2026 Fig. 7 (6.2e-10
+                              # at their own 60 C peak) / 20 -- see comment above, not literature-exact
 # GAB isotherm (solid-phase hexane), W2_eq = GAB(ah,T) — Cardarelli & Crapiste (1996) Table 2, soybean,
 # converted from their Hm [g hexane/100 g dry meal] to Xm [kg/kg dry solid] (Hm/100)
 gab_params:
@@ -59,7 +97,14 @@ gab_params:
   K0: 9.172e-2      # [PAPER]
   dHK_R: 729.6      # [PAPER] K, delta_H_K/R
 # hexane-in-oil power law  qo = A0 * ah^B   (eq. 7, oil basis)
-oil_isotherm: {A0: 0.8, B: 1.0}   # [PLACE] no source available (see note above); order-of-magnitude only
+oil_isotherm: {A0: 0.9635, B: 2.7036}   # [PAPER] Coletto supp. Table 1 (Cardarelli 1998)
+# Water desorption isotherm (solid-phase moisture), Xe = A1 / (1 + A2*ln(1/UR)) — modified LUIKOV
+# (1978) form, fit by Gianini, Luz, Sousa, Jorge & Paraíso (2006) Ciênc. Tecnol. Aliment. 26(2):
+# 408-413, Table 7, to soybean meal sampled DIRECTLY from a desolventizer/toaster's own outlet
+# (Cocamar), combined across 15/25/35/50/60/70 C (R2=0.99 -- best of LUIKOV/HALSEY/HENDERSON-
+# THOMPSON). Temperature-independent by the cited paper's own finding in that range; [PAPER] but
+# EXTRAPOLATED above 70 C for this model's own hotter DT-internal zones -- see DECISIONS.md.
+water_luikov: {A1: 0.880, A2: 12.184}   # [PAPER, extrapolated above 70 C]
 # Antoine (log10 P[bar] = A - B/(C+T[K])) — support for VLLE/dew point
 antoine_hexane: {A: 4.00266, B: 1171.53, C: -48.784}   # [STD] NIST n-hexane
 antoine_water:  {A: 5.11564, B: 1687.54, C: -42.98}    # [STD] NIST water

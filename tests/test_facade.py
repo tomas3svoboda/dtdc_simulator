@@ -10,6 +10,18 @@ SCENARIO_PATH = "scenarios/soybean_default.yaml"
 def _facade_freerun() -> RuntimeFacade:
     cfg = load_scenario(SCENARIO_PATH)
     cfg.sim.clock = ClockKind.FREERUN
+    # M3a: assemble() now runs one real solve_dt() call inside init_state(),
+    # and FreeRunClock's sim_time genuinely advances tick-to-tick (unlike
+    # test_model.py's direct model.step() calls, which hold t constant) --
+    # so a long tick loop here WILL eventually cross dt_resolve_interval_s
+    # and trigger further real solves. These tests exercise facade PLUMBING
+    # (state transitions, MV routing), not DT physics correctness (that's
+    # test_dt_solver.py's/test_model.py's job) -- so an even coarser mesh
+    # than the scenario's own real-time default is an appropriate trade,
+    # kept local to this test file's own config copy.
+    cfg.model.dt_nz_phz = 5
+    cfg.model.dt_nz_ftrz = 5
+    cfg.model.dt_nz_dcz = 4
     facade = RuntimeFacade()
     facade.configure(cfg)
     facade.assemble()

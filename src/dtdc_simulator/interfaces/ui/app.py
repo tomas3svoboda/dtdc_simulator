@@ -9,7 +9,7 @@ The dashboard has two views:
 
   * "Overview" — a compact two-column tower schematic (DT: PREDESOLV/MAIN/
     SPARGE trays; DC: DRYER/COOLER, separate per the physical vessel split),
-    each tray showing live T/hexane/moisture/TIA plus a bed-level bar, next
+    each tray showing live T/hexane/moisture plus a bed-level bar, next
     to two profile charts that plot temperature and quality *along the
     tower* (x-axis = stage position) — how process engineers read a DTDC's
     state at a glance.
@@ -40,7 +40,6 @@ SYNC_INTERVAL_S = 0.3
 OUTLET_WINDOW_S = 3600.0  # moving window for the outlet quality trend chart
 
 _KPI_TILES = (
-    ("kpi_urease_proxy", "TIA — dried meal outlet [%]", "{:.1f}"),
     ("kpi_residual_hexane_ppm", "Residual hexane [ppm]", "{:.0f}"),
     ("kpi_meal_moisture_pct", "Meal moisture [%]", "{:.2f}"),
     ("kpi_protein_solubility_pct", "Protein solubility [%]", "{:.1f}"),
@@ -94,12 +93,6 @@ _SIEMENS_AMBER = "#F2A900"
 _SIEMENS_RED = "#E2001A"
 
 _K_OFFSET = 273.15
-
-# Raw/untoasted meal entering the DT hasn't seen any thermal treatment yet, so its
-# trypsin-inhibitor activity sits at the fully-active reference baseline: `C_TIA`
-# is defined as a fraction of this same initial value (core/model.py: State.C_TIA
-# seeds at 1.0 for every stage), so 100% is the correct feed-point estimate.
-_FEED_TIA_PCT = 100.0
 
 
 def _k_to_c(k: float) -> float:
@@ -237,8 +230,10 @@ def create_app(
 
         _inject_siemens_theme()
 
-        with ui.header().classes("items-center justify-between px-4").style(
-            f"background-color: {_SIEMENS_DARK};"
+        with (
+            ui.header()
+            .classes("items-center justify-between px-4")
+            .style(f"background-color: {_SIEMENS_DARK};")
         ):
             ui.label("DTDC Real-Time Simulator").classes("text-xl font-bold text-white")
             ui.label("Digital Twin — Desolventizer / Toaster / Dryer / Cooler").classes(
@@ -252,21 +247,24 @@ def create_app(
         with setup_container, ui.card().classes("w-full max-w-2xl"):
             ui.label("Setup").classes("text-lg font-semibold")
             path_input = ui.input("Scenario YAML path", value=default_scenario).classes("w-full")
+            start_empty_checkbox = ui.checkbox(
+                "Start empty (watch material propagate through the unit)"
+            )
             error_label = ui.label("").classes("text-red-600")
 
             def do_load() -> None:
                 try:
                     cfg = load_scenario(path_input.value)
+                    cfg.sim.dt_start_empty = start_empty_checkbox.value
                     facade.configure(cfg)
                     facade.assemble()
                     error_label.text = ""
                     hexane_slider.value = round(cfg.disturbance_defaults.feed_hexane * 100.0, 1)
-                    moisture_slider.value = round(
-                        cfg.disturbance_defaults.feed_moisture * 100.0, 1
-                    )
+                    moisture_slider.value = round(cfg.disturbance_defaults.feed_moisture * 100.0, 1)
                     feed_temp_slider.value = round(
                         _k_to_c(cfg.disturbance_defaults.feed_temperature), 1
                     )
+                    resolve_interval_input.value = cfg.operating_defaults.dt_resolve_interval_s
                 except (
                     Exception
                 ) as exc:  # noqa: BLE001 - surface load/validation errors to the user
@@ -298,6 +296,22 @@ def create_app(
                     value=20.0,
                     on_change=lambda e: facade.set_speed_factor(float(e.value)),
                 ).classes("w-48").props("label-always")
+                # M3a follow-up ("C"): live-tunable DT resolve cadence -- min=120
+                # matches the schema/facade-enforced floor (config/schema.py's
+                # OperatingDefaults.dt_resolve_interval_s, engine/facade.py's
+                # set_dt_resolve_interval_s). The label makes the resulting
+                # wall-clock gap (dt_resolve_interval_s/speed_factor) visible
+                # live instead of hidden in a YAML file -- directly what was
+                # asked for ("write somewhere what the time discretization
+                # step is").
+                ui.label("DT resolve interval [s]")
+                resolve_interval_input = ui.number(
+                    min=120,
+                    step=10,
+                    value=400.0,
+                    on_change=lambda e: facade.set_dt_resolve_interval_s(float(e.value)),
+                ).classes("w-24")
+                resolve_gap_label = ui.label().classes("text-xs text-gray-500")
                 ui.label("Global mode")
                 ui.toggle(
                     {Mode.MANUAL.value: "MANUAL", Mode.AUTO.value: "AUTO"},
@@ -310,35 +324,49 @@ def create_app(
                 with ui.row().classes("w-full gap-8 items-center flex-wrap"):
                     with ui.column().classes("gap-0"):
                         ui.label("Hexane [%]").classes("text-xs text-gray-500")
-                        hexane_slider = ui.slider(
-                            min=10,
-                            max=50,
-                            step=1,
-                            value=26,
-                            on_change=lambda e: facade.set_dv("feed_hexane", float(e.value) / 100.0),
-                        ).classes("w-48").props("label-always")
+                        hexane_slider = (
+                            ui.slider(
+                                min=10,
+                                max=50,
+                                step=1,
+                                value=26,
+                                on_change=lambda e: facade.set_dv(
+                                    "feed_hexane", float(e.value) / 100.0
+                                ),
+                            )
+                            .classes("w-48")
+                            .props("label-always")
+                        )
                     with ui.column().classes("gap-0"):
                         ui.label("Moisture [%]").classes("text-xs text-gray-500")
-                        moisture_slider = ui.slider(
-                            min=5,
-                            max=25,
-                            step=1,
-                            value=7,
-                            on_change=lambda e: facade.set_dv(
-                                "feed_moisture", float(e.value) / 100.0
-                            ),
-                        ).classes("w-48").props("label-always")
+                        moisture_slider = (
+                            ui.slider(
+                                min=5,
+                                max=25,
+                                step=1,
+                                value=7,
+                                on_change=lambda e: facade.set_dv(
+                                    "feed_moisture", float(e.value) / 100.0
+                                ),
+                            )
+                            .classes("w-48")
+                            .props("label-always")
+                        )
                     with ui.column().classes("gap-0"):
                         ui.label("Feed temperature [°C]").classes("text-xs text-gray-500")
-                        feed_temp_slider = ui.slider(
-                            min=40,
-                            max=80,
-                            step=1,
-                            value=57,
-                            on_change=lambda e: facade.set_dv(
-                                "feed_temperature", _c_to_k(float(e.value))
-                            ),
-                        ).classes("w-48").props("label-always")
+                        feed_temp_slider = (
+                            ui.slider(
+                                min=40,
+                                max=80,
+                                step=1,
+                                value=57,
+                                on_change=lambda e: facade.set_dv(
+                                    "feed_temperature", _c_to_k(float(e.value))
+                                ),
+                            )
+                            .classes("w-48")
+                            .props("label-always")
+                        )
 
             with ui.row().classes("w-full gap-4"):
                 with ui.card().classes("w-48"):
@@ -372,8 +400,10 @@ def create_app(
                             # Bounded + internally scrollable: the tower's own trays are at
                             # most one small scroll away, but the rest of the dashboard
                             # (controls, KPIs, charts) never needs the page to scroll for it.
-                            with ui.row().classes("w-full gap-3 items-start").style(
-                                "max-height: 640px; overflow-y: auto;"
+                            with (
+                                ui.row()
+                                .classes("w-full gap-3 items-start")
+                                .style("max-height: 640px; overflow-y: auto;")
                             ):
                                 with ui.column().classes("gap-1").style("flex: 1 1 0%"):
                                     ui.label("DT — Desolventizer / Toaster").classes(
@@ -387,9 +417,7 @@ def create_app(
                                     dc_column = ui.column().classes("w-full gap-1")
 
                         # ---- right: spatial profiles along the tower ----
-                        with ui.column().classes("gap-4").style(
-                            "flex: 1 1 0%; min-width: 420px"
-                        ):
+                        with ui.column().classes("gap-4").style("flex: 1 1 0%; min-width: 420px"):
                             ui.label("Temperature Profile Along Tower").classes(
                                 "text-lg font-semibold"
                             )
@@ -459,30 +487,6 @@ def create_app(
                                             "name": "Moisture",
                                             "type": "line",
                                             "itemStyle": {"color": "#94a300"},
-                                            "areaStyle": {"opacity": 0.08},
-                                            "data": [],
-                                            "markArea": {"data": []},
-                                        }
-                                    ],
-                                    "tooltip": {"trigger": "axis"},
-                                }
-                            ).classes("w-full h-48")
-
-                            tia_profile_plot = ui.echart(
-                                {
-                                    "grid": {"containLabel": True},
-                                    "xAxis": {"type": "category", "data": []},
-                                    "yAxis": {
-                                        "type": "value",
-                                        "name": "TIA [%]",
-                                        "scale": True,
-                                        "splitNumber": 3,
-                                    },
-                                    "series": [
-                                        {
-                                            "name": "TIA",
-                                            "type": "line",
-                                            "itemStyle": {"color": "#343a40"},
                                             "areaStyle": {"opacity": 0.08},
                                             "data": [],
                                             "markArea": {"data": []},
@@ -599,7 +603,6 @@ def create_app(
                 temp_profile_plot,
                 hexane_profile_plot,
                 moisture_profile_plot,
-                tia_profile_plot,
                 plot,
                 outlet_trend_plot,
             ):
@@ -623,9 +626,12 @@ def create_app(
         ) -> tuple[ui.card, dict[str, object]]:
             style = _ROLE_STYLE.get(role, {"border": "border-gray-400", "badge": "grey"})
             widgets: dict[str, object] = {}
-            with container, ui.card().classes(
-                f"w-full border-l-4 {style['border']}"
-            ).style("padding: 6px 10px;") as card:
+            with (
+                container,
+                ui.card()
+                .classes(f"w-full border-l-4 {style['border']}")
+                .style("padding: 6px 10px;") as card,
+            ):
                 with ui.row().classes("items-center justify-between w-full"):
                     with ui.row().classes("items-center gap-2"):
                         ui.label(sid).classes("font-bold text-xs")
@@ -637,7 +643,6 @@ def create_app(
                     widgets["T"] = _compact_metric("°C")
                     widgets["hex"] = _compact_metric("ppm")
                     widgets["water"] = _compact_metric("% H2O")
-                    widgets["tia"] = _compact_metric("% TIA")
                     if role in DT_ROLES:
                         widgets["steam"] = _compact_metric("kW")
                     if role == "SPARGE":
@@ -645,9 +650,13 @@ def create_app(
                     if role in ("DRYER", "COOLER"):
                         widgets["air"] = _compact_metric("°C / kg/s")
                 with ui.row().classes("items-center gap-2 w-full mt-1"):
-                    bar_bg = ui.element("div").classes("flex-1").style(
-                        f"height:6px; border-radius:3px; background:{_SIEMENS_BORDER}; "
-                        "overflow:hidden;"
+                    bar_bg = (
+                        ui.element("div")
+                        .classes("flex-1")
+                        .style(
+                            f"height:6px; border-radius:3px; background:{_SIEMENS_BORDER}; "
+                            "overflow:hidden;"
+                        )
                     )
                     with bar_bg:
                         fill = ui.element("div").style(
@@ -672,9 +681,11 @@ def create_app(
             product_column = dc_column if dc_stage_ids else dt_column
 
             with dt_column:
-                with ui.card().classes(f"w-full border-l-4 {_FEED_BORDER}").style(
-                    "padding: 6px 10px;"
-                ) as feed_card:
+                with (
+                    ui.card()
+                    .classes(f"w-full border-l-4 {_FEED_BORDER}")
+                    .style("padding: 6px 10px;") as feed_card
+                ):
                     with ui.row().classes("items-center justify-between"):
                         ui.label("FEED").classes("font-bold text-xs")
                         ui.badge("IN").props("color=grey")
@@ -692,9 +703,11 @@ def create_app(
                 tower_cards[sid] = card
 
             with product_column:
-                with ui.card().classes(f"w-full border-l-4 {_FEED_BORDER}").style(
-                    "padding: 6px 10px;"
-                ) as product_card:
+                with (
+                    ui.card()
+                    .classes(f"w-full border-l-4 {_FEED_BORDER}")
+                    .style("padding: 6px 10px;") as product_card
+                ):
                     with ui.row().classes("items-center justify-between"):
                         ui.label("PRODUCT").classes("font-bold text-xs")
                         ui.badge("OUT").props("color=grey")
@@ -702,7 +715,6 @@ def create_app(
                         product_widgets["T"] = _compact_metric("°C")
                         product_widgets["hex"] = _compact_metric("ppm")
                         product_widgets["water"] = _compact_metric("% H2O")
-                        product_widgets["tia"] = _compact_metric("% TIA")
 
             profile_categories = ["FEED"] + list(stage_order)
             roles_for_bands = ["FEED"] + [stage_roles.get(sid, "") for sid in stage_order]
@@ -711,7 +723,6 @@ def create_app(
                 temp_profile_plot,
                 hexane_profile_plot,
                 moisture_profile_plot,
-                tia_profile_plot,
             ):
                 plot_.options["xAxis"]["data"] = profile_categories
                 plot_.options["series"][0]["markArea"]["data"] = profile_role_bands
@@ -729,6 +740,13 @@ def create_app(
             speed_label.text = f"Actual speed: {snap.actual_speed:.2f}x"
             undersample_badge.visible = snap.undersample_warning
             solver_badge.visible = snap.solver_stress
+            wall_gap_s = snap.dt_resolve_interval_s / max(snap.speed_factor, 1.0e-9)
+            resolve_gap_label.text = f"(~{wall_gap_s:.0f}s wall-clock between DT updates)"
+            if snap.outputs is not None:
+                solver_badge.tooltip(
+                    f"DT solve: {'converged' if snap.outputs.dt_solver_converged else 'NOT converged'} "
+                    f"({snap.outputs.dt_solver_outer_iterations} outer iterations)"
+                )
 
             nonlocal known_mv_keys, built_stage_order
             mv_keys = list(snap.mvs.keys())
@@ -769,7 +787,9 @@ def create_app(
                 feed_widgets["hex"].text = f"{feed_hex_pct:.2f} % hex"
                 feed_widgets["water"].text = f"{feed_water_pct:.2f} % H2O"
             if feed_card is not None:
-                feed_card.style(replace=f"background-color: {_heat_color(feed_temperature_k, 0.12)}")
+                feed_card.style(
+                    replace=f"background-color: {_heat_color(feed_temperature_k, 0.12)}"
+                )
 
             outputs = snap.outputs
             if outputs is None:
@@ -786,7 +806,6 @@ def create_app(
                 widgets["T"].text = f"{_k_to_c(t_val):.1f} °C"
                 widgets["hex"].text = f"{outputs.stage_X_hex_ppm[sid]:.0f} ppm"
                 widgets["water"].text = f"{outputs.stage_X_w_pct[sid]:.2f} % H2O"
-                widgets["tia"].text = f"{outputs.stage_TIA[sid]:.1f} % TIA"
                 card = tower_cards.get(sid)
                 if card is not None:
                     card.style(replace=f"background-color: {_heat_color(t_val, 0.12)}")
@@ -824,7 +843,6 @@ def create_app(
                 product_widgets["T"].text = f"{_k_to_c(outputs.stage_T[last_sid]):.1f} °C"
                 product_widgets["hex"].text = f"{outputs.stage_X_hex_ppm[last_sid]:.0f} ppm"
                 product_widgets["water"].text = f"{outputs.stage_X_w_pct[last_sid]:.2f} % H2O"
-                product_widgets["tia"].text = f"{outputs.stage_TIA[last_sid]:.1f} % TIA"
                 if product_card is not None:
                     product_card.style(
                         replace=(
@@ -855,17 +873,10 @@ def create_app(
                 water_data = [feed_water_pct] + [
                     outputs.stage_X_w_pct[sid] for sid in snap.stage_order
                 ]
-                # Feed meal hasn't been thermally treated yet, so its trypsin-inhibitor
-                # activity is still at the fully-active reference baseline (100%).
-                tia_data = [_FEED_TIA_PCT] + [
-                    outputs.stage_TIA[sid] for sid in snap.stage_order
-                ]
                 hexane_profile_plot.options["series"][0]["data"] = hex_data
                 hexane_profile_plot.update()
                 moisture_profile_plot.options["series"][0]["data"] = water_data
                 moisture_profile_plot.update()
-                tia_profile_plot.options["series"][0]["data"] = tia_data
-                tia_profile_plot.update()
 
             history_t.append(snap.sim_time)
             for sid, t_val in outputs.stage_T.items():

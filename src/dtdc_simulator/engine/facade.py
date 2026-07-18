@@ -57,6 +57,7 @@ class Snapshot:
     outputs: Outputs | None
     stage_roles: dict[str, str]
     stage_order: list[str]
+    dt_resolve_interval_s: float  # M3a follow-up ("C")
 
 
 class RuntimeFacade:
@@ -84,6 +85,9 @@ class RuntimeFacade:
         self._undersample_warning = False
         self._solver_stress = False
         self._shutdown = False
+        # M3a follow-up ("C"): HOT, live-tunable -- see config/schema.py's
+        # OperatingDefaults.dt_resolve_interval_s for the 120s-floor rationale.
+        self._dt_resolve_interval_s = 120.0
 
     # ------------------------------------------------------------------ lifecycle
     @property
@@ -121,6 +125,7 @@ class RuntimeFacade:
             self._speed_factor = config.sim.speed_factor
             self._undersample_warning = False
             self._solver_stress = False
+            self._dt_resolve_interval_s = config.operating_defaults.dt_resolve_interval_s
             self._build_registry(config)
             u0 = self._read_effective_inputs_locked(0.0)
             self._latest_outputs = model.outputs(self._x, u0)
@@ -254,6 +259,14 @@ class RuntimeFacade:
             if isinstance(self._clock, RealTimeClock):
                 self._clock.speed_factor = value
 
+    def set_dt_resolve_interval_s(self, value: float) -> None:
+        """M3a follow-up ("C"): live-tunable from the UI/OPC UA while
+        RUNNING. Clamped to the 120s floor (see config/schema.py's own
+        rationale) rather than rejected -- mirrors `set_speed_factor`'s own
+        clamp-not-reject convention for an out-of-range live setpoint."""
+        with self._lock:
+            self._dt_resolve_interval_s = max(value, 120.0)
+
     def mv_keys(self) -> list[str]:
         with self._lock:
             return list(self._mvs.keys())
@@ -298,6 +311,7 @@ class RuntimeFacade:
             feed_hexane=self._dvs["feed_hexane"].value,
             ambient_temp=self._dvs["ambient_temp"].value,
             ambient_humidity=self._dvs["ambient_humidity"].value,
+            dt_resolve_interval_s=self._dt_resolve_interval_s,
         )
 
     def tick(self) -> None:
@@ -321,7 +335,9 @@ class RuntimeFacade:
 
         try:
             x_next, y = model.step(x, u, sim_time, dt_target)
-            solver_stress = False
+            # M3a: SolverStress now reflects real DT-solve non-convergence
+            # (DTResult.converged), not only a raised exception (§7.9/§9.1).
+            solver_stress = not y.dt_solver_converged
         except Exception:
             x_next, y = x, model.outputs(x, u)
             solver_stress = True
@@ -365,4 +381,5 @@ class RuntimeFacade:
                 outputs=self._latest_outputs,
                 stage_roles=dict(self._stage_roles),
                 stage_order=list(self._stage_order),
+                dt_resolve_interval_s=self._dt_resolve_interval_s,
             )

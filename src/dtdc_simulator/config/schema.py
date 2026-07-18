@@ -71,6 +71,16 @@ class OilIsotherm(BaseModel):
     B: float
 
 
+class LuikovParams(BaseModel):
+    """Modified LUIKOV (1978) water desorption isotherm, Gianini, Luz, Sousa,
+    Jorge & Paraíso (2006) Table 7 — measured on soybean meal sampled directly
+    from a desolventizer/toaster's own outlet. Temperature-independent by the
+    cited paper's own finding (its tested range: 15-70 C)."""
+
+    A1: float = Field(gt=0)
+    A2: float = Field(gt=0)
+
+
 class AntoineParams(BaseModel):
     A: float
     B: float
@@ -108,10 +118,19 @@ class PhysicalParams(BaseModel):
     alpha_ps: float = Field(gt=0, lt=1)
     alpha_pg: float = Field(gt=0, lt=1)
     particle_radius: float = Field(gt=0, description="m, rP")
+    k_ps: float = Field(gt=0, description="W/(m K), particle solid-phase thermal conductivity")
+    k_pg: float = Field(gt=0, description="W/(m K), particle pore-gas thermal conductivity")
+    k_mixL: float = Field(
+        gt=0, description="W/(m K), porous solid/gas mixture thermal conductivity (bed scale, A.32)"
+    )
     sorption_C0: float
     sorption_C1: float
+    water_diffusivity: float = Field(
+        gt=0, description="m2/s, water's own intraparticle diffusivity, DCZ's LDF equilibration rate"
+    )
     gab_params: GabParams
     oil_isotherm: OilIsotherm
+    water_luikov: LuikovParams
     antoine_hexane: AntoineParams
     antoine_water: AntoineParams
     material_name: str = ""
@@ -137,17 +156,61 @@ class ModelParams(BaseModel):
     outer_relaxation: float = Field(gt=0, le=1)
     outer_tol: float = Field(gt=0)
     outer_max_iter: int = Field(gt=0)
-    tia_k0_1: float = Field(gt=0)
-    tia_Ea_1: float = Field(gt=0)
-    tia_k0_2: float = Field(gt=0)
-    tia_Ea_2: float = Field(gt=0)
-    tia_A_fraction: float = Field(ge=0, le=1)
     denat_k0: float = Field(gt=0)
     denat_Ea: float = Field(gt=0)
     denat_moisture_cap: float = Field(gt=0)
     sweep_arm_transfer_gain: float = Field(ge=0)
     base_residence_s: float = Field(
         gt=0, default=90.0, description="s, nominal per-stage residence at reference sweep/gate"
+    )
+    # --- M3a (BuildSpec §14): integrated DT solve wiring, §7.9 ---
+    # NOTE: dt_resolve_interval_s lives in OperatingDefaults now, not here --
+    # it's a HOT, live-tunable value (M3a follow-up, "C"), not a cold
+    # constant frozen at assembly. See OperatingDefaults below.
+    dt_nz_phz: int = Field(
+        gt=0, description="PHZ axial cells for the real-time (not validation) solve"
+    )
+    dt_nz_ftrz: int = Field(gt=0, description="FTRZ axial cells for the real-time solve")
+    dt_nz_dcz: int = Field(gt=0, description="DCZ axial cells for the real-time solve")
+    dt_vapor_feed_water_kg_s: float = Field(
+        gt=0,
+        description="[PLACE] 'clean' water vapor arriving below the DT's bottom tray -- see "
+        "dt_solver.py's own sparge-BC docstring for the same category of documented assumption",
+    )
+    dt_vapor_feed_hex_kg_s: float = Field(ge=0, description="[PLACE] as dt_vapor_feed_water_kg_s")
+    dt_vapor_feed_T: float = Field(gt=0, description="K, [PLACE] as dt_vapor_feed_water_kg_s")
+    dc_hexane_strip_k: float = Field(
+        ge=0, description="[PLACE] DC residual-hexane air-stripping rate constant, core/dc.py"
+    )
+    # SPARGE (direct) steam supply pressure, found this session: this project's own
+    # `literature_sources/Svoboda_Case_for_Advanced_Process_Control_VRX-DTDC_Concept.pdf`
+    # documents INDIRECT steam at 9.5 barG (~185 C) but does not state direct/sparge steam's
+    # own supply pressure -- confirmed by user (the paper's own author) as ~3 barG plant
+    # practice. Water's own saturation temperature at this pressure (~144 C, via the SAME
+    # antoine_water correlation `config/builder.py::_antoine_boiling_point_k` already uses for
+    # T_boil_water at 1 atm) is what direct steam actually mixes into DCZ's bottom BC at
+    # (`core/dt_solver.py`'s `T_bottom`) -- NOT water's atmospheric boiling point, which this
+    # scenario previously (incorrectly) assumed. See DECISIONS.md's "DCZ moisture balance" entry.
+    direct_steam_pressure_barg: float = Field(
+        gt=0, description="bar gauge, sparge/direct steam supply pressure -- see comment above"
+    )
+    # DT solve convergence tuning (M3a follow-up, "A2"), kept SEPARATE from
+    # dt_solver.solve_dt()'s own conservative validation-run defaults
+    # (1e-5/100/100, unchanged) -- these real-time settings trade precision
+    # far beyond the model's own placeholder-constant uncertainty for wall
+    # -clock speed. Measured this session: outer_tol=1e-5/cap=100 -> ~10s;
+    # outer_tol=0.05/cap=20 -> ~3s, for a ~0.7 K / ~2 ppm difference in the
+    # converged answer. See DECISIONS.md's M3a follow-up entry.
+    dt_outer_tol: float = Field(
+        gt=0,
+        description="real-time FTRZ<->DCZ outer-loop convergence tolerance (solve_dt's own "
+        "default is 1e-5; this is deliberately looser, see comment above)",
+    )
+    dt_outer_max_iter: int = Field(
+        gt=0, description="real-time FTRZ<->DCZ outer-loop iteration cap"
+    )
+    dt_dcz_inner_max_iter: int = Field(
+        gt=0, description="real-time DCZ-own Gauss-Seidel inner-loop iteration cap"
     )
 
 
@@ -163,6 +226,21 @@ class OperatingDefaults(BaseModel):
     heated_air_flow: float = Field(gt=0, description="kg/s, DRYER")
     ambient_air_temp: float = Field(gt=0, description="K, COOLER")
     ambient_air_flow: float = Field(gt=0, description="kg/s, COOLER")
+    # M3a follow-up ("C"): HOT, live-tunable (moved out of ModelParams) --
+    # the UI/OPC UA can adjust this while RUNNING via
+    # RuntimeFacade.set_dt_resolve_interval_s. `ge=120` is a floor the user
+    # asked for directly: the DT's own dynamics (~20-30 min residence) don't
+    # meaningfully change faster than this, so resolving more often than
+    # every 120 SIM-seconds buys nothing physically -- only wall-clock cost.
+    dt_resolve_interval_s: float = Field(
+        ge=120.0,
+        description=(
+            "s, SIM time between full solve_dt() re-solves (§7.9 quasi-steady map, periodic not "
+            "every-tick -- see DECISIONS.md M3a entry for why). The WALL-CLOCK gap is "
+            "dt_resolve_interval_s/speed_factor and must stay above solve_dt's own "
+            "(hardware-dependent) wall-clock cost or the tick loop stutters every resolve."
+        ),
+    )
 
 
 class DisturbanceDefaults(BaseModel):
@@ -183,6 +261,15 @@ class SimConfig(BaseModel):
     dt_wall_s: float = Field(gt=0, default=0.2)
     max_control_interval_s: float = Field(gt=0, default=10.0)
     clock: ClockKind = ClockKind.REALTIME
+    # M3a follow-up ("B"): an engine/run-control choice, not a physical
+    # constant -- seed the DT empty (no holdup, no material) and watch it
+    # fill via the existing lag mechanism, instead of starting pre-solved at
+    # steady state.
+    dt_start_empty: bool = Field(
+        default=False,
+        description="seed init_state() empty (M=0, T=feed, X1=X2=0) instead of "
+        "pre-solved at steady state, to watch material propagate through the unit",
+    )
 
 
 class ScenarioConfig(BaseModel):

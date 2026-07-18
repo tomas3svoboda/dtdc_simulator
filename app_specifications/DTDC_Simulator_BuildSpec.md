@@ -66,8 +66,7 @@ steam is injected into the meal.
 **KPIs to expose as PVs:**
 - Residual hexane in final meal `[mg/kg]` (target: ≤ ~10 human / ~1000 animal).
 - Meal moisture `[% w/w]` (target: < ~12 %).
-- Urease/Trypsin-Inhibitor-Activity proxy (under-processing indicator).
-- Protein solubility in KOH `[%]` (over-processing indicator; ~78–85 % nominal).
+- Protein solubility in KOH `[%]` (under/over-processing indicator; ~78–85 % nominal).
 - Steam consumption `[kg/t]`, throughput `[t/day]`.
 
 **Reference models** (for validation targets and the fidelity ladder — do not copy text, use as
@@ -112,7 +111,7 @@ mathematical/behavioral references):
 |    - sorption/      (GAB isotherm, oil power-law, heat of sorpt)|
 |    - transport/     (Faner Nu, Chilton-Colburn hM, D_eff, D_ax) |
 |    - properties/    (B.1-B.12 correlations + material sets)     |
-|    - kinetics/      (TIA biexponential, protein denat, Arrhenius)|
+|    - kinetics/      (protein denat, Arrhenius)                   |
 |    - dc.py          (dryer/cooler air-contacting stages, §7.10) |
 |    - initializer.py (steady DT solve at defaults -> x0, §7.8)   |
 +------------------------------------------------------------------+
@@ -205,9 +204,6 @@ STOPPED      --reconfigure----->    CONFIGURED     (rebuild allowed; constants e
 | `X2_critical_mode` | – | compute via (4) from densities, or override |
 | `outer_relaxation` | – | under-relaxation factor for the DT fixed-point sweep |
 | `outer_tol`, `outer_max_iter` | – | convergence of the integrated DT solve (§7.8) |
-| `tia_k0_1`, `tia_Ea_1` | 1/s, J/mol | inhibitor-1 Arrhenius |
-| `tia_k0_2`, `tia_Ea_2` | 1/s, J/mol | inhibitor-2 Arrhenius |
-| `tia_A_fraction` | – | activity fraction of inhibitor 1 (0..1) |
 | `denat_k0`, `denat_Ea` | 1/s, J/mol | protein-denaturation Arrhenius |
 | `denat_moisture_cap` | kg/kg | moisture influence saturates (~0.30) |
 | `sweep_arm_transfer_gain` | – | central-shaft sweep/rake arms: sets bed turnover/residence time; secondary effect on hQ/hM (§7.9) |
@@ -312,7 +308,7 @@ precise, because "steady-state" here does NOT mean "not time-varying":
    produces the spatial profile that corresponds to the **current** inputs.
 3. *Application scale (our real-time wrapper, §7.9):* fully time-dependent. Each engine tick feeds
    the current (possibly just-changed) inputs into a fresh DT solve, AND advances genuine transient
-   states carried between ticks — the quality kinetics (`C_TIA`, `S_prot`), the DC holdups, and the
+   states carried between ticks — the quality kinetics (`S_prot`), the DC holdups, and the
    transport-lag states. Across ticks the plant state evolves in time; the DT interior simply tracks
    a *moving* equilibrium because its residence time (~25–30 min) dwarfs a sub-second tick.
 In one line: **a dynamic simulator whose DT interior is solved quasi-steady each tick.** The
@@ -548,17 +544,16 @@ sensible cooling by ambient air (COOLER); residual-hexane stripping to air. Use 
 per-stage balance structure with air as the gas phase. `DECIDE` correlation details; keep it
 behind the same stage interface so it can be upgraded later.
 
-### 7.11 Quality kinetics (TIA + protein solubility) — coupled to the thermal field
+### 7.11 Quality kinetics (protein solubility) — coupled to the thermal field
 Advected with the descending solid; Arrhenius in the local solid temperature; strong moisture
 dependence. From `DTDC and VRXDTDC.pdf` (Chen et al. 2014 basis):
 ```
 k(T)          = k0 · exp(−Ea/(R·T))
-dC_TIA/dt     = −C_TIA0 · ( A·k_tia1·exp(−k_tia1·t) + (1−A)·k_tia2·exp(−k_tia2·t) )   (biexponential)
 dS_prot/dt    = −k_den(T, Xwater) · S_prot0
 ```
-Moisture influence saturates above ~0.30 kg water/kg dry solid. These feed the urease/TIA proxy
-and protein-solubility KPIs. In the DT they ride on the zone solid-temperature profiles; couple
-them to the per-tray solid temperature and residence time (they do not feed back into the hexane
+Moisture influence saturates above ~0.30 kg water/kg dry solid. This feeds the
+protein-solubility KPI. In the DT it rides on the zone solid-temperature profiles; couple
+it to the per-tray solid temperature and residence time (it does not feed back into the hexane
 balances at this fidelity).
 
 ### 7.12 State vector and the `Model` interface
@@ -567,7 +562,7 @@ Because the DT interior is solved quasi-steady per tick (§7.9), the persistent 
 - per DT tray: converged zone profiles used as **warm start** (not integrated as ODEs, but stored),
   plus optional particle-layer fields `wpg2,layer[tray][1..12]` if the ∂/∂t advance option is chosen;
 - per stage: first-order lag states for published outputs (if the lag option is chosen);
-- per stage: `C_TIA`, `S_prot` (advected quality states).
+- per stage: `S_prot` (advected quality state).
 - DC stages: `X_w`, `T` (and residual hexane) as ODE holdup states (§7.10).
 
 `core.Model` exposes:
@@ -648,8 +643,8 @@ Objects/DTDC/
   DV/
     <dv_key>        (RW)
   PV/               (all RO)
-    Stage/<i>/{T, X_hex, X_w, TIA, Sprot, VaporTemp}
-    KPI/{residual_hexane, meal_moisture, urease_proxy, protein_solubility,
+    Stage/<i>/{T, X_hex, X_w, Sprot, VaporTemp}
+    KPI/{residual_hexane, meal_moisture, protein_solubility,
          steam_consumption, throughput}
   Sim/
     SpeedFactor     (RW)
@@ -717,8 +712,6 @@ geometry:
 model:
   k_mass_transfer: 0.02
   h_heat_transfer: 5000.0
-  tia_k0_1: 1.0e6
-  tia_Ea_1: 85000.0
   # ...
 operating_defaults:
   feed_flow_rate: 25.0
@@ -759,7 +752,7 @@ and imposes no constraint. Do not build scipy from source unless unavoidable.
   - Receding front: `rfr = rP` for `X2 > X2,cr`; `rfr → 0` as `X2 → X2,eq`; `rfr` clamped to `[0,rP]`.
   - Particle FVM (12 layers): radial symmetry BC at `r=0`; converges under refinement; conserves hexane.
   - Property correlations (`B.7`–`B.12`) reproduce paper values; `hM` from `hQ` via Chilton–Colburn.
-  - Arrhenius kinetics: `k` increases with `T`; TIA decays; `Sprot` decays faster hot+wet.
+  - Arrhenius kinetics: `k` increases with `T`; `Sprot` decays faster hot+wet.
   - DT fixed-point sweep converges from a warm start; residual below `outer_tol`.
   - **Validation vs Coletto (2022):** DCZ hexane ~4000 ppm → ~100 ppm; thin FTRZ (order cm);
     solid/vapor temperature and water/hexane profiles match the paper's figures within tolerance.
@@ -801,7 +794,7 @@ temperature and water/hexane profiles match the paper's figures within tolerance
 
 **M3 — Real-time wrap + DC + quality + full I/O.**
 Wrap the steady DT solve as the quasi-steady `step()` with transport lag (§7.9); implement the DC
-air-contacting stages (§7.10) and the TIA/protein-solubility kinetics (§7.11) feeding the KPIs;
+air-contacting stages (§7.10) and the protein-solubility kinetics (§7.11) feeding the KPIs;
 full MV/DV/PV node map; manual/auto per MV with bumpless transfer; setup/runtime lifecycle +
 reconfigure; complete UI dashboard; `SolverStress`/undersample handling. Acceptance: real-time
 pacing holds at 1× and moderate speed-ups; determinism (free-run) reproduces bit-for-bit;
@@ -831,6 +824,5 @@ Each milestone ships with its tests green and a short `DECISIONS.md` update.
 - **MV** manipulated variable (controllable). **DV** disturbance variable. **PV** process value
   (measured/output). **CV** controlled variable (a PV the APC regulates).
 - **DT / DC** Desolventizer-Toaster / Dryer-Cooler.
-- **TIA** trypsin inhibitor activity.
 - **ZOH** zero-order hold. **Bumpless transfer** mode switch with no actuator step.
 - **Cold config** constants frozen at setup. **Hot inputs** MV/DV changed at runtime.

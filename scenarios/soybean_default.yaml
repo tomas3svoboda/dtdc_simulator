@@ -15,21 +15,23 @@
 #
 # Primary sources:
 #   Coletto, Bandoni & Blanco (2022) J. Food Eng. 318, 110870   -> geometry, base operating point, C0/C1, correlations
-#   Chen et al. (2014) Food Chem. 154, 108                      -> TIA biexponential inactivation basis
+#   Chen et al. (2014) Food Chem. 154, 108                      -> protein denaturation Arrhenius basis
 
 material: soybean
 
 # ------------------------------------------------------------------ geometry
-# Coletto base case: 6 trays x 4 m dia; 3 pre-desolv (0.3 m), tray4 1.0 m, trays5-6 0.6 m.
+# Simplified from Coletto's own 6-tray base case (3 pre-desolv + 2 main + 1 sparge) to
+# 2 PREDESOLV + 1 MAIN + 1 SPARGE for faster iteration (DECIDE, this phase). PD3's and
+# MN2's indirect duty was folded into the remaining PREDESOLV/MAIN trays below (not just
+# dropped) so PHZ still reaches X2_cr before running out of trays -- see the retuned
+# indirect_steam values' own comments.
 # DC (dryer/cooler) stages appended (not in Coletto) as first-estimate.
 geometry:
   stages:
     - {id: PD1, role: PREDESOLV, diameter_m: 4.0, bed_height_m: 0.30}   # [PAPER]
     - {id: PD2, role: PREDESOLV, diameter_m: 4.0, bed_height_m: 0.30}   # [PAPER]
-    - {id: PD3, role: PREDESOLV, diameter_m: 4.0, bed_height_m: 0.30}   # [PAPER]
-    - {id: MN1, role: MAIN,      diameter_m: 4.0, bed_height_m: 1.00}   # [PAPER] tray4 (FTRZ starts here)
-    - {id: MN2, role: MAIN,      diameter_m: 4.0, bed_height_m: 0.60}   # [PAPER] tray5
-    - {id: SP1, role: SPARGE,    diameter_m: 4.0, bed_height_m: 0.60}   # [PAPER] tray6 (direct steam)
+    - {id: MN1, role: MAIN,      diameter_m: 4.0, bed_height_m: 1.00}   # [PAPER] (FTRZ starts here)
+    - {id: SP1, role: SPARGE,    diameter_m: 4.0, bed_height_m: 0.60}   # [PAPER] (direct steam)
     # DR1/CL1 sized so the bed-holdup mass balance (added alongside gate_opening
     # becoming a real MV) settles at ~65% level at default gate/sweep settings,
     # leaving headroom before a narrowed gate genuinely floods the tray.
@@ -39,72 +41,148 @@ geometry:
 # ------------------------------------------------------------------ model params
 model:
   D_eff: 4.0e-10               # m2/s  [PAPER] Cardarelli, Crapiste & Mattea (2002) Table 1, exact cited value
-  D_ax:  1.0e-4               # m2/s  [PLACE] axial dispersion (bed scale)
+  D_ax:  1.022e-3              # m2/s  [PAPER] Coletto supp. Table 1, "Hexane axial diffusivity" (Cardarelli 1998)
   n_particle_layers: 12       # -     [PAPER] Coletto uses 12 spherical FVM shells
   nz_per_zone: 20             # -     [PLACE] axial cells per zone per tray
-  D_HW: 1.0e-5               # m2/s  [PLACE] hexane-water gas diffusivity for Schmidt no. (B.10)
+  D_HW: 1.33e-5              # m2/s  [PAPER] Coletto supp. Table 1, "Hexane-water molecular diffusivity" (Cardarelli 1998)
   htc_correlation: {form: faner, c: 0.6949, m: 0.579, n: 0.3333}  # [PAPER] Nu=0.6949 Re^0.579 Pr^(1/3) (B.7)
   # DT fixed-point sweep controls (§7.8)
   outer_relaxation: 0.5       # [PLACE] under-relaxation
   outer_tol: 1.0e-5           # [PLACE]
   outer_max_iter: 100         # [PLACE]
-  # TIA biexponential + protein denaturation (Chen 2014 basis) — Arrhenius
-  tia_k0_1: 1.0e10            # 1/s   [PLACE]
-  tia_Ea_1: 9.0e4            # J/mol [PLACE] ~90 kJ/mol
-  tia_k0_2: 1.0e8            # 1/s   [PLACE]
-  tia_Ea_2: 7.5e4            # J/mol [PLACE]
-  tia_A_fraction: 0.6         # -     [PLACE] fast-inhibitor fraction
+  # Protein denaturation (Chen 2014 basis) — Arrhenius
   denat_k0: 1.0e12           # 1/s   [PLACE]
   denat_Ea: 1.1e5            # J/mol [PLACE] ~110 kJ/mol (protein/lysine sensitive)
   denat_moisture_cap: 0.30    # kg/kg [PAPER] moisture influence saturates ~0.30
-  sweep_arm_transfer_gain: 0.2   # [PLACE] hQ/hM sensitivity to sweep-arm speed (renamed from agitator)
-  # DT equilibrium (core/model.py: _stage_equilibrium) is a mechanistic sequential
-  # flash/sensible-heat energy balance — no fitted "duty saturation curve" or
-  # hand-picked temperature ceiling. It's driven entirely by dH_vap_hexane,
-  # dH_vap_water, T_boil_hexane (above, in properties/soybean.yaml) plus
-  # T_boil_water (derived from antoine_water at 1 atm in config/builder.py) and
-  # cp_solid/cp_water_liquid/cp_oil/oil_fraction. At this scenario's steam duties
-  # this correctly lands the sparge tray around ~100 C once fully desolventized
-  # (matches the ~105-110 C literature DT-exit figure — see
-  # app_specifications/DTDC_steady_state_reference.md), rather than staying
-  # pinned at hexane's boiling point (68.7 C) forever.
+  # Retuned this session, empirically, once wired into bed_transport_coefficients (previously
+  # declared but never connected to anything -- confirmed by a repo-wide search before this
+  # fix): a real DT bed is continuously mechanically swept/agitated, a fundamentally stronger
+  # heat/mass-transfer regime than the passive Nu-Re packed-bed correlation alone predicts.
+  # gain=1.0 (form: hQ *= 1 + gain*rpm^2) lands DCZ's converged temperature in its own
+  # validated ~380-383 K band (vs ~390-410 K unwired/under-tuned) -- see DECISIONS.md.
+  sweep_arm_transfer_gain: 1.0   # [PLACE] hQ/hM sensitivity to sweep-arm agitation (empirically retuned)
+  # M3a (BuildSpec §7.9): DT-role stage equilibrium targets now come from the
+  # real core/dt_solver.py::solve_dt() zonal solve (PHZ/FTRZ/DCZ), re-run on
+  # the periodic cadence below — no more fitted "duty saturation curve";
+  # driven by the real dH_vap/T_boil/GAB-isotherm/particle physics in
+  # properties/soybean.yaml plus the D_eff/D_ax/htc_correlation/etc. above.
   base_residence_s: 90.0      # s  [PLACE] nominal per-stage lag time constant at reference sweep
                               #    speed (3 rpm) and gate opening (50%). Cascaded across 8 stages this
                               #    settles in ~20-40 simulated minutes, in line with a real DT's
                               #    ~20-30 min total residence — see sim.speed_factor below for why
                               #    that's still practical to watch interactively.
+  # DT solve scheduling (M3a, §7.9): solve_dt() is NOT re-run every 0.2s tick;
+  # only every dt_resolve_interval_s of SIM time (that value is now a HOT,
+  # live-tunable seed in operating_defaults below, not here -- see its own
+  # comment there for the wall-clock-gap math).
+  dt_nz_phz: 10                  # -  [PLACE] real-time PHZ mesh, coarser than a validation run's nz_per_zone
+  dt_nz_ftrz: 10                 # -  [PLACE] real-time FTRZ mesh
+  dt_nz_dcz: 8                   # -  [PLACE] real-time DCZ mesh (verified to stay converged/monotonic)
+  # DT bottom vapor boundary (documented simplification, same category as
+  # dt_solver.py's own sparge-BC assumption): "clean" vapor arriving below the
+  # bottommost DT tray (rotary lock / DC side), before SP1's own direct steam
+  # mixes in. No real DC->DT vapor-return stream is modeled at this fidelity.
+  dt_vapor_feed_water_kg_s: 5.0   # kg/s  [PLACE]
+  dt_vapor_feed_hex_kg_s: 0.0005  # kg/s  [PLACE]
+  dt_vapor_feed_T: 371.0          # K     [PLACE]
+  # Retuned from an initial 0.3 placeholder (DECIDE, this session): recalibrating
+  # ambient_air_flow/heated_air_flow against a real DTDC SCADA reference screen (a
+  # "311 TOASTER" HMI, user-provided) surfaced that residual hexane at the old flow+k
+  # combination sat ~11,800 ppm at steady state -- far above the ~1000 ppm ceiling the
+  # user set as a hard requirement for finished meal. Retuned jointly with the air flow
+  # recalibration below (see operating_defaults' own comments) to land comfortably under
+  # that ceiling (~115-120 ppm at the base case, confirmed robust across a stress test
+  # sweep -- reduced indirect steam duty, narrower discharge gates -- since DC's own
+  # stripping dominates whatever concentration arrives from the DT). Still [PLACE]: no
+  # literature source calibrates this rate constant, only the ppm ceiling it must satisfy.
+  dc_hexane_strip_k: 1.0          # -  [PLACE, RETUNED] core/dc.py residual-hexane air-stripping rate constant
+  # SPARGE (direct) steam supply pressure -- found this session: the model previously mixed
+  # direct_steam in at water's ATMOSPHERIC boiling point (~373 K), but that's the DT vessel's
+  # own internal vapor-space reference, not the steam SUPPLY temperature. This project's own
+  # literature_sources/Svoboda_Case_for_Advanced_Process_Control_VRX-DTDC_Concept.pdf documents
+  # indirect steam at 9.5 barG (~185 C) but not direct/sparge steam's own pressure. First guess
+  # (3 barG/144 C) was revised after the user's own more detailed operational knowledge: real
+  # sparge steam is LOW pressure, ~0.5-1.5 bar / 100-110 C saturated -- 0.3 barG (~107.5 C) is
+  # the middle of that range via the same antoine_water correlation used for T_boil_water.
+  direct_steam_pressure_barg: 0.3 # bar  [PAPER-adjacent, user-confirmed plant practice, revised]
+  # DT solve convergence tuning (M3a follow-up, "A2") -- deliberately looser
+  # than solve_dt()'s own validation-run defaults (outer_tol=1e-5, both
+  # iteration caps=100), profiled+measured this session: dt_solver's own
+  # FTRZ<->DCZ outer-loop convergence check applies the same absolute
+  # tolerance to a Kelvin-scale quantity (T, ~300-450) and a mass-fraction
+  # quantity (wV2, ~0.0005) -- traced directly, wV2 converges by iteration ~5
+  # while T is still creeping by <0.001%/iteration at iteration 50+. At these
+  # settings: ~3s per solve_dt call (combined with the sorption-heat-source
+  # dedup fix, core/zones/particle.py), vs ~10-14s at the tight defaults, for
+  # a ~0.7 K / ~2 ppm difference in the converged answer -- negligible next
+  # to hQ/hM/aV's own already-flagged [DERIVED]/[PLACE] uncertainty. See
+  # DECISIONS.md's M3a follow-up entry for the full measured comparison.
+  dt_outer_tol: 0.05             # -  [PLACE] real-time FTRZ<->DCZ outer-loop tolerance
+  dt_outer_max_iter: 20          # -  [PLACE] real-time FTRZ<->DCZ outer-loop cap
+  dt_dcz_inner_max_iter: 100     # -  [PLACE] DCZ's own inner Gauss-Seidel cap (unchanged from M2 Phase 4's own default)
 
 # ---------------------------------------------------- operating defaults (HOT seeds)
 # Coletto base case direction: feed ~26% solvent, ~35% at rotary lock; steam split DT.
 operating_defaults:
   feed_flow_rate: 25.0        # kg/s dry solid  [PLACE] (scale to your throughput)
+  # Retuned after dropping PD3/MN2 (DECIDE, this phase): each role's TOTAL duty from the
+  # original 6-tray base case is conserved across the fewer remaining trays of that role
+  # (PD 4.0e5*3=1.2e6 -> 6.0e5*2; MAIN 1.2e6+8.0e5=2.0e6 -> one 2.0e6 tray), rather than
+  # just deleting PD3's/MN2's capacity outright -- confirmed PHZ still reaches X2_cr with
+  # this duty at the new geometry (see DECISIONS.md).
   indirect_steam:             # W per DT tray (jacket duty)  [PLACE]
-    PD1: 4.0e5
-    PD2: 4.0e5
-    PD3: 4.0e5
-    MN1: 1.2e6
-    MN2: 8.0e5
+    PD1: 6.0e5
+    PD2: 6.0e5
+    MN1: 2.0e6
     SP1: 4.0e5
   direct_steam:               # kg/s sparge steam  [PLACE]
     SP1: 1.5
   sweep_arm_speed:            # rpm  [PLACE] central-shaft sweep/rake arms (NOT agitation)
     PD1: 3.0
     PD2: 3.0
-    PD3: 3.0
     MN1: 3.0
-    MN2: 3.0
     SP1: 3.0
   gate_opening:               # 0-100 % level/discharge gate per stage  [PLACE]
     PD1: 50
     PD2: 50
-    PD3: 50
     MN1: 50
-    MN2: 50
     SP1: 50
+  # heated_air_flow/ambient_air_flow retuned from an initial 5.0/8.0 kg/s placeholder
+  # (DECIDE, this session): at the OLD values, the air:solid mass ratio (0.2-0.3:1
+  # against feed_flow_rate=25 kg/s) was far too low for core/dc.py's own single-pass
+  # well-mixed contactor model to bring the meal anywhere close to its own inlet air
+  # temperature -- confirmed directly against a real DTDC SCADA reference screen (a
+  # "311 TOASTER" HMI, user-provided): its own cooler (CHLADIC) reads ~38.5 C, while
+  # this scenario's OLD cooler stage barely moved off the toaster's own ~102 C. Retuning
+  # this ALSO surfaced a genuine bug in `core/dc.py::air_contact_equilibrium` (found
+  # while sweeping air flow upward looking for a fix): the old sensible-heat formula let
+  # the solid's own equilibrium temperature overshoot PAST the air's own inlet
+  # temperature at high air flow (e.g. cooling BELOW ambient) -- a real thermodynamic
+  # impossibility for a passive contactor, fixed the same session (min-heat-capacity-rate
+  # bound, see that function's own docstring) BEFORE this recalibration was finalized.
+  # 60/60 kg/s (2.4:1 air:solid) lands the cooler at ~39.8 C, matching the SCADA
+  # reference closely. The dryer stage stays close to its own inlet air temperature
+  # regardless (~103.7 C, NOT matching the SCADA reference's own ~50 C SUSIC reading) --
+  # an accepted, structural gap: the real unit uses TWO dryer passes in series (this
+  # scenario's own single DR1 stage, like its MN/SP simplification earlier this session,
+  # trades that structural detail for a simpler geometry) and this single-stage model
+  # can't simultaneously use hot air to genuinely dry (needs air HOTTER than the
+  # incoming meal) and cool far below that same hot air's own temperature in one pass --
+  # the COOLER stage (using real ambient air) carries the actual cooling duty instead,
+  # matching the reference there specifically.
   heated_air_temp: 380.0      # K  [PLACE] dryer inlet air
-  heated_air_flow: 5.0        # kg/s  [PLACE]
+  heated_air_flow: 60.0       # kg/s  [PLACE, RETUNED]
   ambient_air_temp: 298.0     # K  [PLACE] cooler inlet air
-  ambient_air_flow: 8.0       # kg/s  [PLACE]
+  ambient_air_flow: 60.0      # kg/s  [PLACE, RETUNED]
+  # M3a follow-up ("C"): HOT, live-tunable from the UI/OPC UA while RUNNING
+  # (RuntimeFacade.set_dt_resolve_interval_s) -- schema-enforced floor of
+  # 120s (config/schema.py's OperatingDefaults.dt_resolve_interval_s): the
+  # DT's own dynamics (~20-30 min residence) don't meaningfully change faster
+  # than this, so resolving more often buys nothing physically, only
+  # wall-clock cost. At the floor + this scenario's speed_factor=20, the
+  # wall-clock gap is 120/20=6s -- ~2x margin over the ~3s solve cost
+  # measured with the M3a follow-up ("A2") tuning above.
+  dt_resolve_interval_s: 120.0   # s, SIM time
 
 # --------------------------------------------------- disturbance defaults (HOT seeds)
 # Feed conditions to the DT — live-adjustable (UI sliders / OPC UA), no MANUAL/AUTO mode (§5.2 DV).
@@ -114,7 +192,14 @@ operating_defaults:
 disturbance_defaults:
   feed_temperature: 330.0     # K = 56.85 C  [PAPER] meal from extractor ~55-60 C
   feed_moisture: 0.07         # kg/kg dry solid  [PAPER] ~5-10% incoming (was 0.12, too high vs lit.)
-  feed_hexane:   0.26         # kg/kg dry solid  [PAPER] ~25-35% solvent entering DT
+  # Was 0.26 ("~25-35%" generic industry range, saVree/AOCS/patent sources) -- found this
+  # session (DECISIONS.md) to sit BELOW X2,cr (~0.41, from this scenario's own cited particle
+  # porosity/density values), collapsing PHZ to zero length. Restored to Coletto (2022)'s own
+  # Fig. 1 base case (matches tests/test_phz.py's/test_dt_solver.py's own SOLID_FEED exactly),
+  # which the rest of this model's particle physics (alpha_pg/alpha_ps/rho_ps/isotherms) is
+  # actually calibrated against -- both figures are individually literature-defensible, but
+  # only one is self-consistent with this scenario's own X2,cr.
+  feed_hexane:   0.4743        # kg/kg dry solid  [PAPER] Coletto (2022) Fig. 1 base case
   ambient_temp:  298.0        # K  [PLACE]
   ambient_humidity: 0.010     # kg/kg  [PLACE]
 
