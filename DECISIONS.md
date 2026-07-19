@@ -3,6 +3,121 @@
 Log of `DECIDE` choices made while building the DTDC simulator, per
 `Specifications/DTDC_Simulator_BuildSpec.md`. Newest entries at the top.
 
+## Flake particle radius fixes DT residual hexane + moisture; realistic geometry & feed basis (2026-07-19)
+
+**Trigger.** With the DC rewrite landed and the DT geometry made realistic (6 m diameter, shallow
+PREDESOLV / deep TOASTING beds), two seed-tuning requests surfaced: get the DT-exit (dryer-inlet)
+residual hexane down to ~500-1000 ppm (was ~12000), and set feed hexane to ~35%.
+
+**Feed hexane was a display/basis confusion, not a value problem.** The GUI feed card showed
+`feed_hexane*100` = "47%", read as a total mass fraction. But the model stores hexane DRY-basis
+(kg/kg dry solid); as a fraction of WET meal (dry + moisture + oil + hexane) the 0.4743 base case is
+only ~30.5% -- already within the realistic ~30-35% band. Fixed the feed card to display total
+(wet) mass fraction (`interfaces/ui/tower.py`); the underlying feed_hexane is unchanged (0.4743).
+NB feed BELOW ~0.42 dry-basis collapses the PHZ (it drops under X2,cr, the pore-saturation
+threshold), so the realistic-looking "35% dry" would have been unphysical -- the wet-basis framing
+avoids that trap.
+
+**The residual hexane is diffusion-TAIL limited -- seed levers and extra trays can't fix it.**
+Confirmed empirically: the GAB equilibrium floor is only ~40-450 ppm (so ~500 ppm IS reachable),
+but feed flow (25->12 kg/s) + direct steam (1.5->4.0) only moved 11800->9600 ppm, and adding a
+whole extra toasting tray (doubling DCZ residence) only 12129->10975. The core hexane diffuses out
+on an `r_P^2/D_eff` timescale (~hundreds of s) that residence can't overcome. The one effective
+lever is the DIFFUSION LENGTH.
+
+**Root fix: flake particle radius.** Real desolventizer meal is thin FLAKES (~0.2-0.4 mm), not
+Cardarelli's 2 mm granules (`particle_radius` was 1.0 mm = their "diameter"/2). Set to the
+flake-scale **0.18 mm** (`properties/soybean.yaml`, `[DERIVED]`). Result: DT exit **~517 ppm**
+hexane (in target), still converged, PHZ intact (L_PHZ ~0.28 m). This ALSO self-consistently sped
+water equilibration (`kappa_w = 15*D/r_P^2`), which fixed a long-standing moisture gap: DT exit
+moisture rose from ~9.5% to a realistic **~24%** (literature target 18-22%), so the DRYER now has
+real moisture to remove.
+
+**DC air flows re-tuned for the new moisture regime.** With ~24% moisture reaching the dryer,
+evaporative cooling drops DR1 to ~53 C (matching the real 311 SUSIC ~50 C) while drying to ~12%.
+The dryer thus does most of the cooling, so the COOLER only needs ~53->37 C -- `ambient_air_flow`
+dropped **400 -> 55 kg/s** (a normal ~2:1 air:solid, vs the old 16:1 that the low-moisture regime
+had forced), landing CL1 ~37 C (SCADA CHLADIC ~38.5 C).
+
+**Final calibration (same session, after user input):** feed hexane set to **35% by total WET mass**
+(industry convention; = 0.5815 dry-basis, still above X2,cr so PHZ intact) and the feed card fixed
+to display wet-basis %. `particle_radius` settled at **0.20 mm** (not 0.18): a real ~0.25 mm soy
+flake diffuses through its ~0.125 mm half-thickness, so a sphere-equivalent radius is ~0.125-0.25 mm,
+and 0.20 mm is the SAFE end of that band -- larger radii (0.25 mm -> ~3800 ppm DT exit) would force
+the dryer to exceed the **1100 ppm hexane-in-drying-air safety limit** to reach a realistic product.
+At 0.20 mm the DT exits ~2000 ppm, the dryer strips to ~186 ppm (already in the target 100-300 ppm
+product band) at ~780 ppm in the drying air (safe). REMAINING (next task, user-flagged): the COOLER
+currently over-strips ~186 -> ~20 ppm, but hexane diffusion nearly stops at cooler temperatures, so
+the product should hold ~100-300 ppm -- needs a temperature-gated DC hexane rate plus explicit
+drying-air hexane tracking against the 1100 ppm limit.
+
+## DC (dryer/cooler) rewritten first-principles on Luz/Silva falling-rate physics (2026-07-19)
+
+**Trigger.** The user reported two DC symptoms: (1) the air-outlet readout looked "significantly
+lower than the air inlet" ("where does the air go?"), and (2) ~100 C meal meeting ~100 C dryer air
+read ~43 C on the tray. Both traced to one root cause: `core/dc.py`'s previous model treated the
+dryer as a WET-SURFACE, CONSTANT-RATE contactor — it evaporatively cooled the meal to the air's
+adiabatic-saturation temperature and relaxed solid moisture most of the way toward the
+air-humidity isotherm equilibrium each pass. That is the wrong physics for soybean meal.
+
+**Literature.** Two sources the user pointed to (`literature_sources/`): Luz et al. (2010),
+*Food Bioprod. Process.* 88:90-98 (dynamic model of a direct rotary soybean-meal dryer), and Silva
+et al. (2012), *Powder Technol.* 229:61-70 (fluidized-bed drying). Both establish that soybean-meal
+drying is **entirely falling-rate (internal-diffusion-controlled)** — there is NO constant-rate
+period, and the drying RATE `K*(X1 - X_e)` (with a small `K`, Luz eq. 4, ~8.44e-3/s), not the air's
+saturation capacity, governs how fast moisture leaves. Luz's own industrial case: 90 C air ->
+89 C solid out — the meal STAYS HOT because that unit runs an ~80:1 air:solid ratio, so the hot air
+supplies the evaporation's latent load.
+
+**Rewrite (`core/dc.py`).** Each DC stage is now a well-mixed CSTR at steady state with a CLOSED
+two-sided mass/energy balance:
+- **Moisture (solid):** falling-rate CSTR `X1_eq = (X1_in + K*tau*X_e)/(1 + K*tau)`,
+  `K = thermo.luz_mass_transfer_coefficient` (Luz eq. 4), `X_e = thermo.luz_equilibrium_moisture`
+  (Luz eq. 5 — the temperature-dependent DRYING isotherm, NOT the DT-internal Gianini/Luikov
+  desorption isotherm the user correctly suspected was wrong for this regime). `tau` is the stage's
+  own residence time (threaded through `model._dc_equilibrium`), so the meal removes only a FRACTION
+  of removable moisture per pass. Capped by the air's saturation carrying-capacity (-> 0 as air
+  flow -> 0) and by moisture actually present.
+- **Moisture (air):** `Y_out = Y_in + m_evap/m_air_dry` — dry air conserved EXACTLY; humidity
+  accounts for every kg the solid loses. This is the closed air mass balance (answers "where does
+  the air go": nowhere — it conserves dry mass and only gains humidity).
+- **Energy:** a COUPLED two-phase balance. Solid temperature from a Newton-cooling balance
+  convectively coupled (conductance `UA`, NTU-derived) to the outlet air; outlet air temperature
+  pinned by the adiabatic total-enthalpy balance `H_in == H_out`. The coupling lets the hot air
+  supply the latent load, so the meal stays warm rather than crashing to wet-bulb. No more
+  evaporative-cooling special case, no `adiabatic_saturation_temperature` (deleted).
+
+`core/balance.py::dc_stage_balance` is now a genuine two-sided check (water + total enthalpy via the
+shared `dc.solid_stream_enthalpy_w`/`dc.air_stream_enthalpy_w` primitives); it closes to machine
+precision in every regime, and the old `ignore_evaporative_cooling_air_enthalpy` exception is gone.
+
+**Physical finding surfaced during implementation (important, reported to the user).** At this
+plant's throughput (25 kg/s dry meal), a dryer that removes meaningful moisture CANNOT hold the meal
+at ~100 C while doing so — evaporating water carries latent heat away, so DR1 settles WARM (~85 C at
+the scenario's own SP1 -> DR1 inlet of ~9.5% moisture), not hot, and not the old ~43 C crash. The
+43 C reading was the over-evaporation bug; ~85 C is the correct answer. Keeping a dryer meal at air
+temperature while drying requires Luz's ~80:1 air:solid ratio, unrealistic here.
+
+**Calibration.** COOLER: cooling ~25 kg/s of hot meal to the SCADA CHLADIC reference (~38.5 C) with
+25 C ambient air is energy-bound to a high air:solid ratio; `ambient_air_flow` retuned 60 -> 400 kg/s
+(~16:1) lands CL1 at ~39 C (60 kg/s -> ~70 C; 200 -> ~49 C — real cooling thermodynamics, not tuning
+slack). `MV_LIMITS` ceilings raised accordingly (`heated_air_flow` 100->200, `ambient_air_flow`
+100->800). DRYER `heated_air_flow` kept at 60 kg/s (DR1 ~85 C while drying). **Out-of-DC-scope
+caveat (documented in the scenario):** SP1 currently delivers only ~9.5% moisture to the dryer vs
+the 18-22% whole-tower literature target, so DR1 over-dries to ~5% and the final product lands ~7-8%
+rather than the ~12% spec — a DT/sparge calibration gap, not a DC one.
+
+**Config.** Luz correlations added as `LuzDryingParams` (`thermo.py`/`schema.py`), coefficients in
+`properties/soybean.yaml` (`water_luz_drying`, `[PAPER]` Luz eqs. 4/5), wired into `DCConstants`
+(replacing the DC's `luikov` field — the Gianini/Luikov isotherm stays in the DT-internal DCZ only).
+
+**UI.** The tower's "Air out:" readout now shows the (conserved) dry-air flow alongside humidity, so
+it can't be misread as the air stream shrinking.
+
+**Verified.** Full suite 131 passed; `test_dc.py` rewritten for the three physical regimes plus
+parametrized closed-balance checks; full-scenario run gives DR1 ~85 C / dries, CL1 ~39 C, both
+balances ~0.
+
 ## Stale MV air-flow cap silently halved the tuned DC air flows (2026-07-18)
 
 **Trigger.** After the previous entry's fixes, the user ran the actual GUI (not the headless

@@ -190,6 +190,9 @@ def test_dcz_hexane_and_energy_residual_stay_small() -> None:
 
 
 def test_dc_stage_conserves_mass_and_energy_evaporating() -> None:
+    # Drying (evaporation) regime. Since the rewrite (core/dc.py's coupled
+    # two-sided balance), the FULL air+solid energy balance closes to machine
+    # precision here -- no more evaporative-cooling special case in the check.
     inputs = dict(
         T_in=320.0,
         X1_in=0.15,
@@ -198,6 +201,7 @@ def test_dc_stage_conserves_mass_and_energy_evaporating() -> None:
         air_flow_kg_s=8.0,
         air_humidity_in=0.01,
         m_dry_kg_s=dc_fixtures.M_DRY_KG_S,
+        residence_s=dc_fixtures.TAU_S,
         c=dc_fixtures.CONSTANTS,
     )
     result = dc.air_contact_equilibrium(**inputs)
@@ -228,6 +232,7 @@ def test_dc_stage_conserves_mass_and_energy_adsorbing() -> None:
         air_flow_kg_s=8.0,
         air_humidity_in=0.01,
         m_dry_kg_s=dc_fixtures.M_DRY_KG_S,
+        residence_s=dc_fixtures.TAU_S,
         c=dc_fixtures.CONSTANTS,
     )
     result = dc.air_contact_equilibrium(**inputs)

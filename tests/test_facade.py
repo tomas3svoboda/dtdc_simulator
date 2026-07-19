@@ -56,13 +56,17 @@ def test_tick_only_advances_while_running() -> None:
 def test_auto_mode_drives_pv_apc_style() -> None:
     facade = _facade_freerun()
     facade.run()
-    key = "indirect_steam/MN1"
+    # Drive a PREDESOLV tray's jacket duty: the MAIN/SPARGE (DCZ) trays are pinned near the
+    # direct-steam saturation temperature (~100 C) by condensation equilibrium, so their
+    # temperature barely responds to indirect steam -- the PREDESOLV trays are where jacket
+    # duty actually lands (see tests/test_model.py::test_more_steam_raises_dt_target_temperature).
+    key = "indirect_steam/PD1"
     facade.set_mv_mode(key, Mode.AUTO)
     facade.set_mv_auto_setpoint(key, 3.0e6)
-    T_before = facade.get_snapshot().outputs.stage_T["MN1"]
+    T_before = facade.get_snapshot().outputs.stage_T["PD1"]
     for _ in range(300):
         facade.tick()
-    T_after = facade.get_snapshot().outputs.stage_T["MN1"]
+    T_after = facade.get_snapshot().outputs.stage_T["PD1"]
     assert T_after > T_before
 
 

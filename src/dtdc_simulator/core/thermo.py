@@ -406,6 +406,73 @@ def luikov_equilibrium_moisture(a_w: float, p: LuikovParams) -> float:
     return p.A1 / (1.0 + p.A2 * math.log(1.0 / a_w))
 
 
+# ---------------------------------------------------------------------------
+# Soybean-meal air-drying correlations (Luz et al.) -- used by the DC
+# (dryer/cooler) stage, `core/dc.py`. NOT for the DT-internal DCZ zone, which
+# keeps the Gianini/Luikov desorption isotherm above: these are purpose-built
+# for the falling-rate AIR-drying regime (25-100 C, ambient/heated air over a
+# hygroscopic bed), the exact regime the DT-internal (superheated-vapor,
+# hexane-dominated) sorption model does NOT cover.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LuzDryingParams:
+    """Soybean-meal air-drying correlations from Luz, dos Santos Conceição,
+    de Matos Jorge, Paraíso & Andrade (2010) *Food Bioprod. Process.* 88:
+    90-98 ("Dynamic modeling and control of soybean meal drying in a direct
+    rotary dryer"), themselves citing Luz et al. (2006a/c).
+
+    MASS-TRANSFER COEFFICIENT K [1/s] -- Luz eq. (4), the FRACTIONAL-moisture
+    form (X_s in kg water/kg dry solid, not %):
+
+        K = (k_a2*T_a + k_b2)*X_s^2 + (k_a1*T_a + k_b1)*X_s + k_c
+
+    Both Luz and Silva et al. (2012) establish soybean-meal drying is
+    ENTIRELY falling-rate (internal-diffusion-controlled) -- there is no
+    constant-rate period -- so this rate, NOT the air's saturation capacity,
+    sets how fast moisture leaves. The temperature terms are near-negligible
+    next to `k_c` (K ~ 8.44e-3 /s over the whole band), so evaluating `T_a`
+    in K here rather than Luz's own °C shifts K by <0.1% -- immaterial, and
+    kept in K for SI consistency with the rest of `core/`.
+
+    EQUILIBRIUM MOISTURE X_e [kg water/kg dry solid] -- Luz eq. (5), a
+    modified-Halsey isotherm (Luz et al. 2006a):
+
+        X_e = xe_num / (1 + xe_coef * T_s * ln(1/ur))
+
+    with `T_s` the SOLID temperature (K) and `ur` the local air relative
+    humidity (0-1). Unlike the temperature-INDEPENDENT Gianini/Luikov
+    isotherm (`LuikovParams`, fit to desolventizer-outlet meal at 15-70 C),
+    this one is explicitly temperature-dependent and was regressed against
+    the drying process itself -- the appropriate `X_e` for the DC regime."""
+
+    k_a2: float  # 1/(s.K), coeff of T_a in the X_s^2 term        (Luz: -0.33e-11 in 1/(s.°C))
+    k_b2: float  # 1/s, constant of the X_s^2 term                (Luz: 4.60e-9)
+    k_a1: float  # 1/(s.K), coeff of T_a in the X_s term          (Luz: 7e-8 in 1/(s.°C))
+    k_b1: float  # 1/s, constant of the X_s term                  (Luz: 1.42e-5)
+    k_c: float  # 1/s, constant term (dominant)                   (Luz: 8.44e-3)
+    xe_num: float  # kg/kg dry solid, isotherm numerator          (Luz: 0.834)
+    xe_coef: float  # 1/K, isotherm temperature/activity factor   (Luz: 0.036)
+
+
+def luz_mass_transfer_coefficient(T_a: float, X_s: float, p: LuzDryingParams) -> float:
+    """K(T_a, X_s) [1/s] -- Luz eq. (4). `T_a` air temperature (K), `X_s`
+    solid moisture (kg water/kg dry solid). Clamped at `X_s >= 0`; the
+    quadratic is monotone-safe over the physical moisture range."""
+    x = max(X_s, 0.0)
+    return (p.k_a2 * T_a + p.k_b2) * x * x + (p.k_a1 * T_a + p.k_b1) * x + p.k_c
+
+
+def luz_equilibrium_moisture(T_s: float, ur: float, p: LuzDryingParams) -> float:
+    """X_e(T_s, ur) [kg water/kg dry solid] -- Luz eq. (5). `T_s` solid
+    temperature (K), `ur` local air relative humidity. `ur` is clamped to
+    (0, 1) open interval: `ur -> 1` gives the isotherm's own moisture ceiling
+    (`xe_num`), `ur -> 0` gives bone-dry equilibrium, both finite."""
+    ur_c = min(max(ur, 1.0e-6), 1.0 - 1.0e-6)
+    return p.xe_num / (1.0 + p.xe_coef * T_s * math.log(1.0 / ur_c))
+
+
 @dataclass(frozen=True)
 class VaporEnthalpyRef:
     """Zero-enthalpy datum for the water-basis vapor enthalpy curve: liquid

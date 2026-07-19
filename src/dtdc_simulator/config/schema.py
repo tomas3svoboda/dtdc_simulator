@@ -81,6 +81,23 @@ class LuikovParams(BaseModel):
     A2: float = Field(gt=0)
 
 
+class LuzDryingParams(BaseModel):
+    """Soybean-meal air-drying correlations — Luz et al. (2010) eqs. (4)/(5),
+    used by the DC (dryer/cooler) stage (core/dc.py). `k_*` are the
+    falling-rate mass-transfer coefficient K(T_a, X_s) [1/s]; `xe_*` the
+    temperature-dependent equilibrium-moisture isotherm X_e(T_s, ur). See
+    core/thermo.py::LuzDryingParams for the full form/provenance. Signs vary
+    (some coefficients are negative), so no positivity constraint here."""
+
+    k_a2: float
+    k_b2: float
+    k_a1: float
+    k_b1: float
+    k_c: float = Field(gt=0, description="1/s, dominant constant term of K")
+    xe_num: float = Field(gt=0, description="kg/kg dry solid, isotherm moisture ceiling")
+    xe_coef: float = Field(gt=0, description="1/K, isotherm temperature/activity factor")
+
+
 class AntoineParams(BaseModel):
     A: float
     B: float
@@ -131,6 +148,7 @@ class PhysicalParams(BaseModel):
     gab_params: GabParams
     oil_isotherm: OilIsotherm
     water_luikov: LuikovParams
+    water_luz_drying: LuzDryingParams
     antoine_hexane: AntoineParams
     antoine_water: AntoineParams
     material_name: str = ""
@@ -221,7 +239,6 @@ class OperatingDefaults(BaseModel):
     gate_opening: dict[str, float] = Field(default_factory=dict, description="0-100% per stage")
     heated_air_temp: float = Field(gt=0, description="K, DRYER")
     heated_air_flow: float = Field(gt=0, description="kg/s, DRYER")
-    ambient_air_temp: float = Field(gt=0, description="K, COOLER")
     ambient_air_flow: float = Field(gt=0, description="kg/s, COOLER")
     # M3a follow-up ("C"): HOT, live-tunable (moved out of ModelParams) --
     # the UI/OPC UA can adjust this while RUNNING via
@@ -244,8 +261,13 @@ class DisturbanceDefaults(BaseModel):
     feed_temperature: float = Field(gt=0, description="K")
     feed_moisture: float = Field(ge=0, description="kg/kg dry solid")
     feed_hexane: float = Field(ge=0, description="kg/kg dry solid")
-    ambient_temp: float = Field(gt=0, description="K")
-    ambient_humidity: float = Field(ge=0, description="kg/kg")
+    # Weather, not an operator setpoint -- COOLER's own inlet air temperature
+    # (see engine/facade.py's MV->DV reclassification comment).
+    ambient_air_temp: float = Field(gt=0, description="K, COOLER inlet air")
+    # Relative humidity (0-1), not an absolute humidity ratio -- what a
+    # weather report actually gives; converted to the absolute humidity the
+    # physics needs at `ambient_air_temp` in `core/model.py::_dc_equilibrium`.
+    ambient_relative_humidity: float = Field(ge=0, le=1, description="0-1, ambient RH")
 
 
 class ClockKind(str, Enum):

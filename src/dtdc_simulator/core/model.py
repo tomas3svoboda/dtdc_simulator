@@ -130,6 +130,11 @@ class State:
     dt_last_solve_sim_time: float
     dt_converged: bool
     dt_outer_iterations: int
+    # M4 (GUI redesign): the full per-cell axial profile from the last periodic
+    # solve_dt() resolve -- visualization-only (the HMI's "profile along the
+    # tower"), same cadence/lifecycle as dt_target_T/X1/X2 above (only touched
+    # in _apply_dt_result, otherwise carried unchanged tick-to-tick).
+    dt_axial_profile: dt_solver.DTAxialProfile
 
     def copy(self) -> "State":
         return State(
@@ -146,6 +151,7 @@ class State:
             dt_last_solve_sim_time=self.dt_last_solve_sim_time,
             dt_converged=self.dt_converged,
             dt_outer_iterations=self.dt_outer_iterations,
+            dt_axial_profile=self.dt_axial_profile,  # frozen/immutable, safe to share
         )
 
 
@@ -165,8 +171,13 @@ class Inputs:
     ambient_air_flow: float = 0.0  # kg/s
     feed_moisture: float = 0.0  # kg/kg dry solid
     feed_hexane: float = 0.0  # kg/kg dry solid
-    ambient_temp: float = 298.0  # K
-    ambient_humidity: float = 0.01  # kg/kg
+    # 0-1 fraction (weather RH, not an absolute humidity ratio) -- converted
+    # to the absolute humidity `dc.air_contact_equilibrium` actually needs
+    # in `_dc_equilibrium` below, evaluated at `ambient_air_temp` (heating
+    # this same air parcel up to `heated_air_temp` for the DRYER doesn't
+    # change its ABSOLUTE humidity, only its RH at the new temperature --
+    # see `_dc_equilibrium`'s own comment).
+    ambient_relative_humidity: float = 0.5  # 0-1
     # M3a follow-up ("C"): HOT, live-tunable -- see config/schema.py's
     # OperatingDefaults.dt_resolve_interval_s for the floor rationale.
     dt_resolve_interval_s: float = 120.0  # s, SIM time
@@ -207,6 +218,11 @@ class Outputs:
     stage_X_w_pct: dict[str, float]
     stage_vapor_temp: dict[str, float]
     stage_level_pct: dict[str, float]
+    # DC (DRYER/COOLER) air-outlet readout -- keyed only by DC-role stage
+    # ids (see `Model.outputs`'s own diagnostic re-derivation); no entry for
+    # DT-role stages, which have no equivalent air-side state at this fidelity.
+    stage_air_T_out: dict[str, float]
+    stage_air_humidity_out: dict[str, float]
     kpi_residual_hexane_ppm: float
     kpi_meal_moisture_pct: float
     kpi_steam_consumption_kg_per_t: float
@@ -214,6 +230,8 @@ class Outputs:
     dt_solver_converged: bool
     dt_solver_outer_iterations: int
     mass_inventory: MassInventory
+    dt_axial_profile: dt_solver.DTAxialProfile
+    dt_last_solve_sim_time: float
 
 
 def _dt_role_stages(stages: tuple[StageSpec, ...]) -> list[StageSpec]:
@@ -271,6 +289,7 @@ def _apply_dt_result(x_next: State, result: dt_solver.DTResult) -> None:
     x_next.dt_warm_start_vapor_wV2 = result.dcz.vapor_out.wV2
     x_next.dt_warm_start_vapor_T = result.dcz.vapor_out.T
     x_next.dt_warm_start_T_L_sup = result.ftrz.solid_out.T
+    x_next.dt_axial_profile = result.axial_profile
 
 
 @dataclass(frozen=True)
@@ -375,6 +394,7 @@ class Model:
             dt_last_solve_sim_time=0.0,
             dt_converged=result.converged,
             dt_outer_iterations=result.outer_iterations,
+            dt_axial_profile=result.axial_profile,
         )
 
     def _stage_M_max(self, stage: StageSpec) -> float:
@@ -396,41 +416,61 @@ class Model:
         return base / max(rpm / 3.0, 0.1) / gate_norm
 
     def _dc_equilibrium(
-        self, stage: StageSpec, T_in: float, X1_in: float, X2_in: float, u: Inputs
-    ) -> tuple[float, float, float]:
+        self, stage: StageSpec, T_in: float, X1_in: float, X2_in: float, u: Inputs, residence_s: float
+    ) -> tuple[float, float, float, float, float]:
         """§7.10: real well-mixed air-contacting balance (`core/dc.py`),
         shared by DRYER/COOLER -- only the air-stream arguments differ.
-        `dc.air_contact_equilibrium` also reports the air stream's own exit
-        state (`air_T_out`/`air_humidity_out`, added for `core/balance.py`'s
-        two-sided DC conservation check) -- not consumed by `Model.step`
-        today (no cross-stage air tracking exists yet), so only the solid
-        -side targets are returned here."""
+
+        `residence_s` is the stage's own solid residence time (`_stage_tau`,
+        the same holdup time `Model.step`'s lag relaxation uses) -- it sets
+        `K*tau` in `core/dc.py`'s falling-rate moisture balance (how far down
+        the drying curve the meal gets in one pass). See `dc.
+        air_contact_equilibrium`'s own docstring.
+        Returns `(T_eq, X1_eq, X2_eq, air_T_out, air_humidity_out)` --
+        `air_T_out`/`air_humidity_out` (the air stream's own exit state) are
+        used by `Model.step`'s own solid-side relaxation only via the first
+        three; `Model.outputs`'s own diagnostic re-derivation (see there)
+        reports the air-side pair directly for the HMI's "air outlet"
+        readout.
+
+        `u.ambient_relative_humidity` is evaluated at `u.ambient_air_temp`
+        (the actual weather condition) to get the air's own ABSOLUTE
+        humidity ratio -- reused unchanged for BOTH the DRYER and COOLER
+        calls below, since heating this same ambient air parcel up to
+        `heated_air_temp` for the DRYER doesn't add or remove water (only
+        its RH at that higher temperature drops, which is exactly what
+        makes heated dryer air "dry" despite starting from humid ambient
+        air) -- matches this function's own pre-existing convention of
+        reusing one shared humidity value for both roles."""
         c = self.constants
         m_dry = max(u.feed_flow_rate, 1e-9)
+        air_humidity = dc.saturation_humidity_ratio(
+            u.ambient_air_temp, c.dc_constants.antoine_water
+        ) * u.ambient_relative_humidity
         if stage.role is StageRole.DRYER:
-            T_eq, X1_eq, X2_eq, _, _ = dc.air_contact_equilibrium(
+            return dc.air_contact_equilibrium(
                 T_in,
                 X1_in,
                 X2_in,
                 u.heated_air_temp,
                 u.heated_air_flow,
-                u.ambient_humidity,
+                air_humidity,
                 m_dry,
+                residence_s,
                 c.dc_constants,
             )
-            return T_eq, X1_eq, X2_eq
         if stage.role is StageRole.COOLER:
-            T_eq, X1_eq, X2_eq, _, _ = dc.air_contact_equilibrium(
+            return dc.air_contact_equilibrium(
                 T_in,
                 X1_in,
                 X2_in,
                 u.ambient_air_temp,
                 u.ambient_air_flow,
-                u.ambient_humidity,
+                air_humidity,
                 m_dry,
+                residence_s,
                 c.dc_constants,
             )
-            return T_eq, X1_eq, X2_eq
         raise ValueError(f"unhandled DC stage role: {stage.role}")
 
     def _resolve_dt(self, x: State, x_next: State, u: Inputs, dt_stages: list[StageSpec]) -> None:
@@ -495,15 +535,15 @@ class Model:
         m_in = u.feed_flow_rate  # kg/s dry solid, chained bed-holdup mass balance
         dt_idx = 0
         for i, stage in enumerate(self.stages):
+            tau = self._stage_tau(stage, u)
             if stage.role in DT_ROLES:
                 T_eq = x_next.dt_target_T[dt_idx]
                 X1_eq = x_next.dt_target_X1[dt_idx]
                 X2_eq = x_next.dt_target_X2[dt_idx]
                 dt_idx += 1
             else:
-                T_eq, X1_eq, X2_eq = self._dc_equilibrium(stage, T_in, X1_in, X2_in, u)
+                T_eq, X1_eq, X2_eq, _, _ = self._dc_equilibrium(stage, T_in, X1_in, X2_in, u, tau)
 
-            tau = self._stage_tau(stage, u)
             decay = math.exp(-dt / tau)
 
             T_new = T_eq + (x.T[i] - T_eq) * decay
@@ -538,6 +578,27 @@ class Model:
             s.id: float(x.M[i] / self._stage_M_max(s) * 100.0) for i, s in enumerate(self.stages)
         }
 
+        # DC air-outlet readout (HMI request): a diagnostic-only re-derivation
+        # of `_dc_equilibrium`'s own air-side exit state, walking the same
+        # T_in/X1_in/X2_in chain `step()`'s own loop threads through the
+        # stages -- `outputs()` is a pure function of (x, u) alone (called
+        # both from `step()` and once, pre-tick, from `RuntimeFacade.
+        # assemble()`), so it re-derives this here rather than depending on
+        # `step()` to have passed it through. Only populated for DC-role
+        # stages (DRYER/COOLER); DT-role stages have no equivalent air-side
+        # state modeled at this fidelity.
+        stage_air_T_out: dict[str, float] = {}
+        stage_air_humidity_out: dict[str, float] = {}
+        T_in_diag, X1_in_diag, X2_in_diag = u.feed_temperature, u.feed_moisture, u.feed_hexane
+        for i, stage in enumerate(self.stages):
+            if stage.role in DC_ROLES:
+                _, _, _, air_T_out, air_humidity_out = self._dc_equilibrium(
+                    stage, T_in_diag, X1_in_diag, X2_in_diag, u, self._stage_tau(stage, u)
+                )
+                stage_air_T_out[stage.id] = float(air_T_out)
+                stage_air_humidity_out[stage.id] = float(air_humidity_out)
+            T_in_diag, X1_in_diag, X2_in_diag = float(x.T[i]), float(x.X1[i]), float(x.X2[i])
+
         total_steam_kg_s = (
             sum(u.direct_steam.values()) + sum(u.indirect_steam.values()) / c.dH_vap_water
         )
@@ -566,6 +627,8 @@ class Model:
             stage_X_w_pct=stage_X_w_pct,
             stage_vapor_temp=stage_vapor_temp,
             stage_level_pct=stage_level_pct,
+            stage_air_T_out=stage_air_T_out,
+            stage_air_humidity_out=stage_air_humidity_out,
             kpi_residual_hexane_ppm=float(x.X2[-1] * 1.0e6),
             kpi_meal_moisture_pct=float(x.X1[-1] * 100.0),
             kpi_steam_consumption_kg_per_t=steam_kg_per_t,
@@ -573,4 +636,6 @@ class Model:
             dt_solver_converged=bool(x.dt_converged),
             dt_solver_outer_iterations=int(x.dt_outer_iterations),
             mass_inventory=mass_inventory,
+            dt_axial_profile=x.dt_axial_profile,
+            dt_last_solve_sim_time=float(x.dt_last_solve_sim_time),
         )

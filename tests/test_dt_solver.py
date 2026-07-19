@@ -301,6 +301,51 @@ def test_zone_lengths_sum_sanely_against_geometry(default_result: dts.DTResult) 
     )
 
 
+# ------------------------------------------------------------------ axial profile (visualization)
+
+
+def test_axial_profile_spans_all_zones_in_physical_order(default_result: dts.DTResult) -> None:
+    profile = default_result.axial_profile
+    assert len(profile.z_m) > 0
+    assert list(profile.z_m) == sorted(profile.z_m)  # top-to-bottom, non-decreasing
+    assert set(profile.zone) == {"PHZ", "FTRZ", "DCZ"}
+    # Zones appear as contiguous blocks, in the real top-to-bottom physical
+    # order (PHZ then FTRZ then DCZ) -- not interleaved.
+    seen_order: list[str] = []
+    for zone in profile.zone:
+        if not seen_order or seen_order[-1] != zone:
+            seen_order.append(zone)
+    assert seen_order == ["PHZ", "FTRZ", "DCZ"]
+    assert set(profile.stage_id) <= {t.id for t in REFERENCE_TRAYS}
+    assert profile.z_m[-1] == pytest.approx(
+        default_result.L_PHZ_m + default_result.L_FTRZ_m + default_result.L_DCZ_m, rel=1.0e-6
+    )
+
+
+def test_axial_profile_hexane_falls_monotonically_through_phz(
+    default_result: dts.DTResult,
+) -> None:
+    profile = default_result.axial_profile
+    phz_x2 = [x2 for zone, x2 in zip(profile.zone, profile.solid_X2) if zone == "PHZ"]
+    assert phz_x2[0] <= SOLID_FEED.X2
+    assert phz_x2[-1] < phz_x2[0]
+    assert phz_x2 == sorted(phz_x2, reverse=True)  # PHZ only ever removes hexane
+
+
+def test_axial_profile_all_states_physically_bounded(default_result: dts.DTResult) -> None:
+    profile = default_result.axial_profile
+    for T in (*profile.solid_T, *profile.vapor_T):
+        assert T > 0.0
+    for X1, X2 in zip(profile.solid_X1, profile.solid_X2):
+        assert 0.0 <= X1 <= 1.0
+        assert 0.0 <= X2 <= 1.0
+    for flow in profile.vapor_flow_kg_s:
+        assert flow > 0.0
+    for hex_frac, water_frac in zip(profile.vapor_hexane_frac, profile.vapor_water_frac):
+        assert 0.0 <= hex_frac <= 1.0
+        assert 0.0 <= water_frac <= 1.0
+
+
 # ------------------------------------------------------------------ input validation
 
 

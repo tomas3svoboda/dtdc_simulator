@@ -256,6 +256,10 @@ class PHZPassResult:
     tray_results: tuple[phz_mod.PHZTrayResult, ...]  # fully-PHZ trays, top to bottom
     boundary_tray_index: int  # index into the caller's `trays` list
     z_star_m: float  # PHZ's own share of the boundary tray's height
+    boundary_tray_result: phz_mod.PHZTrayResult  # the boundary tray's own PHZ portion
+    # (height z_star_m), kept for the axial profile (DTAxialProfile) -- everything else here
+    # already only needed the boundary tray's own EXIT state (`exit_state` below), but the
+    # profile needs its per-cell interior too.
     exit_state: phz_mod.SolidState  # X2 <= X2,cr, T == T_boil_hexane
     L_PHZ_m: float
 
@@ -336,6 +340,7 @@ def _phz_pass(
             tray_results=tuple(completed),
             boundary_tray_index=idx,
             z_star_m=z_star,
+            boundary_tray_result=boundary_result,
             exit_state=boundary_result.solid_out,
             L_PHZ_m=cumulative_height + z_star,
         )
@@ -423,11 +428,39 @@ class TraySummary:
 
 
 @dataclass(frozen=True)
+class DTAxialProfile:
+    """Per-cell axial profile spanning the WHOLE DT (PHZ -> FTRZ -> DCZ, top to
+    bottom), for visualization (the HMI's own "profile along the tower", not
+    consumed by `Model.step` -- that only needs `tray_summaries`' per-tray exit
+    values). Parallel tuples, one entry per cell, ordered top-to-bottom by
+    `z_m` (cumulative distance from the DT's own top face).
+
+    `vapor_flow_kg_s` is a REAL, cell-varying quantity in PHZ/FTRZ (hexane
+    evaporation/condensation changes the vapor's own total mass flow as it
+    travels) but a FIXED *input* to DCZ's own zone solve (`solve_dcz_zone`
+    takes one scalar `m_vapor_kg_s`, not a per-cell profile) -- so this trace
+    is flat across the DCZ segment by construction, not a rendering artifact.
+    """
+
+    z_m: tuple[float, ...]
+    zone: tuple[str, ...]  # "PHZ" | "FTRZ" | "DCZ"
+    stage_id: tuple[str, ...]  # which real tray this cell belongs to
+    solid_T: tuple[float, ...]  # K
+    solid_X1: tuple[float, ...]  # kg/kg dry solid, moisture
+    solid_X2: tuple[float, ...]  # kg/kg dry solid, hexane
+    vapor_T: tuple[float, ...]
+    vapor_flow_kg_s: tuple[float, ...]  # total (water + hexane)
+    vapor_hexane_frac: tuple[float, ...]  # mass fraction, 0-1
+    vapor_water_frac: tuple[float, ...]  # mass fraction, 0-1
+
+
+@dataclass(frozen=True)
 class DTResult:
     phz: PHZPassResult
     ftrz: ftrz.FTRZZoneResult
     dcz: dcz.DCZZoneResult
     tray_summaries: tuple[TraySummary, ...]
+    axial_profile: DTAxialProfile
     L_PHZ_m: float
     L_FTRZ_m: float
     L_DCZ_m: float
@@ -714,11 +747,175 @@ def solve_dt(
             )
         )
 
+    # --- whole-DT axial profile (visualization only, see DTAxialProfile docstring) ---
+    def _dcz_stage_id_at(z_local_m: float) -> str:
+        """Same half-open-interval bucketing `_build_dcz_domain`'s own q_Iv
+        profile already uses, just keyed on real tray id instead of duty."""
+        z = 0.0
+        for tray in remaining:
+            if z - 1.0e-9 <= z_local_m < z + tray.bed_height_m + 1.0e-9:
+                return tray.id
+            z += tray.bed_height_m
+        return remaining[-1].id
+
+    prof_z: list[float] = []
+    prof_zone: list[str] = []
+    prof_stage: list[str] = []
+    prof_solid_T: list[float] = []
+    prof_solid_X1: list[float] = []
+    prof_solid_X2: list[float] = []
+    prof_vapor_T: list[float] = []
+    prof_vapor_flow: list[float] = []
+    prof_vapor_hex: list[float] = []
+    prof_vapor_water: list[float] = []
+
+    def _append_profile_point(
+        z: float,
+        zone_name: str,
+        stage: str,
+        s_T: float,
+        s_X1: float,
+        s_X2: float,
+        v_T: float,
+        v_flow: float,
+        v_hex: float,
+        v_water: float,
+    ) -> None:
+        prof_z.append(z)
+        prof_zone.append(zone_name)
+        prof_stage.append(stage)
+        prof_solid_T.append(s_T)
+        prof_solid_X1.append(s_X1)
+        prof_solid_X2.append(s_X2)
+        prof_vapor_T.append(v_T)
+        prof_vapor_flow.append(v_flow)
+        prof_vapor_hex.append(v_hex)
+        prof_vapor_water.append(v_water)
+
+    # PHZ vapor -- PHYSICAL (not the old per-cell "informational" placeholder).
+    # PHZ's SOLID solve is legitimately vapor-decoupled (the bed is jacket-heated,
+    # so its temperature/hexane profile doesn't depend on the gas). But the vapor
+    # RISING through PHZ physically carries hexane: it arrives hexane-rich from the
+    # FTRZ flash front below (`ftrz_result.vapor_out`) and picks up MORE from each
+    # PHZ cell's own surface evaporation (`hexane_evaporated_kg_s`, already computed
+    # by `solve_phz_tray`) on the way up to the DT vapor outlet. The old trace used
+    # each PHZ cell's decoupled `vapor_out` (which read ~pure water and did NOT
+    # carry the solvent leaving the top) -- a display artifact, fixed here.
+    #
+    # Construction: water-vapor flow is CONSTANT across PHZ (X1 is carried unchanged
+    # -- no water exchange with the solid here), equal to the FTRZ outlet water flow.
+    # Hexane flow leaving a cell's top face = FTRZ hexane + every PHZ cell at or below
+    # it (all cells the rising vapor has already passed), so we accumulate bottom-to-top.
+    # The vapor TEMPERATURE keeps each cell's own local estimate (`vapor_out.T`, which
+    # tracks the solid temperature) -- a rigorous PHZ vapor energy balance is out of
+    # scope and unneeded, since the solid solve doesn't consume it.
+    phz_vapor_in = ftrz_result.vapor_out  # hexane-rich vapor entering PHZ from the flash front
+    m_water_phz = phz_vapor_in.m_water_kg_s  # constant across PHZ
+    m_hex_ftrz = phz_vapor_in.m_hex_kg_s
+
+    phz_points: list[tuple[float, str, phz_mod.PHZCellResult]] = []
+    z_cum = 0.0
+    for tray, result in zip(trays[: phz_result.boundary_tray_index], phz_result.tray_results):
+        for cell in result.cells:
+            phz_points.append((z_cum + cell.z_from_top_m, tray.id, cell))
+        z_cum += tray.bed_height_m
+    boundary_tray = trays[phz_result.boundary_tray_index]
+    for cell in phz_result.boundary_tray_result.cells:
+        phz_points.append((z_cum + cell.z_from_top_m, boundary_tray.id, cell))
+
+    # Suffix-sum the hexane evaporated: cell i's top-face vapor carries the FTRZ
+    # hexane plus cells i..last (bottom-to-top accumulation in the vapor's direction).
+    hex_flow_at = [0.0] * len(phz_points)
+    running_hex = m_hex_ftrz
+    for i in range(len(phz_points) - 1, -1, -1):
+        running_hex += phz_points[i][2].hexane_evaporated_kg_s
+        hex_flow_at[i] = running_hex
+
+    for i, (z, stage, cell) in enumerate(phz_points):
+        m_hex = hex_flow_at[i]
+        v_flow = m_water_phz + m_hex
+        _append_profile_point(
+            z,
+            "PHZ",
+            stage,
+            cell.solid_out.T,
+            solid_feed.X1,
+            cell.solid_out.X2,
+            # PHZ vapor TEMPERATURE tracks the solid (thermal near-equilibrium in a
+            # well-contacted, arm-agitated bed). Using each cell's OWN decoupled
+            # `vapor_out.T` instead produced a per-tray sawtooth ("fangs"): the
+            # informational vapor was solved independently per tray and reset at every
+            # tray boundary. It connects continuously to the FTRZ vapor below (whose T
+            # also equals the solid T at the PHZ/FTRZ interface).
+            cell.solid_out.T,
+            v_flow,
+            m_hex / v_flow if v_flow > 0.0 else 0.0,
+            m_water_phz / v_flow if v_flow > 0.0 else 1.0,
+        )
+    z_cum = phz_result.L_PHZ_m  # authoritative, avoids float drift from the sum above
+
+    # FTRZ: thin zone, entirely within the boundary/host tray (solve_dt already
+    # raises above if L_FTRZ_m doesn't fit inside it). NOTE `cell.solid.X1` is the
+    # water CONDENSED within FTRZ only (it initializes at 0 and accumulates
+    # condensate top-to-bottom -- see zones/ftrz.py) -- so the displayed TOTAL
+    # moisture adds back the feed moisture the solid already carried through PHZ
+    # (`solid_feed.X1`, carried unchanged). Without this the profile drops to ~0%
+    # at the flash front and jumps back up at DCZ -- a display artifact, not real.
+    for cell in ftrz_result.cells:
+        z_cum += cell.dz_m
+        v_flow = cell.vapor_out.m_water_kg_s + cell.vapor_out.m_hex_kg_s
+        _append_profile_point(
+            z_cum,
+            "FTRZ",
+            host.id,
+            cell.solid.T,
+            solid_feed.X1 + cell.solid.X1,
+            cell.solid.X2,
+            cell.vapor_out.T,
+            v_flow,
+            cell.vapor_out.m_hex_kg_s / v_flow,
+            cell.vapor_out.m_water_kg_s / v_flow,
+        )
+    z_cum = phz_result.L_PHZ_m + L_FTRZ_m
+
+    # DCZ: vapor_flow_kg_s is the zone's own fixed scalar input, not a per-cell
+    # solved quantity (see DTAxialProfile docstring).
+    for j, cell in enumerate(dcz_result.cells):
+        z_local_end = (j + 1) * dz_dcz
+        z_local_center = (j + 0.5) * dz_dcz
+        stage = _dcz_stage_id_at(z_local_center)
+        _append_profile_point(
+            z_cum + z_local_end,
+            "DCZ",
+            stage,
+            dcz.bulk_temperature(cell, geometry),
+            cell.X1_bulk,
+            cell.X2_bulk,
+            cell.vapor_top.T,
+            m_vapor_total_kg_s,
+            cell.vapor_top.wV2,
+            1.0 - cell.vapor_top.wV2,
+        )
+
+    axial_profile = DTAxialProfile(
+        z_m=tuple(prof_z),
+        zone=tuple(prof_zone),
+        stage_id=tuple(prof_stage),
+        solid_T=tuple(prof_solid_T),
+        solid_X1=tuple(prof_solid_X1),
+        solid_X2=tuple(prof_solid_X2),
+        vapor_T=tuple(prof_vapor_T),
+        vapor_flow_kg_s=tuple(prof_vapor_flow),
+        vapor_hexane_frac=tuple(prof_vapor_hex),
+        vapor_water_frac=tuple(prof_vapor_water),
+    )
+
     return DTResult(
         phz=phz_result,
         ftrz=ftrz_result,
         dcz=dcz_result,
         tray_summaries=tuple(tray_summaries),
+        axial_profile=axial_profile,
         L_PHZ_m=phz_result.L_PHZ_m,
         L_FTRZ_m=L_FTRZ_m,
         L_DCZ_m=dcz_c.bed_height_m,

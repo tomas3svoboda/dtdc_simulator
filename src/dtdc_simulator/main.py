@@ -7,7 +7,6 @@ see interfaces/ui/app.py). Run with `dtdc-sim` (see pyproject.toml) or
 """
 
 from __future__ import annotations
-
 import argparse
 import logging
 

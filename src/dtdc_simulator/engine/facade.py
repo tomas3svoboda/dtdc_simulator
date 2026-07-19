@@ -27,9 +27,11 @@ MV_LIMITS: dict[str, tuple[float, float, float | None]] = {
     "sweep_arm_speed": (0.0, 10.0, None),
     "gate_opening": (0.0, 100.0, None),
     "heated_air_temp": (280.0, 450.0, None),
-    "heated_air_flow": (0.0, 100.0, None),
-    "ambient_air_temp": (250.0, 320.0, None),
-    "ambient_air_flow": (0.0, 100.0, None),
+    # Cooling ~25 kg/s of hot meal to ~38 C with ambient air is energy-bound to a high
+    # air:solid ratio (~16:1), so the COOLER air-flow ceiling is well above the DRYER's --
+    # see core/dc.py's coupled two-sided balance and scenarios/soybean_default.yaml.
+    "heated_air_flow": (0.0, 200.0, None),
+    "ambient_air_flow": (0.0, 800.0, None),
 }
 
 
@@ -196,7 +198,6 @@ class RuntimeFacade:
         add("feed_flow_rate", od.feed_flow_rate, "feed_flow_rate")
         add("heated_air_temp", od.heated_air_temp, "heated_air_temp")
         add("heated_air_flow", od.heated_air_flow, "heated_air_flow")
-        add("ambient_air_temp", od.ambient_air_temp, "ambient_air_temp")
         add("ambient_air_flow", od.ambient_air_flow, "ambient_air_flow")
 
         dt_stage_ids = [s.id for s in config.geometry.stages if s.role in DT_SCHEMA_ROLES]
@@ -221,8 +222,13 @@ class RuntimeFacade:
             "feed_temperature": DisturbanceVariable("feed_temperature", dd.feed_temperature),
             "feed_moisture": DisturbanceVariable("feed_moisture", dd.feed_moisture),
             "feed_hexane": DisturbanceVariable("feed_hexane", dd.feed_hexane),
-            "ambient_temp": DisturbanceVariable("ambient_temp", dd.ambient_temp),
-            "ambient_humidity": DisturbanceVariable("ambient_humidity", dd.ambient_humidity),
+            # Weather, not an operator setpoint -- reclassified from an MV (see
+            # MV_LIMITS' own history / DECISIONS.md): nothing sets the COOLER's
+            # inlet air temperature, it's a disturbance like ambient_relative_humidity.
+            "ambient_air_temp": DisturbanceVariable("ambient_air_temp", dd.ambient_air_temp),
+            "ambient_relative_humidity": DisturbanceVariable(
+                "ambient_relative_humidity", dd.ambient_relative_humidity
+            ),
         }
 
     # ------------------------------------------------------------------ hot writes
@@ -305,12 +311,11 @@ class RuntimeFacade:
             gate_opening=gate_opening,
             heated_air_temp=self._mvs["heated_air_temp"].tick(dt),
             heated_air_flow=self._mvs["heated_air_flow"].tick(dt),
-            ambient_air_temp=self._mvs["ambient_air_temp"].tick(dt),
+            ambient_air_temp=self._dvs["ambient_air_temp"].value,
             ambient_air_flow=self._mvs["ambient_air_flow"].tick(dt),
             feed_moisture=self._dvs["feed_moisture"].value,
             feed_hexane=self._dvs["feed_hexane"].value,
-            ambient_temp=self._dvs["ambient_temp"].value,
-            ambient_humidity=self._dvs["ambient_humidity"].value,
+            ambient_relative_humidity=self._dvs["ambient_relative_humidity"].value,
             dt_resolve_interval_s=self._dt_resolve_interval_s,
         )
 

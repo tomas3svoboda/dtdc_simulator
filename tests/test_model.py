@@ -30,12 +30,11 @@ def _default_inputs(cfg):
         gate_opening=dict(od.gate_opening),
         heated_air_temp=od.heated_air_temp,
         heated_air_flow=od.heated_air_flow,
-        ambient_air_temp=od.ambient_air_temp,
+        ambient_air_temp=dd.ambient_air_temp,
         ambient_air_flow=od.ambient_air_flow,
         feed_moisture=dd.feed_moisture,
         feed_hexane=dd.feed_hexane,
-        ambient_temp=dd.ambient_temp,
-        ambient_humidity=dd.ambient_humidity,
+        ambient_relative_humidity=dd.ambient_relative_humidity,
     )
 
 
@@ -83,16 +82,23 @@ def test_more_steam_raises_dt_target_temperature(loaded) -> None:
     """Direct, cheap test of the DT-role target mechanism itself (one
     solve_dt call per trajectory, not a long tick loop): halved vs doubled
     indirect steam duty should produce a cooler vs hotter converged DT
-    profile at the DT's own exit tray.
+    profile.
+
+    Asserts on the DT's PEAK tray temperature, not its exit tray: the exit
+    (SPARGE/DCZ) tray is pinned near the direct-steam saturation temperature
+    (~100 C) by steam condensation equilibrium, so it barely moves with
+    indirect steam -- the PREDESOLV/MAIN trays are where indirect (jacket)
+    duty actually lands (verified directly: doubling indirect steam takes the
+    PREDESOLV trays from ~62-67 C to ~104 C while SP1 stays ~100 C). Using
+    `max()` captures the real, physically-meaningful response.
 
     Not asserting `dt_converged` here: the scenario's own real-time tuning
     (M3a follow-up "A2", `dt_outer_tol=0.05`/`dt_outer_max_iter=20`) is
     deliberately loose enough that the formal convergence flag often reads
     False within so few iterations even though the profile itself is already
-    close to its asymptote (verified directly this session -- within ~1K/
-    ~2ppm of the tight-tolerance answer at these settings) -- `converged`
-    is a diagnostic for `SolverStress`, not a precondition for the profile
-    being directionally meaningful, which is what this test actually checks.
+    close to its asymptote -- `converged` is a diagnostic for `SolverStress`,
+    not a precondition for the profile being directionally meaningful, which
+    is what this test actually checks.
     """
     (model, x0), cfg = loaded
 
@@ -104,7 +110,7 @@ def test_more_steam_raises_dt_target_temperature(loaded) -> None:
     x_cold, _ = model.step(x0, u_cold, 1.0, 1.0)  # t=1.0 >> the tiny resolve interval
     x_hot, _ = model.step(x0, u_hot, 1.0, 1.0)
 
-    assert x_hot.dt_target_T[-1] > x_cold.dt_target_T[-1]
+    assert max(x_hot.dt_target_T) > max(x_cold.dt_target_T)
 
 
 def test_narrower_gate_raises_steady_state_bed_level(loaded) -> None:

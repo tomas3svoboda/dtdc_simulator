@@ -330,32 +330,51 @@ def dc_stage_balance(
     c: dc_mod.DCConstants,
     ignore_hexane_latent_heat: bool = True,
 ) -> MassEnergyResidual:
-    """Two-sided (air loses what solid gains) mass+energy, enabled by
-    `air_contact_equilibrium`'s extended return signature
-    (`T_eq, X1_eq, X2_eq, air_T_out, air_humidity_out`, `result` here).
-    `ignore_hexane_latent_heat` defaults `True` and MUST stay so unless
-    `core/dc.py`'s own model is upgraded to charge hexane's own evaporation
-    a latent-heat cost: `DCConstants` carries no `dH_vap_hexane` at all
-    today (a known, pre-existing, documented simplification -- hexane
-    leaving the solid in DC currently costs no energy in this model). This
-    parameter exists so that gap is visible in this check's OWN signature,
-    not silently absorbed into a loose energy tolerance.
+    """Full two-sided water-mass + total-energy conservation check for the
+    rewritten `core/dc.py` (first-principles falling-rate contactor with a
+    CLOSED balance -- see that module's own docstring). Enabled by
+    `air_contact_equilibrium`'s extended return signature (`T_eq, X1_eq,
+    X2_eq, air_T_out, air_humidity_out`, `result` here).
+
+    WATER: the air gains exactly what the solid loses --
+    `(Y_out - Y_in)*m_air == m_dry*(X1_in - X1_eq)` -- exact by construction
+    (`air_contact_equilibrium` sets `Y_out = Y_in + m_evap/m_air`), so this
+    residual is machine-precision zero unless that relation is broken.
+
+    ENERGY: adiabatic two-sided total-enthalpy balance `H_in == H_out`,
+    reconstructed INDEPENDENTLY from the reported boundary states via the
+    SAME `dc.solid_stream_enthalpy_w`/`dc.air_stream_enthalpy_w` primitives
+    `air_contact_equilibrium` solved `air_T_out` against (a well-isolated
+    constitutive property, appropriate to reuse per this module's own design
+    principle). `air_T_out` is defined to close this, so the residual is
+    machine-precision zero -- a genuine check that the reported outlet states
+    are mutually energy-consistent, and that the model no longer needs the
+    old evaporative-cooling special case (which left the air side unbalanced
+    in the drying regime).
+
+    `ignore_hexane_latent_heat` defaults `True` and MUST stay so: `DCConstants`
+    still carries no `dH_vap_hexane` (a pre-existing, documented
+    simplification -- hexane air-stripping in DC costs no energy in this
+    model; `dc.py`'s own `air_T_out` solve likewise ignores it, so both sides
+    of this check omit it consistently). The flag keeps that gap visible in
+    the signature rather than hidden in a loose tolerance.
     """
-    T_eq, X1_eq, _X2_eq, air_T_out, air_humidity_out = result
+    _T_eq, X1_eq, _X2_eq, air_T_out, air_humidity_out = result
     m_dry_safe = max(m_dry_kg_s, 1.0e-9)
     # X1_eq = X1_in - m_evap_kg_s/m_dry_safe (air_contact_equilibrium's own
     # relation) -- solved back for m_evap_kg_s, NOT simply X1_in-X1_eq (that
-    # forgets the m_dry_safe scaling entirely -- caught empirically: an
-    # earlier version of this line was off by exactly that factor).
+    # forgets the m_dry_safe scaling entirely).
     m_evap_kg_s = (X1_in - X1_eq) * m_dry_safe  # positive = evaporating
 
     water_residual = (air_humidity_out - air_humidity_in) * air_flow_kg_s - m_evap_kg_s
 
-    Q_sensible_w = air_flow_kg_s * dc_mod.CP_AIR_J_KG_K * (air_T - air_T_out)
-    Q_latent_w = m_evap_kg_s * c.dH_vap_water
-    C_wet = c.cp_solid + X1_in * c.cp_water_liquid
-    solid_energy_w = m_dry_safe * C_wet * (T_eq - T_in)
-    energy_residual = Q_sensible_w - (solid_energy_w + Q_latent_w)
+    h_in = dc_mod.solid_stream_enthalpy_w(m_dry_safe, T_in, X1_in, c) + dc_mod.air_stream_enthalpy_w(
+        air_flow_kg_s, air_T, air_humidity_in, c
+    )
+    h_out = dc_mod.solid_stream_enthalpy_w(
+        m_dry_safe, _T_eq, X1_eq, c
+    ) + dc_mod.air_stream_enthalpy_w(air_flow_kg_s, air_T_out, air_humidity_out, c)
+    energy_residual = h_in - h_out
     if not ignore_hexane_latent_heat:
         raise NotImplementedError(
             "core/dc.py's DCConstants carries no dH_vap_hexane -- hexane's own "

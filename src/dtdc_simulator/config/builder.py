@@ -47,6 +47,18 @@ def _thermo_luikov(p: schema.LuikovParams) -> thermo.LuikovParams:
     return thermo.LuikovParams(A1=p.A1, A2=p.A2)
 
 
+def _thermo_luz_drying(p: schema.LuzDryingParams) -> thermo.LuzDryingParams:
+    return thermo.LuzDryingParams(
+        k_a2=p.k_a2,
+        k_b2=p.k_b2,
+        k_a1=p.k_a1,
+        k_b1=p.k_b1,
+        k_c=p.k_c,
+        xe_num=p.xe_num,
+        xe_coef=p.xe_coef,
+    )
+
+
 def _build_dt_solver_constants(
     physical: schema.PhysicalParams, model: schema.ModelParams, T_boil_water: float
 ) -> dt_solver.DTSolverConstants:
@@ -149,7 +161,8 @@ def assemble_model(config: ScenarioConfig) -> tuple[Model, State]:
         dH_vap_water=config.physical.dH_vap_water,
         antoine_water=_thermo_antoine(config.physical.antoine_water),
         dc_hexane_strip_k=config.model.dc_hexane_strip_k,
-        luikov=_thermo_luikov(config.physical.water_luikov),
+        luz=_thermo_luz_drying(config.physical.water_luz_drying),
+        cp_water_vapor=config.physical.cp_water_vapor,
     )
     constants = ModelConstants(
         dH_vap_hexane=config.physical.dH_vap_hexane,
