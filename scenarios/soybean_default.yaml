@@ -127,15 +127,16 @@ model:
 # Coletto base case direction: feed ~26% solvent, ~35% at rotary lock; steam split DT.
 operating_defaults:
   feed_flow_rate: 25.0        # kg/s dry solid  [PLACE] (scale to your throughput)
-  # PD1/PD2 raised 6.0e5 -> 9.0e5 W so the PREDESOLV section actually reaches hexane bp
-  # (~69 C) and DESOLVENTIZES, rather than merely pre-heating: at 6.0e5 the meal only got to
-  # ~64 C by PD2 exit (below bp) and X2 stayed at feed until MN1; at 9.0e5 PD1 pre-heats to
-  # ~67 C and PD2 crosses bp and flashes ~95% of the hexane (a real predesolventizer). The
-  # extra duty goes into hexane LATENT heat (DT exit temp is ~unchanged at ~102 C), i.e. it
-  # desolventizes rather than overheating. MN1/SP1 unchanged (they now finish + toast).
+  # PD1/PD2 raised to 2.5e6 W each so the PREDESOLV section can strip feed hexane down to the
+  # measured critical content X_c ~0.20 (properties/soybean.yaml, Faner 2019) by surface
+  # evaporation -- i.e. the predesolventizer does the bulk of the desolventizing, as it does in
+  # a real DT. (At the old 9.0e5, the PHZ could only reach ~0.36 by surface evaporation, which
+  # was fine when X_c was the theoretical ~0.43 but leaves the meal above the real 0.20.) With
+  # 2.5e6 the flash front sits in PD2 and the DT exits ~1000 ppm hexane at ~100 C. MN1 (toasting)
+  # + SP1 (sparge) then finish the residual via the receding front + DCZ diffusion.
   indirect_steam:             # W per DT tray (jacket duty)  [PLACE]
-    PD1: 9.0e5
-    PD2: 9.0e5
+    PD1: 2.5e6
+    PD2: 2.5e6
     MN1: 2.0e6
     SP1: 4.0e5
   direct_steam:               # kg/s sparge steam  [PLACE]

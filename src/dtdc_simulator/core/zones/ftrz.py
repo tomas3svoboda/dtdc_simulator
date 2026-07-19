@@ -86,6 +86,9 @@ class FTRZConstants:
     rho_ps: float
     X3: float  # oil fraction, kg/kg dry solid
     bed_porosity: float  # eps_b; alpha_L (bed-scale solid volume fraction) = 1 - bed_porosity
+    # Empirical critical solvent content (Faner 2019, ~0.20 soybean). None -> use the
+    # theoretical pore-saturation eq. 4 (thermo.x2_critical). See DECISIONS.md.
+    x2_critical_empirical: float | None = None
 
 
 @dataclass(frozen=True)
@@ -323,7 +326,11 @@ def solve_ftrz_zone(
             # `cell_thickness_m`). k=0 is the bottommost cell.
             X2_entrance = X2_inf + (k + 1) * (hexane_evap_kg_s / m_dry_kg_s)
             X2_cr = thermo.x2_critical(
-                c.alpha_pg, thermo.rho_hexane_liquid(vapor_out.T), c.alpha_ps, c.rho_ps
+                c.alpha_pg,
+                thermo.rho_hexane_liquid(vapor_out.T),
+                c.alpha_ps,
+                c.rho_ps,
+                empirical=c.x2_critical_empirical,
             )
             T_L = solid_temperature(X2_entrance, X2_cr, X2_inf, c.T_boil_hexane, vapor_out.T)
             # Reported/exit state (matching zones/phz.py's "cell holds the

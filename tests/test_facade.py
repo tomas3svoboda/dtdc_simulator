@@ -56,18 +56,21 @@ def test_tick_only_advances_while_running() -> None:
 def test_auto_mode_drives_pv_apc_style() -> None:
     facade = _facade_freerun()
     facade.run()
-    # Drive a PREDESOLV tray's jacket duty: the MAIN/SPARGE (DCZ) trays are pinned near the
-    # direct-steam saturation temperature (~100 C) by condensation equilibrium, so their
-    # temperature barely responds to indirect steam -- the PREDESOLV trays are where jacket
-    # duty actually lands (see tests/test_model.py::test_more_steam_raises_dt_target_temperature).
-    key = "indirect_steam/PD1"
-    facade.set_mv_mode(key, Mode.AUTO)
-    facade.set_mv_auto_setpoint(key, 3.0e6)
-    T_before = facade.get_snapshot().outputs.stage_T["PD1"]
+    # Assert on the DT PEAK temperature, not a single tray: individual trays are variously
+    # pinned -- the MAIN/SPARGE (DCZ) trays at the direct-steam saturation temperature, and a
+    # PREDESOLV tray sitting at the hexane boiling point is evaporation-pinned (extra jacket
+    # duty goes into hexane latent heat, not temperature). The DT peak still rises with total
+    # jacket duty (see tests/test_model.py::test_more_steam_raises_dt_target_temperature).
+    dt_stages = [sid for sid, role in facade.get_snapshot().stage_roles.items()
+                 if role in ("PREDESOLV", "MAIN", "SPARGE")]
+    for sid in dt_stages:
+        facade.set_mv_mode(f"indirect_steam/{sid}", Mode.AUTO)
+        facade.set_mv_auto_setpoint(f"indirect_steam/{sid}", 3.0e6)
+    peak_before = max(facade.get_snapshot().outputs.stage_T[s] for s in dt_stages)
     for _ in range(300):
         facade.tick()
-    T_after = facade.get_snapshot().outputs.stage_T["PD1"]
-    assert T_after > T_before
+    peak_after = max(facade.get_snapshot().outputs.stage_T[s] for s in dt_stages)
+    assert peak_after > peak_before
 
 
 def test_manual_mode_ignores_auto_writes() -> None:

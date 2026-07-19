@@ -142,6 +142,9 @@ class PhysicalParams(BaseModel):
     )
     sorption_C0: float
     sorption_C1: float
+    # Empirical critical solvent content X_c (constant->falling-rate transition). None ->
+    # theoretical pore-saturation eq. 4. Faner et al. (2019) measured ~0.20 for soybean.
+    x2_critical: float | None = Field(default=None, gt=0, lt=1)
     water_diffusivity: float = Field(
         gt=0, description="m2/s, water's own intraparticle diffusivity, DCZ's LDF equilibration rate"
     )

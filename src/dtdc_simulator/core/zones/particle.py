@@ -74,6 +74,9 @@ class ParticleConstants:
     sorption_C0: float
     sorption_C1: float
     cp_water_liquid: float  # J/(kg K), for the moisture-weighted Cv term below
+    # Empirical critical solvent content (Faner 2019, ~0.20 soybean). None -> use the
+    # theoretical pore-saturation eq. 4 (thermo.x2_critical). See DECISIONS.md.
+    x2_critical_empirical: float | None = None
 
 
 @dataclass(frozen=True)

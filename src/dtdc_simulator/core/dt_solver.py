@@ -278,7 +278,11 @@ def _phz_pass(
 
     def _x2_cr(T: float) -> float:
         return thermo.x2_critical(
-            c.particle.alpha_pg, thermo.rho_hexane_liquid(T), c.particle.alpha_ps, c.particle.rho_ps
+            c.particle.alpha_pg,
+            thermo.rho_hexane_liquid(T),
+            c.particle.alpha_ps,
+            c.particle.rho_ps,
+            empirical=c.particle.x2_critical_empirical,
         )
 
     for idx, tray in enumerate(trays):

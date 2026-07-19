@@ -110,9 +110,28 @@ def rho_hexane_vapor(T: float, P: float = ATM_PRESSURE_PA) -> float:
     return P * M_HEXANE / (R_GAS * T)
 
 
-def x2_critical(alpha_pg: float, rho_hexL: float, alpha_ps: float, rho_ps: float) -> float:
-    """X2,cr (eq. 4) — hexane content once the particle pores are just
-    saturated with LIQUID hexane (surface hexane just gone)."""
+def x2_critical(
+    alpha_pg: float,
+    rho_hexL: float,
+    alpha_ps: float,
+    rho_ps: float,
+    empirical: float | None = None,
+) -> float:
+    """X2,cr -- the critical hexane content at the constant-rate -> falling-rate
+    (surface-evaporation -> receding-front) transition.
+
+    `empirical`, when given, is returned directly (temperature-independent): use
+    it to supply Faner, Perez & Crapiste (2019)'s MEASURED soybean value
+    (X_c ~= 0.20), which is the constant->falling transition actually observed in
+    superheated-hexane desolventizing. The default `None` falls back to Coletto
+    eq. 4 -- the THEORETICAL pore-liquid-saturation content
+    `(alpha_pg*rho_hexL)/(alpha_ps*rho_ps)` (~0.43), i.e. the content at which the
+    pores are just full of liquid hexane. The two disagree ~2x because capillarity
+    keeps the particle surface wetted (constant rate) well below full pore
+    saturation; Faner's empirical value is the physically-observed transition and
+    is preferred for soybean. See DECISIONS.md."""
+    if empirical is not None:
+        return empirical
     return (alpha_pg * rho_hexL) / (alpha_ps * rho_ps)
 
 
@@ -266,8 +285,17 @@ def cp_lmix(
 
 
 def nu_from_reynolds(Re: float, Pr: float) -> float:
-    """Nu_epsilon = 0.6949 * Re^0.579 * Pr^(1/3) — Faner's correlation (eq. B.7)."""
-    return 0.6949 * Re**0.579 * Pr ** (1.0 / 3.0)
+    """Nu = 2.0 + 0.6 * Re^0.5 * Pr^(1/3) -- the canonical Ranz-Marshall
+    single-sphere correlation, which Faner, Perez & Crapiste (2019) use for
+    oilseed-meal desolventizing (their eq. 11). Replaces the earlier
+    `0.6949*Re^0.579*Pr^(1/3)` form (Coletto's eq. B.7, cited to Faner's
+    unrecoverable 2008 thesis): the `+2.0` conduction floor is the physically
+    correct low-Re limit for a sphere. Verified NOT to move the tuning
+    (DT exit ~977->982 ppm, DCZ temperature band ~unchanged) -- the sweep-arm
+    agitation enhancement (`bed_transport_coefficients`) dominates the base
+    correlation at these conditions, so this is a fidelity refinement, not a
+    re-tune. See DECISIONS.md."""
+    return 2.0 + 0.6 * Re**0.5 * Pr ** (1.0 / 3.0)
 
 
 def hq_from_nu(Nu: float, r_P: float, k_V: float, alpha_V: float, alpha_L: float) -> float:

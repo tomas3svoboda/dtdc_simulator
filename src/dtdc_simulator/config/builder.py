@@ -103,6 +103,7 @@ def _build_dt_solver_constants(
         rho_ps=physical.rho_ps,
         X3=physical.oil_fraction,
         bed_porosity=physical.bed_porosity,
+        x2_critical_empirical=physical.x2_critical,
     )
     particle_c = pt.ParticleConstants(
         D_eff=model.D_eff,
@@ -123,6 +124,7 @@ def _build_dt_solver_constants(
         sorption_C0=physical.sorption_C0,
         sorption_C1=physical.sorption_C1,
         cp_water_liquid=physical.cp_water_liquid,
+        x2_critical_empirical=physical.x2_critical,
     )
     T_direct_steam = _antoine_boiling_point_k(
         physical.antoine_water, p_bar=_ATM_PRESSURE_BAR + model.direct_steam_pressure_barg

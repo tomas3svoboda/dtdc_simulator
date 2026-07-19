@@ -71,6 +71,13 @@ oil_fraction:      0.01      # kg/kg [PAPER-ish] residual oil in meal (X3), ~1% 
 # heat of sorption  dH_s = dH_lv2 + C0 * W2^C1   (A.31)
 sorption_C0: 3.0e5           # [PLACE] no source available (see note above); order-of-magnitude only
 sorption_C1: -0.5            # [PLACE] no source available (see note above); order-of-magnitude only
+# Critical solvent content X_c (constant-rate -> falling-rate / surface -> receding-front transition).
+# Faner, Perez & Crapiste (2019) MEASURED ~0.20 for soybean meal desolventizing with superheated hexane
+# (their Fig. 5 / model fit). The theoretical Coletto eq. 4 (pore LIQUID saturation) gives ~0.43 -- ~2x
+# too high, because capillarity keeps the particle surface wetted well below full pore saturation. Using
+# Faner's measured value; the predesolventizer then does most of the desolventizing (feed -> 0.20 by
+# surface evaporation), which is realistic. Omit / set null to fall back to the theoretical eq. 4.
+x2_critical: 0.20            # kg hexane/kg dry solid  [PAPER] Faner et al. (2019), soybean measured value
 # Water's own bed-scale equilibration rate (DCZ moisture, subsaturated regime) -- found this
 # session (DECISIONS.md): reusing hexane's own hM here (a Faner-correlation, hexane-vapor-tuned
 # value) was ~25-100x too fast once genuinely coupled to an energy balance (confirmed: inverted
