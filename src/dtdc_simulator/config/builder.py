@@ -162,9 +162,11 @@ def assemble_model(config: ScenarioConfig) -> tuple[Model, State]:
         cp_water_liquid=config.physical.cp_water_liquid,
         dH_vap_water=config.physical.dH_vap_water,
         antoine_water=_thermo_antoine(config.physical.antoine_water),
-        dc_hexane_strip_k=config.model.dc_hexane_strip_k,
         luz=_thermo_luz_drying(config.physical.water_luz_drying),
         cp_water_vapor=config.physical.cp_water_vapor,
+        gab=_thermo_gab(config.physical.gab_params),
+        antoine_hexane=_thermo_antoine(config.physical.antoine_hexane),
+        dc_hexane_mtc=config.model.dc_hexane_mtc,
     )
     constants = ModelConstants(
         dH_vap_hexane=config.physical.dH_vap_hexane,

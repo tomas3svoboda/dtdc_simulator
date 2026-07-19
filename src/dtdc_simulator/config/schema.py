@@ -197,8 +197,10 @@ class ModelParams(BaseModel):
     )
     dt_vapor_feed_hex_kg_s: float = Field(ge=0, description="[PLACE] as dt_vapor_feed_water_kg_s")
     dt_vapor_feed_T: float = Field(gt=0, description="K, [PLACE] as dt_vapor_feed_water_kg_s")
-    dc_hexane_strip_k: float = Field(
-        ge=0, description="[PLACE] DC residual-hexane air-stripping rate constant, core/dc.py"
+    dc_hexane_mtc: float = Field(
+        gt=0,
+        description="[PLACE] DC hexane desorption mass-transfer coefficient (core/dc.py::desorb_hexane); "
+        "hexane removal rate = dc_hexane_mtc * air_flow * (y_surf - y_air)",
     )
     # SPARGE (direct) steam supply pressure, found this session: this project's own
     # `literature_sources/Svoboda_Case_for_Advanced_Process_Control_VRX-DTDC_Concept.pdf`

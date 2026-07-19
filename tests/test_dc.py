@@ -16,14 +16,18 @@ ANTOINE_WATER = thermo.AntoineParams(A=5.11564, B=1687.54, C=-42.98)
 LUZ = thermo.LuzDryingParams(
     k_a2=-0.33e-11, k_b2=4.60e-9, k_a1=7.0e-8, k_b1=1.42e-5, k_c=8.44e-3, xe_num=0.834, xe_coef=0.036
 )
+ANTOINE_HEXANE = thermo.AntoineParams(A=4.00266, B=1171.53, C=-48.784)
+GAB_HEXANE = thermo.GabParams(Xm=5.183e-3, C0=3.117e-3, dHC_R=2262.0, K0=9.172e-2, dHK_R=729.6)
 CONSTANTS = dc.DCConstants(
     cp_solid=1800.0,
     cp_water_liquid=4186.0,
     dH_vap_water=2.26e6,
     antoine_water=ANTOINE_WATER,
-    dc_hexane_strip_k=1.0,
     luz=LUZ,
     cp_water_vapor=1900.0,
+    gab=GAB_HEXANE,
+    antoine_hexane=ANTOINE_HEXANE,
+    dc_hexane_mtc=2.0e-2,
 )
 M_DRY_KG_S = 25.0
 TAU_S = 135.0
@@ -124,7 +128,7 @@ def test_luz_equilibrium_moisture_falls_with_temperature() -> None:
 
 
 def test_zero_air_flow_leaves_solid_and_air_unchanged() -> None:
-    T_eq, X1_eq, X2_eq, air_T_out, air_humidity_out = _equilibrium(air_flow_kg_s=0.0)
+    T_eq, X1_eq, X2_eq, air_T_out, air_humidity_out, _ = _equilibrium(air_flow_kg_s=0.0)
     assert T_eq == pytest.approx(378.0)
     assert X1_eq == pytest.approx(0.10)
     assert X2_eq == pytest.approx(0.0138)
@@ -141,7 +145,7 @@ def test_dryer_dries_the_meal_but_keeps_it_warm() -> None:
     # cooling is real but modest here (the air supplies most of the latent load
     # via the coupled balance), so the meal settles well above the old model's
     # ~43 C wet-bulb crash. Protects against reintroducing that bug.
-    T_eq, X1_eq, _X2_eq, air_T_out, air_humidity_out = _equilibrium(
+    T_eq, X1_eq, _X2_eq, air_T_out, air_humidity_out, _ = _equilibrium(
         T_in=375.15, X1_in=0.095, air_T=380.0
     )
     assert X1_eq < 0.095  # dried
@@ -152,8 +156,8 @@ def test_dryer_dries_the_meal_but_keeps_it_warm() -> None:
 
 def test_more_residence_time_dries_more() -> None:
     # Falling-rate kinetics: longer contact -> further down the drying curve.
-    _, X1_short, _, _, _ = _equilibrium(residence_s=40.0)
-    _, X1_long, _, _, _ = _equilibrium(residence_s=400.0)
+    _, X1_short, _, _, _, _ = _equilibrium(residence_s=40.0)
+    _, X1_long, _, _, _, _ = _equilibrium(residence_s=400.0)
     assert X1_long < X1_short < 0.10
 
 
@@ -161,7 +165,9 @@ def test_more_residence_time_dries_more() -> None:
 
 
 def test_cool_air_cools_the_solid_toward_air_temperature() -> None:
-    T_eq, _X1_eq, X2_eq, air_T_out, _ = _equilibrium(T_in=378.0, air_T=298.0, air_humidity_in=Y_AMBIENT)
+    T_eq, _X1_eq, X2_eq, air_T_out, _, _ = _equilibrium(
+        T_in=378.0, air_T=298.0, air_humidity_in=Y_AMBIENT
+    )
     assert 298.0 < T_eq < 378.0  # cools toward, never past, the cold air
     assert 298.0 < air_T_out < 378.0  # air warms toward, never past, the hot meal
     assert 0.0 <= X2_eq < 0.0138
@@ -203,7 +209,7 @@ def test_dry_meal_in_humid_air_adsorbs_moisture_bounded() -> None:
     # A COOLER stage on meal dried below its ambient-humidity isotherm
     # equilibrium picks moisture back UP from the humid ambient air -- real,
     # bounded, energy-consistent (no runaway exothermic heating).
-    T_eq, X1_eq, _, _, air_humidity_out = _equilibrium(
+    T_eq, X1_eq, _, _, air_humidity_out, _ = _equilibrium(
         T_in=319.15, X1_in=0.02, air_T=298.0, air_flow_kg_s=400.0
     )
     assert X1_eq > 0.02  # adsorbed
@@ -216,18 +222,38 @@ def test_dry_meal_in_humid_air_adsorbs_moisture_bounded() -> None:
 
 def test_hexane_and_moisture_bounded_in_unit_interval() -> None:
     for air_flow in (0.0, 1.0, 8.0, 60.0, 400.0):
-        T_eq, X1_eq, X2_eq, _, _ = _equilibrium(air_flow_kg_s=air_flow)
+        T_eq, X1_eq, X2_eq, _, _, _ = _equilibrium(air_flow_kg_s=air_flow)
         assert 0.0 <= X1_eq <= 1.0
         assert 0.0 <= X2_eq <= 1.0
         assert T_eq == T_eq  # not NaN
 
 
 def test_moisture_removal_never_exceeds_available_moisture() -> None:
-    _T_eq, X1_eq, _X2_eq, _, _ = _equilibrium(X1_in=0.001, air_T=400.0, air_flow_kg_s=500.0)
+    _T_eq, X1_eq, _X2_eq, _, _, _ = _equilibrium(X1_in=0.001, air_T=400.0, air_flow_kg_s=500.0)
     assert X1_eq >= 0.0
 
 
 def test_more_air_flow_strips_more_hexane() -> None:
-    _, _, X2_low, _, _ = _equilibrium(air_flow_kg_s=2.0)
-    _, _, X2_high, _, _ = _equilibrium(air_flow_kg_s=16.0)
+    # Mechanistic desorption (desorb_hexane): more air dilutes the bulk hexane it
+    # must exceed, raising the driving force -> more removal -> lower residual.
+    _, _, X2_low, _, _, _ = _equilibrium(air_flow_kg_s=2.0)
+    _, _, X2_high, _, _, _ = _equilibrium(air_flow_kg_s=16.0)
     assert X2_high < X2_low
+
+
+def test_colder_meal_desorbs_less_hexane() -> None:
+    # The escaping tendency a_h*p_sat_hexane(T) collapses at low temperature, so a
+    # cold stage desorbs less residual hexane than a hot one -- the mechanistic
+    # (no-gate) temperature dependence that keeps ~100-300 ppm in the cooled product.
+    x2_out_hot, _ = dc.desorb_hexane(0.0015, 373.15, 60.0, M_DRY_KG_S, CONSTANTS)  # 100 C
+    x2_out_cold, _ = dc.desorb_hexane(0.0015, 310.15, 60.0, M_DRY_KG_S, CONSTANTS)  # 37 C
+    assert x2_out_cold > x2_out_hot  # colder meal keeps more hexane
+
+
+def test_dc_air_hexane_stays_below_safety_limit_and_tracks_removal() -> None:
+    # The hexane desorbed into the drying air is reported (mole fraction) for the
+    # ~1100 ppm (10% LEL) safety check; it must equal what the solid lost, and stay
+    # comfortably under the limit at the base-case dryer conditions.
+    x2_out, y_air = dc.desorb_hexane(0.001, 326.15, 60.0, M_DRY_KG_S, CONSTANTS)
+    assert x2_out < 0.001  # some hexane removed
+    assert 0.0 < y_air * 1.0e6 < 1100.0  # air hexane in mole ppm, under the LEL limit

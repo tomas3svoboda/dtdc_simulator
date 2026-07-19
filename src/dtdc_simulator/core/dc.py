@@ -54,6 +54,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from scipy.optimize import brentq
+
 from dtdc_simulator.core import thermo
 
 CP_AIR_J_KG_K = 1005.0  # [STD] dry air specific heat
@@ -69,9 +71,12 @@ class DCConstants:
     cp_water_liquid: float
     dH_vap_water: float  # J/kg, latent heat of water (referenced at the 0 C enthalpy datum)
     antoine_water: thermo.AntoineParams
-    dc_hexane_strip_k: float  # [PLACE], see air_contact_equilibrium docstring
     luz: thermo.LuzDryingParams  # soybean-meal air-drying K + isotherm (Luz 2010), see thermo.py
     cp_water_vapor: float  # J/(kg K), humid-air enthalpy for the closed energy balance
+    # --- residual-hexane desorption (mechanistic, shared with the DT/DCZ physics) ---
+    gab: thermo.GabParams  # hexane sorption isotherm (Cardarelli 1996) -- SAME as the DCZ uses
+    antoine_hexane: thermo.AntoineParams  # hexane saturation pressure (escaping tendency)
+    dc_hexane_mtc: float  # [PLACE] mass-transfer coefficient for hexane desorption into air
 
 
 def saturation_humidity_ratio(
@@ -147,6 +152,52 @@ def _close_air_temperature(
     return _T_ENTHALPY_REF_K + (h_in - h_solid_out - latent) / max(coeff, _EPS)
 
 
+def desorb_hexane(
+    X2_in: float, T_solid: float, air_flow_kg_s: float, m_dry_kg_s: float, c: DCConstants
+) -> tuple[float, float]:
+    """Mechanistic residual-hexane desorption into (fresh, ~0-hexane) air, at the
+    well-mixed stage's steady state. Returns `(X2_out, air_hexane_mole_frac_out)`.
+
+    Replaces the old ad-hoc `X2*exp(-k*air/m_dry)` first-order strip with the SAME
+    physics the DT/DCZ uses -- so the DC and DT are now consistent. The solid at
+    loading `X2` sits in equilibrium with a hexane partial pressure `p_surf =
+    a_h(X2,T)*p_sat_hexane(T)` (its "escaping tendency"); desorption is the
+    gas-side mass transfer of that hexane into the air, driven by `y_surf -
+    y_air`. The strong TEMPERATURE dependence is emergent and mechanistic (no
+    gate): `p_sat_hexane(T)` collapses ~5-20x from the DT (~100 C) to the cooler
+    (~37 C), via the ~22 kJ/mol isosteric heat of sorption (Cardarelli 1996), so
+    a cold cooler barely desorbs and the product holds ~100-300 ppm.
+
+    CSTR hexane balance (implicit in `X2_out`, since `a_h` depends on it):
+        m_dry*(X2_in - X2_out) = dc_hexane_mtc * air_flow * (y_surf - y_air_out)
+    with `y_surf = a_h(X2_out,T)*p_sat(T)/P` and `y_air_out` the outlet air's own
+    hexane mole fraction (the transferred hexane raises the bulk it must exceed).
+    Uses the GAB adsorbed-phase loading alone (oil-absorbed hexane `X3*qo` is a
+    ~1% correction at these coverages -- a documented simplification)."""
+    if air_flow_kg_s < _EPS or X2_in <= 0.0:
+        return max(X2_in, 0.0), 0.0
+    P = thermo.ATM_PRESSURE_PA
+    n_air = air_flow_kg_s / M_AIR_KG_MOL  # mol/s dry air
+    p_sat = thermo.antoine_pressure_pa(T_solid, c.antoine_hexane)
+
+    def _residual(X2_out: float) -> float:
+        m_hex = m_dry_kg_s * (X2_in - X2_out)  # kg/s hexane desorbed
+        n_hex = max(m_hex, 0.0) / thermo.M_HEXANE  # mol/s
+        a_h = thermo.hexane_activity_from_loading(max(X2_out, 0.0), T_solid, c.gab)
+        y_surf = min(a_h * p_sat / P, 1.0)
+        y_air = n_hex / (n_air + n_hex)
+        rate = c.dc_hexane_mtc * air_flow_kg_s * (y_surf - y_air)  # kg/s
+        return m_hex - rate
+
+    # residual(X2_in) < 0 (no removal yet, but a positive escaping tendency);
+    # residual(0) > 0 (max removal, but the driving force has gone negative) -> bracketed.
+    x2_out = brentq(_residual, 0.0, X2_in)
+    m_hex = m_dry_kg_s * (X2_in - x2_out)
+    n_hex = max(m_hex, 0.0) / thermo.M_HEXANE
+    y_air_out = n_hex / (n_air + n_hex)
+    return x2_out, y_air_out
+
+
 def air_contact_equilibrium(
     T_in: float,
     X1_in: float,
@@ -157,7 +208,7 @@ def air_contact_equilibrium(
     m_dry_kg_s: float,
     residence_s: float,
     c: DCConstants,
-) -> tuple[float, float, float, float, float]:
+) -> tuple[float, float, float, float, float, float]:
     """One well-mixed 0-D air-solid contactor at its steady state -- returns
     `(T_eq, X1_eq, X2_eq, air_T_out, air_humidity_out)`. `T_eq`/`X1_eq`/
     `X2_eq` are the SOLID's own steady-state exit targets the caller's
@@ -181,8 +232,14 @@ def air_contact_equilibrium(
     # No air flow -> no contact: the solid and air both leave unchanged (guards
     # the coupled solve below against a zero air heat-capacity/enthalpy rate).
     if air_flow_kg_s < _EPS:
-        X2_eq = X2_in
-        return (T_in, min(max(X1_in, 0.0), 1.0), min(max(X2_eq, 0.0), 1.0), air_T, air_humidity_in)
+        return (
+            T_in,
+            min(max(X1_in, 0.0), 1.0),
+            min(max(X2_in, 0.0), 1.0),
+            air_T,
+            air_humidity_in,
+            0.0,
+        )
 
     # Air-solid heat-transfer conductance UA [W/K] from the NTU convention
     # (NTU = air:solid ratio, effectiveness 1-exp(-NTU) as before), scaled by
@@ -257,9 +314,13 @@ def air_contact_equilibrium(
         m_dry_safe, T_in, X1_in, air_flow_kg_s, air_T, air_humidity_in, T_s, X1_eq, air_humidity_out, c
     )
 
-    # Residual hexane air-stripping (first-order in the air:solid ratio) --
-    # unchanged; orthogonal to the water/energy balance above.
-    X2_eq = X2_in * math.exp(-c.dc_hexane_strip_k * air_flow_kg_s / m_dry_safe)
+    # Residual-hexane desorption at the SOLID's own (solved) temperature `T_s`:
+    # mechanistic, escaping-tendency-driven (see `desorb_hexane`). `air_hexane_out`
+    # (mole fraction) is the hexane going into the drying/cooling air -- the caller
+    # tracks it against the ~1100 ppm (10% LEL) safety limit. Orthogonal to the
+    # water/energy balance above (hexane's own latent heat is still not charged --
+    # a documented, pre-existing DC simplification; its mass is ppm-scale).
+    X2_eq, air_hexane_out = desorb_hexane(X2_in, T_s, air_flow_kg_s, m_dry_safe, c)
 
     return (
         T_s,
@@ -267,4 +328,5 @@ def air_contact_equilibrium(
         min(max(X2_eq, 0.0), 1.0),
         air_T_out,
         air_humidity_out,
+        air_hexane_out,
     )

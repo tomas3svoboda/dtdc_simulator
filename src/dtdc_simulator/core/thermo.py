@@ -74,6 +74,26 @@ def gab_hexane_content(a_h: float, T: float, p: GabParams) -> float:
     return p.Xm * C * K * a_h / ((1.0 - K * a_h) * (1.0 - K * a_h + C * K * a_h))
 
 
+def hexane_activity_from_loading(W2: float, T: float, p: GabParams, a_h_max: float = 1.0) -> float:
+    """Inverse of `gab_hexane_content`: the hexane activity `a_h` whose GAB
+    equilibrium loading equals `W2` (kg/kg dry solid) at temperature `T`. The
+    isotherm is monotone in `a_h` on (0, 1/K), so the root is unique; clamped to
+    `(0, min(a_h_max, 1/K))`. Used by the DC hexane desorption driving force
+    (`core/dc.py`): the solid's own equilibrium hexane partial pressure is
+    `a_h * p_sat(T)`, the "escaping tendency" that collapses at low temperature."""
+    if W2 <= 0.0:
+        return 0.0
+    K = p.K0 * math.exp(p.dHK_R / T)
+    upper = min(a_h_max, 1.0 / K) - 1.0e-9
+    if upper <= 1.0e-12:
+        return 0.0
+    if gab_hexane_content(upper, T, p) <= W2:
+        return upper
+    from scipy.optimize import brentq
+
+    return brentq(lambda a: gab_hexane_content(a, T, p) - W2, 1.0e-12, upper)
+
+
 def oil_hexane_content(a_h: float, p: OilIsotherm) -> float:
     """qo(a_h) = A0 * a_h^B — hexane absorbed in the oil phase, kg/kg oil (eq. 7)."""
     if not 0.0 <= a_h <= 1.0:

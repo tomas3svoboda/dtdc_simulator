@@ -255,6 +255,11 @@ class TowerView:
                 # can't be misread as "the air shrank" -- the air CONSERVES dry mass and
                 # only GAINS humidity (g H2O per kg dry air) as it dries the meal.
                 widgets["air_out"] = theme.compact_metric("°C / kg/s dry / g H2O·kg⁻¹")
+            with ui.row().classes("gap-3 flex-wrap mt-1"):
+                ui.label("Air hexane:").classes("text-[10px] text-gray-500")
+                # Hexane desorbed into the DC exhaust air, vs the ~1100 ppm (10% LEL)
+                # safety limit -- turns red if exceeded.
+                widgets["air_hex"] = theme.compact_metric("ppm (limit 1100)")
             with ui.row().classes("items-center gap-2 w-full mt-1"):
                 bar_bg = (
                     ui.element("div")
@@ -354,6 +359,12 @@ class TowerView:
                 widgets["air_out"].text = (
                     f"{theme.k_to_c(t_out):.0f} °C / {flow:.1f} kg/s / {humidity_out_g_kg:.1f} g/kg"
                 )
+            air_hex_w = widgets.get("air_hex")
+            if air_hex_w is not None and sid in outputs.stage_air_hexane_ppm:
+                hex_ppm = outputs.stage_air_hexane_ppm[sid]
+                over = hex_ppm > 1100.0
+                air_hex_w.text = f"{hex_ppm:.0f} ppm" + (" ⚠ OVER LEL" if over else "")
+                air_hex_w.style(replace=f"color: {theme.RED if over else theme.DARK};")
 
         if self._stage_order and self._product_widgets:
             last_sid = self._stage_order[-1]

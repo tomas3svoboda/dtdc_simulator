@@ -326,7 +326,7 @@ def dc_stage_balance(
     air_flow_kg_s: float,
     air_humidity_in: float,
     m_dry_kg_s: float,
-    result: tuple[float, float, float, float, float],
+    result: tuple[float, float, float, float, float, float],
     c: dc_mod.DCConstants,
     ignore_hexane_latent_heat: bool = True,
 ) -> MassEnergyResidual:
@@ -359,7 +359,7 @@ def dc_stage_balance(
     of this check omit it consistently). The flag keeps that gap visible in
     the signature rather than hidden in a loose tolerance.
     """
-    _T_eq, X1_eq, _X2_eq, air_T_out, air_humidity_out = result
+    _T_eq, X1_eq, _X2_eq, air_T_out, air_humidity_out, _air_hex = result
     m_dry_safe = max(m_dry_kg_s, 1.0e-9)
     # X1_eq = X1_in - m_evap_kg_s/m_dry_safe (air_contact_equilibrium's own
     # relation) -- solved back for m_evap_kg_s, NOT simply X1_in-X1_eq (that

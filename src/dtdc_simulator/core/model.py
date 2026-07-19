@@ -223,6 +223,7 @@ class Outputs:
     # DT-role stages, which have no equivalent air-side state at this fidelity.
     stage_air_T_out: dict[str, float]
     stage_air_humidity_out: dict[str, float]
+    stage_air_hexane_ppm: dict[str, float]  # hexane in the DC exhaust air (mole ppm), vs ~1100 LEL limit
     kpi_residual_hexane_ppm: float
     kpi_meal_moisture_pct: float
     kpi_steam_consumption_kg_per_t: float
@@ -417,7 +418,7 @@ class Model:
 
     def _dc_equilibrium(
         self, stage: StageSpec, T_in: float, X1_in: float, X2_in: float, u: Inputs, residence_s: float
-    ) -> tuple[float, float, float, float, float]:
+    ) -> tuple[float, float, float, float, float, float]:
         """§7.10: real well-mixed air-contacting balance (`core/dc.py`),
         shared by DRYER/COOLER -- only the air-stream arguments differ.
 
@@ -542,7 +543,7 @@ class Model:
                 X2_eq = x_next.dt_target_X2[dt_idx]
                 dt_idx += 1
             else:
-                T_eq, X1_eq, X2_eq, _, _ = self._dc_equilibrium(stage, T_in, X1_in, X2_in, u, tau)
+                T_eq, X1_eq, X2_eq, _, _, _ = self._dc_equilibrium(stage, T_in, X1_in, X2_in, u, tau)
 
             decay = math.exp(-dt / tau)
 
@@ -589,14 +590,16 @@ class Model:
         # state modeled at this fidelity.
         stage_air_T_out: dict[str, float] = {}
         stage_air_humidity_out: dict[str, float] = {}
+        stage_air_hexane_ppm: dict[str, float] = {}  # mole ppm in the DC air, vs the ~1100 (10% LEL) limit
         T_in_diag, X1_in_diag, X2_in_diag = u.feed_temperature, u.feed_moisture, u.feed_hexane
         for i, stage in enumerate(self.stages):
             if stage.role in DC_ROLES:
-                _, _, _, air_T_out, air_humidity_out = self._dc_equilibrium(
+                _, _, _, air_T_out, air_humidity_out, air_hexane_out = self._dc_equilibrium(
                     stage, T_in_diag, X1_in_diag, X2_in_diag, u, self._stage_tau(stage, u)
                 )
                 stage_air_T_out[stage.id] = float(air_T_out)
                 stage_air_humidity_out[stage.id] = float(air_humidity_out)
+                stage_air_hexane_ppm[stage.id] = float(air_hexane_out * 1.0e6)
             T_in_diag, X1_in_diag, X2_in_diag = float(x.T[i]), float(x.X1[i]), float(x.X2[i])
 
         total_steam_kg_s = (
@@ -629,6 +632,7 @@ class Model:
             stage_level_pct=stage_level_pct,
             stage_air_T_out=stage_air_T_out,
             stage_air_humidity_out=stage_air_humidity_out,
+            stage_air_hexane_ppm=stage_air_hexane_ppm,
             kpi_residual_hexane_ppm=float(x.X2[-1] * 1.0e6),
             kpi_meal_moisture_pct=float(x.X1[-1] * 100.0),
             kpi_steam_consumption_kg_per_t=steam_kg_per_t,

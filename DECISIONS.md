@@ -3,6 +3,34 @@
 Log of `DECIDE` choices made while building the DTDC simulator, per
 `Specifications/DTDC_Simulator_BuildSpec.md`. Newest entries at the top.
 
+## DC residual hexane rebuilt mechanistically (GAB + Antoine escaping tendency); DT/DC consistency (2026-07-19)
+
+**Trigger.** Two problems with the DC hexane term: (1) it over-stripped to ~0 ppm after
+cooling (unrealistic -- real meal holds ~100-300 ppm), and (2) it was an ad-hoc first-order
+strip `X2*exp(-k*air/m_dry)`, inconsistent with the DT/DCZ which use the real GAB isotherm +
+Antoine vapor pressure + diffusion. A literature review (Cardarelli 1996 hexane sorption, Faner
+2019 kinetics, Zhang 2018 diffusion `E_a`) confirmed the DC's *hexane* side was the one outlier
+(its water side already uses Luz; the DT is internally consistent).
+
+**Key physics (user's insight, confirmed against Cardarelli 1996).** Hexane desorption at low
+temperature nearly stalls not because the DIFFUSION coefficient drops (Zhang: `E_a`~6 kJ/mol,
+only ~1.5x over the whole range) but because the ESCAPING TENDENCY -- the solid's own equilibrium
+hexane partial pressure `p_eq = a_h(X2,T)*p_sat_hexane(T)` -- collapses: the isosteric heat of
+sorption is ~22 kJ/mol at low coverage (Cardarelli), so `p_eq` falls ~5-20x from the DT (~100 C)
+to the cooler (~37 C). This is the mechanistic version of "diffusion stops at low temperature."
+
+**Rebuild (`core/dc.py::desorb_hexane`).** Replaced the strip with a steady-state well-mixed
+mass-transfer balance: `m_dry*(X2_in - X2_out) = dc_hexane_mtc*air_flow*(y_surf - y_air)`, where
+`y_surf = a_h(X2_out,T)*p_sat_hexane(T)/P` (GAB inverted via new
+`thermo.hexane_activity_from_loading`, SAME isotherm the DCZ uses) and `y_air` is the outlet air's
+hexane mole fraction. Temperature dependence is now EMERGENT (no gate): the cold cooler desorbs
+~2.6x slower than the dryer, so the product holds a realistic ~195 ppm. The hexane going into the
+drying air is returned and tracked against the **~1100 ppm (10% LEL) safety limit** (DR1 ~92 ppm,
+CL1 ~20 ppm at base case -- comfortably safe), shown on the DC tray card (red if exceeded).
+`DCConstants` swaps `dc_hexane_strip_k` for `gab`/`antoine_hexane`/`dc_hexane_mtc`;
+`air_contact_equilibrium` return grows a 6th element (air hexane); `Outputs` gains
+`stage_air_hexane_ppm`. Net: DT exits ~980 ppm, dryer ~320, product ~195 ppm; air well under LEL.
+
 ## Flake particle radius fixes DT residual hexane + moisture; realistic geometry & feed basis (2026-07-19)
 
 **Trigger.** With the DC rewrite landed and the DT geometry made realistic (6 m diameter, shallow

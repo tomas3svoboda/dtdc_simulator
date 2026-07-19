@@ -87,17 +87,14 @@ model:
   dt_vapor_feed_water_kg_s: 5.0   # kg/s  [PLACE]
   dt_vapor_feed_hex_kg_s: 0.0005  # kg/s  [PLACE]
   dt_vapor_feed_T: 371.0          # K     [PLACE]
-  # Retuned from an initial 0.3 placeholder (DECIDE, this session): recalibrating
-  # ambient_air_flow/heated_air_flow against a real DTDC SCADA reference screen (a
-  # "311 TOASTER" HMI, user-provided) surfaced that residual hexane at the old flow+k
-  # combination sat ~11,800 ppm at steady state -- far above the ~1000 ppm ceiling the
-  # user set as a hard requirement for finished meal. Retuned jointly with the air flow
-  # recalibration below (see operating_defaults' own comments) to land comfortably under
-  # that ceiling (~115-120 ppm at the base case, confirmed robust across a stress test
-  # sweep -- reduced indirect steam duty, narrower discharge gates -- since DC's own
-  # stripping dominates whatever concentration arrives from the DT). Still [PLACE]: no
-  # literature source calibrates this rate constant, only the ppm ceiling it must satisfy.
-  dc_hexane_strip_k: 1.0          # -  [PLACE, RETUNED] core/dc.py residual-hexane air-stripping rate constant
+  # DC residual-hexane desorption -- mechanistic (core/dc.py::desorb_hexane), replacing the old
+  # ad-hoc first-order strip. Removal rate = dc_hexane_mtc * air_flow * (y_surf - y_air), where
+  # y_surf = a_h(X2,T)*p_sat_hexane(T)/P is the solid's own escaping tendency (GAB isotherm +
+  # Antoine, the SAME physics the DT/DCZ uses). Temperature dependence is now emergent: the cold
+  # cooler (~37 C) barely desorbs (p_sat collapses), so the product holds a realistic ~100-300 ppm,
+  # while the drying-air hexane stays trackable against the ~1100 ppm (10% LEL) safety limit.
+  # Calibrated so the product lands ~100-300 ppm. Still [PLACE]: a lumped MTC, no direct source.
+  dc_hexane_mtc: 2.0e-2           # -  [PLACE] DC hexane desorption mass-transfer coefficient
   # SPARGE (direct) steam supply pressure -- found this session: the model previously mixed
   # direct_steam in at water's ATMOSPHERIC boiling point (~373 K), but that's the DT vessel's
   # own internal vapor-space reference, not the steam SUPPLY temperature. This project's own
