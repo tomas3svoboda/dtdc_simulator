@@ -3,6 +3,33 @@
 Log of `DECIDE` choices made while building the DTDC simulator, per
 `Specifications/DTDC_Simulator_BuildSpec.md`. Newest entries at the top.
 
+## DC hexane coefficient anchored to real plant data (EPA AP-42) + Naiha diffusion physics (2026-07-19)
+
+**Trigger.** `dc_hexane_mtc` was the last hand-tuned `[PLACE]` number. The user supplied two papers
+that together resolve it: Naiha & Roques (1983), hexane diffusion in DRY oilseed meal, and EPA AP-42
+9.11.1 Table 4-4, measured residual hexane in real US soybean-plant meal.
+
+**Naiha (the rate physics).** Directly measures the intraparticle diffusion `D/a²` for hexane in dry
+meal at 40-105 C (the DC regime), for a ~175 um radius ~ our flake `r_P`: `D/a²` ~ 3e-8..4.4e-6 /s
+(tiny), activation energy **E = 80 kJ/mol** (~190x drop 100->37 C). This is the hard number behind
+"diffusion nearly stops at low temperature." NB Naiha's `D` (~1e-13, dry residual regime) is ~1e5x
+smaller than Cardarelli's `D_eff` (4e-10, bulk desolventizing) -- two DIFFERENT regimes, no conflict
+(DCZ uses the fast one, the DC needs the slow one).
+
+**EPA (the validation data).** Real US soybean plants: meal hexane ~**507 ppm** at the DT exit ->
+~**397** (dryer) -> ~**323** (cooler/product), range 110-650; high-feed plants sit higher (plant F:
+1380 -> 440). The calibration target we'd been guessing.
+
+**Key finding from reconciling them.** Naiha's STATIC diffusion is ~1000x too slow to explain EPA's
+real ~36% DC removal, and its E=80 over-predicts the T-sensitivity (EPA's dryer/cooler split implies
+an effective ~20 kJ/mol). So the real DC removal is **agitation/surface-renewal-driven** (the tumbled,
+conveyed meal exposes fresh surface), not static-diffusion-limited -- which is exactly why a lumped
+MTC is still needed rather than a bare `D_eff`. So `dc_hexane_mtc` is now **[PAPER-anchored]**:
+magnitude to EPA Table 4-4, T-law from the escaping tendency `a_h*p_sat(T)` (moderate, matching EPA),
+with Naiha's 80 kJ/mol noted as the static upper bound. Recalibrated 2.0e-2 -> 1.3e-2 so this
+scenario's high-feed base case (DT ~982 ppm) lands product ~293 ppm (dryer 420, air 78 ppm, safe).
+EPA cascade + Naiha added to the scenario's validation-targets block.
+
 ## DC residual hexane rebuilt mechanistically (GAB + Antoine escaping tendency); DT/DC consistency (2026-07-19)
 
 **Trigger.** Two problems with the DC hexane term: (1) it over-stripped to ~0 ppm after

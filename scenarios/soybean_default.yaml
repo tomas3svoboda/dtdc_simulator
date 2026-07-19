@@ -87,14 +87,20 @@ model:
   dt_vapor_feed_water_kg_s: 5.0   # kg/s  [PLACE]
   dt_vapor_feed_hex_kg_s: 0.0005  # kg/s  [PLACE]
   dt_vapor_feed_T: 371.0          # K     [PLACE]
-  # DC residual-hexane desorption -- mechanistic (core/dc.py::desorb_hexane), replacing the old
-  # ad-hoc first-order strip. Removal rate = dc_hexane_mtc * air_flow * (y_surf - y_air), where
-  # y_surf = a_h(X2,T)*p_sat_hexane(T)/P is the solid's own escaping tendency (GAB isotherm +
-  # Antoine, the SAME physics the DT/DCZ uses). Temperature dependence is now emergent: the cold
-  # cooler (~37 C) barely desorbs (p_sat collapses), so the product holds a realistic ~100-300 ppm,
-  # while the drying-air hexane stays trackable against the ~1100 ppm (10% LEL) safety limit.
-  # Calibrated so the product lands ~100-300 ppm. Still [PLACE]: a lumped MTC, no direct source.
-  dc_hexane_mtc: 2.0e-2           # -  [PLACE] DC hexane desorption mass-transfer coefficient
+  # DC residual-hexane desorption -- mechanistic (core/dc.py::desorb_hexane): removal rate =
+  # dc_hexane_mtc * air_flow * (y_surf - y_air), y_surf = a_h(X2,T)*p_sat_hexane(T)/P the solid's
+  # escaping tendency (GAB isotherm + Antoine, SAME physics as the DT/DCZ). Now ANCHORED to real
+  # US-plant data: EPA AP-42 9.11.1 Table 4-4 gives meal hexane ~507 ppm at the DT exit -> ~397
+  # (dryer) -> ~323 (cooler/product), range 110-650. Calibrated so this scenario's high-feed base
+  # case (DT exit ~980 ppm) lands the product ~300 ppm, i.e. the ~30% cooler + ~57% dryer cascade
+  # of a high-DT-exit plant (cf. EPA plant F: 1380 -> 440 ppm). Drying-air hexane (~78 ppm) stays
+  # well under the ~1100 ppm (10% LEL) safety limit. TEMPERATURE LAW: the escaping-tendency p_sat
+  # gives the (moderate) cooler-desorbs-less behaviour EPA shows. Naiha & Roques (1983) MEASURED
+  # the intraparticle diffusion E=80 kJ/mol, but that is STATIC diffusion and over-predicts the
+  # T-sensitivity vs the real (agitated/conveyed) DC, whose effective E~20 kJ/mol per EPA -- so we
+  # do NOT apply the full 80; surface renewal in the tumbled bed is why the lumped MTC is still
+  # needed. [PAPER-anchored]: magnitude from EPA Table 4-4, T-law from the escaping tendency.
+  dc_hexane_mtc: 1.3e-2           # -  [PAPER-anchored] EPA AP-42 9.11.1 Table 4-4 meal-hexane cascade
   # SPARGE (direct) steam supply pressure -- found this session: the model previously mixed
   # direct_steam in at water's ATMOSPHERIC boiling point (~373 K), but that's the DT vessel's
   # own internal vapor-space reference, not the steam SUPPLY temperature. This project's own
@@ -213,3 +219,8 @@ sim:
 #   [literature, whole tower] DT exit (post-SP1): ~105-110 C, moisture 18-22%, hexane <500-800 ppm
 #   [literature, whole tower] DRYER exit:        moisture ~13%
 #   [literature, whole tower] COOLER exit:       ~35-40 C, moisture ~11-12.5%, hexane <300-500 ppm
+#   [EPA AP-42 9.11.1 Table 4-4, real US soybean plants] MEAL HEXANE cascade (avg; range 110-650):
+#       DT (desolventizer-toaster) exit ~507 ppm  ->  dryer exit ~397 ppm  ->  cooler/product ~323 ppm
+#       (high-feed plants sit higher, e.g. plant F: DT 1380 -> product 440 ppm)
+#   [Naiha & Roques 1983] hexane intraparticle diffusion in DRY meal: D/a² ~3e-8..4.4e-6 /s (40-105 C),
+#       activation energy E=80 kJ/mol (STATIC diffusion; the real agitated DC is milder, EPA effective ~20)

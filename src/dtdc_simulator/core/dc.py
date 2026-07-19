@@ -163,10 +163,15 @@ def desorb_hexane(
     loading `X2` sits in equilibrium with a hexane partial pressure `p_surf =
     a_h(X2,T)*p_sat_hexane(T)` (its "escaping tendency"); desorption is the
     gas-side mass transfer of that hexane into the air, driven by `y_surf -
-    y_air`. The strong TEMPERATURE dependence is emergent and mechanistic (no
-    gate): `p_sat_hexane(T)` collapses ~5-20x from the DT (~100 C) to the cooler
-    (~37 C), via the ~22 kJ/mol isosteric heat of sorption (Cardarelli 1996), so
-    a cold cooler barely desorbs and the product holds ~100-300 ppm.
+    y_air`. The TEMPERATURE dependence is emergent (no gate): `p_sat_hexane(T)`
+    falls with T (via the ~22 kJ/mol isosteric heat of sorption, Cardarelli
+    1996), so a colder stage desorbs less. `dc_hexane_mtc` is ANCHORED to real
+    US-plant data (EPA AP-42 9.11.1 Table 4-4: meal hexane ~507 ppm DT-exit ->
+    ~397 dryer -> ~323 cooler) -- see the scenario file. Note Naiha & Roques
+    (1983) measured the STATIC intraparticle diffusion `E=80 kJ/mol`, far
+    stronger than the effective ~20 kJ/mol the EPA cascade implies: the real DC
+    is agitated/conveyed, so surface renewal (not static diffusion) sets the
+    rate, which is why a lumped MTC is still required rather than a bare `D_eff`.
 
     CSTR hexane balance (implicit in `X2_out`, since `a_h` depends on it):
         m_dry*(X2_in - X2_out) = dc_hexane_mtc * air_flow * (y_surf - y_air_out)
