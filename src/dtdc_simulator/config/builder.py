@@ -143,6 +143,7 @@ def _build_dt_solver_constants(
         sweep_arm_transfer_gain=model.sweep_arm_transfer_gain,
         luikov=_thermo_luikov(physical.water_luikov),
         water_diffusivity=physical.water_diffusivity,
+        antoine_hexane=_thermo_antoine(physical.antoine_hexane),
     )
 
 
@@ -190,11 +191,22 @@ def assemble_model(config: ScenarioConfig) -> tuple[Model, State]:
         dt_outer_tol=config.model.dt_outer_tol,
         dt_outer_max_iter=config.model.dt_outer_max_iter,
         dt_dcz_inner_max_iter=config.model.dt_dcz_inner_max_iter,
+        # Steam supply-header conditions for the HMI readout (saturation temp at
+        # the header pressure, via the same antoine_water correlation used elsewhere).
+        steam_supply_barg=config.model.steam_supply_pressure_barg,
+        steam_supply_T=_antoine_boiling_point_k(
+            config.physical.antoine_water,
+            p_bar=_ATM_PRESSURE_BAR + config.model.steam_supply_pressure_barg,
+        ),
     )
     model = Model(
         stages=stages,
         constants=constants,
         base_residence_s=config.model.base_residence_s,
+        # Full-tray discharge at gate=50% -> ~2x feed, so the default gate
+        # half-fills every tray regardless of depth (level-driven discharge,
+        # core/model.py::_stage_discharge). Floor keeps it positive if feed ~0.
+        nominal_discharge_kg_s=max(2.0 * config.operating_defaults.feed_flow_rate, 1.0),
     )
 
     seed = OperatingSeed(

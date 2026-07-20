@@ -181,6 +181,8 @@ class DTSolverConstants:
     # -- NOT hM (hexane-vapor-tuned, ~25-100x too fast once coupled to an energy balance, see
     # zones/dcz.py's own docstring for the confirmed inversion and why diffusivity, not a
     # convective coefficient, is the right basis)
+    antoine_hexane: thermo.AntoineParams  # hexane saturation pressure -- for the DT dome/vapor
+    # temperature (binary hexane-water dew point of the exiting vapor, see the axial-profile build)
 
     @property
     def k_V(self) -> float:
@@ -835,9 +837,46 @@ def solve_dt(
         running_hex += phz_points[i][2].hexane_evaporated_kg_s
         hex_flow_at[i] = running_hex
 
+    antoine_water = c.ftrz.antoine_water
+    antoine_hexane = c.antoine_hexane
+    P_atm = thermo.ATM_PRESSURE_PA
+
+    def _binary_dew_T(m_hex: float, m_water: float, fallback: float) -> float:
+        """DT vapor temperature = the BINARY (hexane + water) dew point of the
+        exiting vapor: the highest temperature at which either component starts
+        condensing (its partial pressure reaches saturation) -- the physical
+        temperature of the vapor as it leaves the bed. For water-rich vapor the
+        water dew point governs (the AOCS/Kemper 2019 dome relation: more water ->
+        higher dome); for hexane-rich vapor the hexane dew point governs, so the
+        result naturally floors near the ~61 C hexane-water heteroazeotrope
+        instead of dropping unphysically toward the water dew point of a nearly
+        dry-of-water vapor."""
+        n_hex = m_hex / thermo.M_HEXANE
+        n_water = m_water / thermo.M_WATER
+        n_tot = n_hex + n_water
+        if n_tot <= 0.0:
+            return fallback
+        dews = []
+        if m_water > 1.0e-9:
+            y_w = n_water / n_tot
+            dews.append(brentq(lambda T: thermo.antoine_pressure_pa(T, antoine_water) - y_w * P_atm, 230.0, 470.0))
+        if m_hex > 1.0e-9:
+            y_h = n_hex / n_tot
+            dews.append(brentq(lambda T: thermo.antoine_pressure_pa(T, antoine_hexane) - y_h * P_atm, 230.0, 470.0))
+        return max(dews) if dews else fallback
+
     for i, (z, stage, cell) in enumerate(phz_points):
         m_hex = hex_flow_at[i]
         v_flow = m_water_phz + m_hex
+        # PHZ vapor TEMPERATURE is a vapor-liquid-equilibrium quantity (the binary
+        # dew point above), NOT the bed solid temperature. The PHZ solid solve is
+        # legitimately vapor-decoupled (jacket-heated), but the DT DOME temperature
+        # (this trace's top point) is exactly the AOCS/Kemper (2019) dome relation.
+        # Reporting the solid temp instead read the top-of-bed feed temperature
+        # (~59 C, BELOW the ~61 C heteroazeotrope floor -- physically impossible)
+        # as the "dome". The dew point connects continuously to the FTRZ vapor
+        # below (whose own T equals its dew point), so no per-tray "sawtooth".
+        v_T = _binary_dew_T(m_hex, m_water_phz, cell.solid_out.T)
         _append_profile_point(
             z,
             "PHZ",
@@ -845,13 +884,7 @@ def solve_dt(
             cell.solid_out.T,
             solid_feed.X1,
             cell.solid_out.X2,
-            # PHZ vapor TEMPERATURE tracks the solid (thermal near-equilibrium in a
-            # well-contacted, arm-agitated bed). Using each cell's OWN decoupled
-            # `vapor_out.T` instead produced a per-tray sawtooth ("fangs"): the
-            # informational vapor was solved independently per tray and reset at every
-            # tray boundary. It connects continuously to the FTRZ vapor below (whose T
-            # also equals the solid T at the PHZ/FTRZ interface).
-            cell.solid_out.T,
+            v_T,
             v_flow,
             m_hex / v_flow if v_flow > 0.0 else 0.0,
             m_water_phz / v_flow if v_flow > 0.0 else 1.0,

@@ -21,6 +21,20 @@ BORDER = "#E0E0E0"
 AMBER = "#F2A900"  # DV (disturbance) slider color -- theme's own "caution" hue
 RED = "#E2001A"
 
+# --- M4 (GUI redesign): HMI ink + surface + status tokens ---------------------
+# The redesign keeps the flat Siemens-petrol/graphite look but adds the extra
+# tokens a process-overview dashboard needs: text "ink" levels (values/labels
+# wear these, never a series color), panel surfaces, a header gradient, and a
+# RESERVED status palette (good/warning/critical) used ONLY for in-/out-of-spec
+# state on KPI tiles + safety limits -- never as a data-series color.
+INK = "#0F172A"  # primary text (slate-900)
+MUTED = "#64748B"  # secondary/label text (slate-500)
+PANEL = "#FFFFFF"  # card/panel surface
+HEADER_FROM = "#0F2E2E"  # deep petrol -> graphite header gradient
+HEADER_TO = "#1B1B1B"
+WARN = AMBER  # RESERVED status palette (KpiTile out-of-spec tint) -- never a series color
+CRIT = RED
+
 # Zone colors for the DT axial-profile charts (PHZ/FTRZ/DCZ) -- kept in one
 # place so a zone always reads as the same color across every chart.
 ZONE_HEX = {
@@ -80,6 +94,48 @@ def compact_metric(unit: str) -> ui.label:
     return ui.label(f"- {unit}").classes("font-mono text-xs whitespace-nowrap")
 
 
+class KpiTile:
+    """One KPI band tile: a small graphite-on-white card with an uppercase
+    label, a big mono value, and a unit. `set(value_text, status)` updates it;
+    `status` (None|"warn"|"crit") tints ONLY the value + a left accent bar,
+    from the RESERVED status palette -- the label/unit stay in ink so identity
+    is never color-alone (dataviz: text wears text tokens, not series color)."""
+
+    def __init__(self, title: str, unit: str) -> None:
+        with ui.element("div").classes("kpi-tile") as card:
+            self._card = card
+            ui.label(title).classes("kpi-title")
+            with ui.row().classes("items-baseline gap-1 no-wrap"):
+                self._value = ui.label("--").classes("kpi-value")
+                ui.label(unit).classes("kpi-unit")
+
+    def set(self, value_text: str, status: str | None = None) -> None:
+        self._value.text = value_text
+        color = {"warn": WARN, "crit": CRIT}.get(status or "", INK)
+        accent = {"warn": WARN, "crit": CRIT}.get(status or "", TEAL)
+        self._value.style(replace=f"color:{color};")
+        self._card.style(replace=f"border-left:3px solid {accent};")
+
+
+def kpi_tile(title: str, unit: str) -> KpiTile:
+    return KpiTile(title, unit)
+
+
+def flow_arrow(down: bool = True, color: str = TEAL) -> ui.label:
+    """A centered stream-flow connector for the tower schematic: a chevron
+    pointing DOWN (solid falling tray->tray) or UP (vapor rising), with a
+    live-updatable flow-rate caption returned to the caller. Purely visual --
+    it reads `Outputs.stage_solid_out_kg_s` at sync time."""
+    with ui.row().classes("w-full items-center justify-center gap-1").style("margin:-2px 0;"):
+        ui.label("▼" if down else "▲").style(
+            f"color:{color}; font-size:11px; line-height:1;"
+        )
+        caption = ui.label("").classes("font-mono").style(
+            f"color:{MUTED}; font-size:10px; line-height:1;"
+        )
+    return caption
+
+
 def inject_theme() -> None:
     ui.colors(
         primary=TEAL,
@@ -91,12 +147,41 @@ def inject_theme() -> None:
     )
     ui.add_head_html(f"""
     <style>
-      body {{ background-color: {BG}; }}
+      body {{ background-color: {BG}; color: {INK}; }}
       .q-card {{
         box-shadow: none !important;
         border: 1px solid {BORDER};
         border-radius: 4px;
       }}
+      /* --- M4 HMI process-overview tokens --- */
+      .hmi-header {{
+        background: linear-gradient(90deg, {HEADER_FROM}, {HEADER_TO});
+      }}
+      .hmi-panel {{
+        background: {PANEL};
+        border: 1px solid {BORDER};
+        border-radius: 6px;
+        padding: 10px 12px;
+      }}
+      .hmi-section-title {{
+        font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
+        text-transform: uppercase; color: {MUTED};
+      }}
+      .kpi-tile {{
+        background: {PANEL};
+        border: 1px solid {BORDER};
+        border-left: 3px solid {TEAL};
+        border-radius: 6px;
+        padding: 6px 10px;
+        min-width: 132px;
+        display: flex; flex-direction: column; gap: 2px;
+      }}
+      .kpi-title {{
+        font-size: 10px; font-weight: 600; letter-spacing: 0.04em;
+        text-transform: uppercase; color: {MUTED}; white-space: nowrap;
+      }}
+      .kpi-value {{ font-family: monospace; font-size: 20px; font-weight: 700; line-height: 1.1; color: {INK}; }}
+      .kpi-unit {{ font-size: 10px; color: {MUTED}; white-space: nowrap; }}
       /* `label-always` floats its value pill above the thumb; without this
          gap it overlaps whatever label sits directly above the slider
          (every MV/DV slider in controls.py/tower.py places one there). The
@@ -108,34 +193,41 @@ def inject_theme() -> None:
     """)
 
 
-def zone_bands(z_m: list[float], zone: list[str]) -> list[list[dict]]:
-    """Group contiguous same-zone samples of a continuous (value-axis) DT
-    axial profile into colored, NAME-LABELLED markArea bands (PHZ/FTRZ/DCZ),
-    so the vapor and meal-bed profile charts visually mirror the DT's own
-    physical layout AND say which regime each band is. The zone name is drawn
-    at the TOP of each band (tray-boundary labels go at the bottom, see
-    `tray_marklines`, so the two don't collide). `z_m`/`zone` are
-    `DTAxialProfile`'s own parallel arrays."""
+# Alternating subtle slab fills for the per-tray bands (neutral slate, so the
+# physical trays read as distinct "decks" without competing with the data trace
+# or the zone-boundary colors).
+_TRAY_BAND_FILL = ("rgba(100,116,139,0.00)", "rgba(100,116,139,0.09)")
+
+
+def tray_bands(z_m: list[float], stage_id: list[str]) -> list[list[dict]]:
+    """Group the DT axial profile into one alternating-shaded markArea band per
+    REAL TRAY (PD1/PD2/MN1/SP1/...), each labelled with its tray id -- so every
+    physical vessel reads as a distinct horizontal deck on the profile (a
+    natural tower view). Kept deliberately light (neutral alternating fill, one
+    small left-side label) so it shows the trays without the heavier zone
+    color-bands that used to fill the plot. Zone regime is annotated separately
+    and lightly by `zone_lines` (right side), so the two don't collide.
+    `z_m`/`stage_id` are `DTAxialProfile`'s own parallel arrays."""
     bands: list[list[dict]] = []
     i = 0
-    n = len(zone)
+    n = len(stage_id)
+    idx = 0
     while i < n:
-        z = zone[i]
+        s = stage_id[i]
         j = i
-        while j + 1 < n and zone[j + 1] == z:
+        while j + 1 < n and stage_id[j + 1] == s:
             j += 1
         start = z_m[i - 1] if i > 0 else 0.0  # extend to the previous point: a seamless band
-        color = ZONE_HEX.get(z, "#94a3b8")
         bands.append(
             [
                 {
                     "yAxis": start,
-                    "itemStyle": {"color": color, "opacity": 0.10},
+                    "itemStyle": {"color": _TRAY_BAND_FILL[idx % 2]},
                     "label": {
                         "show": True,
-                        "formatter": z,
-                        "position": "insideRight",
-                        "color": color,
+                        "formatter": s,
+                        "position": "insideLeft",
+                        "color": "#475569",
                         "fontSize": 9,
                         "fontWeight": "bold",
                     },
@@ -143,6 +235,7 @@ def zone_bands(z_m: list[float], zone: list[str]) -> list[list[dict]]:
                 {"yAxis": z_m[j]},
             ]
         )
+        idx += 1
         i = j + 1
     return bands
 
@@ -179,36 +272,68 @@ def packed_heights(
     return out
 
 
-def tray_marklines(z_m: list[float], stage_id: list[str]) -> list[dict]:
-    """Horizontal dashed markLine at each REAL TRAY boundary of the DT axial
-    profile, labelled with the tray id (PD1/PD2/MN1/SP1) at the LEFT of the
-    plot (zone-name labels sit at the right, see `zone_bands`, so the two don't
-    collide). The charts plot height on the (inverted) Y axis, so tray
-    boundaries are horizontal lines — a natural tower view. Derived from the
-    profile's own per-cell `stage_id` transitions, so it stays correct as the
-    PHZ/FTRZ/DCZ zone boundaries move across trays. `z_m`/`stage_id` are
+def zone_lines(z_m: list[float], zone: list[str]) -> list[dict]:
+    """A dashed colored markLine (no label) at each drying-zone TRANSITION
+    (PHZ->FTRZ, FTRZ->DCZ) -- shows WHERE the regime changes; the zone NAMES are
+    drawn separately by `zone_label_areas` (at each zone's midpoint) so a thin
+    FTRZ zone doesn't make its boundary labels collide. `z_m`/`zone` are
     `DTAxialProfile`'s own parallel arrays."""
-    lines: list[dict] = []
+    out: list[dict] = []
     i = 0
-    n = len(stage_id)
+    n = len(zone)
+    first = True
     while i < n:
-        s = stage_id[i]
+        z = zone[i]
         j = i
-        while j + 1 < n and stage_id[j + 1] == s:
+        while j + 1 < n and zone[j + 1] == z:
+            j += 1
+        if not first:
+            color = ZONE_HEX.get(z, "#94a3b8")
+            out.append(
+                {
+                    "yAxis": z_m[i - 1],
+                    "lineStyle": {"color": color, "type": "dashed", "width": 1.2},
+                    "label": {"show": False},
+                }
+            )
+        first = False
+        i = j + 1
+    return out
+
+
+def zone_label_areas(z_m: list[float], zone: list[str]) -> list[list[dict]]:
+    """Transparent markArea per drying zone (PHZ/FTRZ/DCZ) carrying just the zone
+    NAME, drawn on the RIGHT at each zone's vertical MIDPOINT (`insideRight`) --
+    rendered on a dedicated helper series so it coexists with the tray-slab
+    markArea, and so the names stay spread apart (opposite side from the LEFT
+    tray labels) even when the FTRZ zone is thin. `z_m`/`zone` are
+    `DTAxialProfile`'s own parallel arrays."""
+    areas: list[list[dict]] = []
+    i = 0
+    n = len(zone)
+    while i < n:
+        z = zone[i]
+        j = i
+        while j + 1 < n and zone[j + 1] == z:
             j += 1
         start = z_m[i - 1] if i > 0 else 0.0
-        lines.append(
-            {
-                "yAxis": start,
-                "lineStyle": {"color": "#94a3b8", "type": "dashed", "width": 1},
-                "label": {
-                    "show": True,
-                    "formatter": s,
-                    "position": "insideStartTop",
-                    "color": "#64748b",
-                    "fontSize": 9,
+        color = ZONE_HEX.get(z, "#94a3b8")
+        areas.append(
+            [
+                {
+                    "yAxis": start,
+                    "itemStyle": {"color": "transparent"},
+                    "label": {
+                        "show": True,
+                        "formatter": z,
+                        "position": "insideRight",
+                        "color": color,
+                        "fontSize": 10,
+                        "fontWeight": "bold",
+                    },
                 },
-            }
+                {"yAxis": z_m[j]},
+            ]
         )
         i = j + 1
-    return lines
+    return areas

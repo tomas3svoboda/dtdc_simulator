@@ -113,6 +113,98 @@ def test_more_steam_raises_dt_target_temperature(loaded) -> None:
     assert max(x_hot.dt_target_T) > max(x_cold.dt_target_T)
 
 
+def test_energy_and_vapor_kpis(loaded) -> None:
+    """M4 (GUI redesign): the new process-dashboard KPIs are derived purely
+    from the current tick's inputs + last DT axial-profile solve. Check the
+    definitional identities hold (total = sum of parts, indirect = input sum)
+    and every new field is finite + non-negative."""
+    (model, x0), cfg = loaded
+    u = _default_inputs(cfg)
+    _, y = model.step(x0, u, 0.0, 1.0)
+
+    assert y.kpi_indirect_heating_kw == pytest.approx(sum(u.indirect_steam.values()) / 1.0e3)
+    assert y.kpi_direct_steam_kg_s == pytest.approx(sum(u.direct_steam.values()))
+    expected_total = (
+        y.kpi_indirect_heating_kw
+        + y.kpi_drying_air_heating_kw
+        + y.kpi_direct_steam_kg_s * cfg.physical.dH_vap_water / 1.0e3
+    )
+    assert y.kpi_total_energy_kw == pytest.approx(expected_total)
+
+    # Per-stage solid outflow reported for every stage, non-negative.
+    assert set(y.stage_solid_out_kg_s) == set(y.stage_T)
+    assert all(v >= 0.0 for v in y.stage_solid_out_kg_s.values())
+
+    # Vapor leaves the DT top (init solve populated the profile), and condenser
+    # duty follows from it; exhaust hexane echoes the DRYER air-side value.
+    assert y.kpi_outlet_vapor_kg_s > 0.0
+    for value in (
+        y.kpi_outlet_vapor_hexane_kg_s,
+        y.kpi_outlet_vapor_water_kg_s,
+        y.kpi_condenser_duty_kw,
+        y.kpi_exhaust_hexane_ppm,
+    ):
+        assert value == value  # not NaN
+        assert value >= 0.0
+
+
+def test_closed_gate_stops_discharge_and_floods(loaded) -> None:
+    """A shut rotary valve (gate_opening=0) must genuinely STOP that stage's
+    solid discharge (not merely slow it, as the old M/tau residence model did)
+    -- so material accumulates and the tray floods past 100%."""
+    (model, x0), cfg = loaded
+    u = _default_inputs(cfg)
+    first = model.stages[0].id
+    u.gate_opening = dict(u.gate_opening)
+    u.gate_opening[first] = 0.0
+
+    x, y = x0.copy(), None
+    for _ in range(200):
+        x, y = model.step(x, u, 0.0, 5.0)
+
+    assert y.stage_solid_out_kg_s[first] == pytest.approx(0.0, abs=1.0e-9)
+    # Capacity-capped: a full tray sits AT ~100% (surplus is rejected upstream),
+    # it doesn't climb unboundedly past it.
+    assert y.stage_level_pct[first] >= 99.5
+
+
+def test_backpressure_floods_the_tray_above(loaded) -> None:
+    """Back-pressure cascade: when a tray floods and can't accept its inflow,
+    the surplus is rejected back into the tray ABOVE it, which then floods too
+    -- so a shut gate mid-column backs material up toward the feed."""
+    (model, x0), cfg = loaded
+    ids = [s.id for s in model.stages]
+    blocked, upstream = ids[2], ids[1]
+    u = _default_inputs(cfg)
+    u.gate_opening = dict(u.gate_opening)
+    u.gate_opening[blocked] = 0.0
+
+    x, y = x0.copy(), None
+    for _ in range(400):
+        x, y = model.step(x, u, 0.0, 5.0)
+
+    assert y.stage_solid_out_kg_s[blocked] == pytest.approx(0.0, abs=1.0e-9)
+    assert y.stage_level_pct[blocked] >= 99.5
+    assert y.stage_level_pct[upstream] >= 99.5  # back-pressure floods the tray above
+
+
+def test_gate_controls_level_uniformly_across_trays(loaded) -> None:
+    """Discharge is driven by bed LEVEL, not absolute holdup, so the SAME gate
+    opening settles every tray to the SAME level despite a ~7x spread in tray
+    capacity (bed depths 0.15 m -> 1.0 m). (With the old `m_out = M*k` law a
+    deep tray sat near-empty and a shallow one near-full at the same gate.)"""
+    (model, x0), cfg = loaded
+    u = _default_inputs(cfg)
+    u.gate_opening = {s.id: 30.0 for s in model.stages}  # same gate on every stage
+
+    x = x0.copy()
+    for _ in range(3000):
+        x, y = model.step(x, u, 0.0, 4.0)
+
+    levels = [y.stage_level_pct[s.id] for s in model.stages]
+    assert max(levels) - min(levels) < 1.0  # uniform, regardless of tray depth
+
+
 def test_narrower_gate_raises_steady_state_bed_level(loaded) -> None:
     """gate_opening (§5.2: "sets inter-stage solid flow / holdup (level)") was
     previously read into Inputs and never used anywhere. Confirm it now

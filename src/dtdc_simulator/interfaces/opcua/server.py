@@ -32,12 +32,25 @@ ENDPOINT = "opc.tcp://0.0.0.0:4840/dtdc/"
 NAMESPACE_URI = "http://dtdc.sim/"
 REFRESH_S = 0.2
 
-_KPI_FIELDS = (
-    "residual_hexane",
-    "meal_moisture",
-    "steam_consumption",
-    "throughput",
-)
+def _kpi_values(outputs) -> dict[str, float]:  # outputs: core.model.Outputs (data, not a core/ import)
+    """The KPI node name -> value map, single source of truth for both the
+    build (`_build_pv_folder`) and push (`_push_snapshot`) passes so the two
+    can't drift. M4 (GUI redesign) added the energy/vapor KPIs below."""
+    return {
+        "residual_hexane": outputs.kpi_residual_hexane_ppm,
+        "meal_moisture": outputs.kpi_meal_moisture_pct,
+        "steam_consumption": outputs.kpi_steam_consumption_kg_per_t,
+        "throughput": outputs.kpi_throughput_t_per_day,
+        "exhaust_hexane": outputs.kpi_exhaust_hexane_ppm,
+        "direct_steam": outputs.kpi_direct_steam_kg_s,
+        "indirect_heating": outputs.kpi_indirect_heating_kw,
+        "drying_air_heating": outputs.kpi_drying_air_heating_kw,
+        "total_energy": outputs.kpi_total_energy_kw,
+        "outlet_vapor": outputs.kpi_outlet_vapor_kg_s,
+        "outlet_vapor_hexane": outputs.kpi_outlet_vapor_hexane_kg_s,
+        "outlet_vapor_water": outputs.kpi_outlet_vapor_water_kg_s,
+        "condenser_duty": outputs.kpi_condenser_duty_kw,
+    }
 
 
 class OpcUaAdapter:
@@ -217,16 +230,8 @@ class OpcUaAdapter:
                 node_map[fname] = await stage_obj.add_variable(idx, fname, float(fval))
             self._pv_stage_nodes[stage_id] = node_map
 
-        kpi_map = {
-            "residual_hexane": outputs.kpi_residual_hexane_ppm,
-            "meal_moisture": outputs.kpi_meal_moisture_pct,
-            "steam_consumption": outputs.kpi_steam_consumption_kg_per_t,
-            "throughput": outputs.kpi_throughput_t_per_day,
-        }
-        for fname in _KPI_FIELDS:
-            self._pv_kpi_nodes[fname] = await kpi_root.add_variable(
-                idx, fname, float(kpi_map[fname])
-            )
+        for fname, fval in _kpi_values(outputs).items():
+            self._pv_kpi_nodes[fname] = await kpi_root.add_variable(idx, fname, float(fval))
 
     async def _pull_writes(self) -> None:
         """Apply a node's value to the facade only if it actually changed since
@@ -315,14 +320,8 @@ class OpcUaAdapter:
             await nodes["VaporTemp"].write_value(float(outputs.stage_vapor_temp[stage_id]))
             await nodes["Level"].write_value(float(outputs.stage_level_pct[stage_id]))
 
-        kpi_map = {
-            "residual_hexane": outputs.kpi_residual_hexane_ppm,
-            "meal_moisture": outputs.kpi_meal_moisture_pct,
-            "steam_consumption": outputs.kpi_steam_consumption_kg_per_t,
-            "throughput": outputs.kpi_throughput_t_per_day,
-        }
-        for fname in _KPI_FIELDS:
-            await self._pv_kpi_nodes[fname].write_value(float(kpi_map[fname]))
+        for fname, fval in _kpi_values(outputs).items():
+            await self._pv_kpi_nodes[fname].write_value(float(fval))
 
     async def run(self) -> None:
         assert self._server is not None

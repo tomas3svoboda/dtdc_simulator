@@ -37,20 +37,39 @@ def _chart(title: str, height_axis_name: str = "Height [m]") -> ui.echart:
                     "name": height_axis_name,
                     "inverse": True,  # DT top (z=0) at the top of the plot
                     "nameTextStyle": {"fontSize": 9},
+                    "axisLabel": {"fontSize": 8, "hideOverlap": True},
                 },
-                "xAxis": {"type": "value", "scale": True},
+                # Narrow charts: shrink tick labels, thin them out, and drop any
+                # that would still overlap (the hexane-ppm axis runs to ~5e5).
+                "xAxis": {
+                    "type": "value",
+                    "scale": True,
+                    "splitNumber": 3,
+                    "axisLabel": {"fontSize": 8, "hideOverlap": True},
+                },
                 "series": [
                     {
                         "type": "line",
                         "showSymbol": False,
+                        "lineStyle": {"width": 2, "color": theme.TEAL},
+                        "itemStyle": {"color": theme.TEAL},
                         "data": [],
-                        "markArea": {"data": []},  # PHZ/FTRZ/DCZ zone bands (+ zone labels)
-                        "markLine": {  # real-tray boundaries (+ tray-id labels)
+                        "markArea": {"data": []},  # physical tray slabs (+ tray-id labels, left)
+                        "markLine": {  # PHZ/FTRZ/DCZ zone-boundary lines (no labels)
                             "symbol": "none",
                             "silent": True,
                             "data": [],
                         },
-                    }
+                    },
+                    {
+                        # Helper series (no data): carries the zone-name labels on
+                        # a second markArea so they can coexist with the tray-slab
+                        # markArea above and sit at each zone's own midpoint (right).
+                        "type": "line",
+                        "silent": True,
+                        "data": [],
+                        "markArea": {"data": []},
+                    },
                 ],
                 "tooltip": {"trigger": "axis"},
             }
@@ -94,23 +113,28 @@ class DTProfileView:
         # so the bed-profile axis reads the actual packed solid depth and moves with holdup.
         z_geom = list(profile.z_m)
         z_packed = theme.packed_heights(z_geom, stage_id, outputs.stage_level_pct)
-        bands_geom = theme.zone_bands(z_geom, zone)
-        lines_geom = theme.tray_marklines(z_geom, stage_id)
-        bands_packed = theme.zone_bands(z_packed, zone)
-        lines_packed = theme.tray_marklines(z_packed, stage_id)
+        # series[0]: profile trace + physical TRAY slabs (markArea) + ZONE-boundary
+        # lines (markLine). series[1]: ZONE-name labels (markArea, right/midpoint).
+        bands_geom = theme.tray_bands(z_geom, stage_id)
+        lines_geom = theme.zone_lines(z_geom, zone)
+        zlabels_geom = theme.zone_label_areas(z_geom, zone)
+        bands_packed = theme.tray_bands(z_packed, stage_id)
+        lines_packed = theme.zone_lines(z_packed, zone)
+        zlabels_packed = theme.zone_label_areas(z_packed, zone)
 
-        def _set(chart: ui.echart, xs: list[float], z, bands, lines) -> None:
+        def _set(chart: ui.echart, xs: list[float], z, bands, lines, zlabels) -> None:
             # height on the (inverted) Y axis, quantity on X -> (value, height) pairs
             chart.options["series"][0]["data"] = list(zip(xs, z))
             chart.options["series"][0]["markArea"]["data"] = bands
             chart.options["series"][0]["markLine"]["data"] = lines
+            chart.options["series"][1]["markArea"]["data"] = zlabels
             chart.update()
 
         def _set_vapor(chart: ui.echart, xs: list[float]) -> None:
-            _set(chart, xs, z_geom, bands_geom, lines_geom)
+            _set(chart, xs, z_geom, bands_geom, lines_geom, zlabels_geom)
 
         def _set_meal(chart: ui.echart, xs: list[float]) -> None:
-            _set(chart, xs, z_packed, bands_packed, lines_packed)
+            _set(chart, xs, z_packed, bands_packed, lines_packed, zlabels_packed)
 
         _set_vapor(self._vapor_T, [theme.k_to_c(v) for v in profile.vapor_T])
         _set_vapor(self._vapor_flow, list(profile.vapor_flow_kg_s))

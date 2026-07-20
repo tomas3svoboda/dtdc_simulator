@@ -73,6 +73,29 @@ def test_auto_mode_drives_pv_apc_style() -> None:
     assert peak_after > peak_before
 
 
+def test_feed_oil_is_a_live_dv() -> None:
+    """M4 (GUI redesign): feed oil (X3) is a live disturbance now -- registered
+    in the DV registry, seeded from the scenario, and settable at runtime."""
+    facade = _facade_freerun()
+    dvs = facade.get_snapshot().dvs
+    assert "feed_oil" in dvs
+    facade.set_dv("feed_oil", 0.025)
+    assert facade.get_snapshot().dvs["feed_oil"] == 0.025
+
+
+def test_group_manual_setpoint_broadcasts_to_all_stages() -> None:
+    """M4: one global 'arm rotation speed' slider drives every per-stage
+    sweep_arm_speed MV via set_mv_group_manual_setpoint, leaving per-stage
+    keys individually addressable (OPC UA granularity)."""
+    facade = _facade_freerun()
+    arm_keys = [k for k in facade.mv_keys() if k.split("/", 1)[0] == "sweep_arm_speed"]
+    assert arm_keys  # scenario has per-stage sweep arms
+    facade.set_mv_group_manual_setpoint("sweep_arm_speed", 7.0)
+    mvs = facade.get_snapshot().mvs
+    for key in arm_keys:
+        assert mvs[key].manual_setpoint == 7.0
+
+
 def test_manual_mode_ignores_auto_writes() -> None:
     facade = _facade_freerun()
     facade.run()

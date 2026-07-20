@@ -1,18 +1,18 @@
 """The DT/DC vessel schematic -- the tower's own visual centerpiece.
 
-Each DT (PREDESOLV/MAIN/SPARGE) tray is drawn as an actual vessel: a bordered
-column whose fill height tracks `stage_level_pct` and whose fill color tracks
-temperature (the same heat gradient `theme.heat_color` already uses for the
-role-card tinting), plus one inline slider for that tray's own most
-process-relevant MV (`indirect_steam`/`direct_steam`) and its `gate_opening`
-(the rotary-valve "bed level" control) -- so an operator can nudge a tray's
-own duty/level right where that tray is drawn. `sweep_arm_speed` is
-deliberately NOT duplicated here (would crowd every tray with a 4th control);
-it stays reachable from the Advanced drawer's generic MV table/drive control.
+The whole unit is drawn as ONE stacked column (feed at the top, product at the
+bottom): FEED -> PREDESOLV/MAIN/SPARGE (DT) -> DRYER/COOLER (DC) -> PRODUCT,
+with downward solid-flow arrows between trays and an upward vapor arrow off the
+DT top. Each DT tray is an actual vessel (a bordered box whose fill height
+tracks `stage_level_pct` and whose color tracks temperature) laid out WIDE and
+SHORT: vessel | readouts | its own inline MV sliders side-by-side.
 
-DC (DRYER/COOLER) trays keep a simpler card (no vessel, no inline slider --
-`core/dc.py` is a 0-D well-mixed contactor, there's no axial profile to draw,
-and its own MVs are GLOBAL, not per-tray, so they belong in `controls.py`).
+The redesign also folds the GLOBAL operator sliders onto the tray they act on
+(BuildSpec §10, "controls at the area of relevance"): feed flow / arm speed /
+feed-composition disturbances sit on the FEED card, the dryer-air sliders on the
+DRYER card, and the cooler-air + ambient-weather sliders on the COOLER card --
+so there's no separate control panel to hunt through. Slider builders live in
+`controls.py`; this module just places them.
 
 Talks only to `RuntimeFacade` + `Snapshot` (BuildSpec §3): never imports `core/`.
 """
@@ -21,26 +21,28 @@ from __future__ import annotations
 
 from nicegui import ui
 
-from dtdc_simulator.engine.facade import MVSnapshot, RuntimeFacade
-from dtdc_simulator.interfaces.ui import theme
+from dtdc_simulator.engine.facade import MVSnapshot, RuntimeFacade, SteamInfo
+from dtdc_simulator.interfaces.ui import controls, theme
 
 DT_ROLES = ("PREDESOLV", "MAIN", "SPARGE")
 DC_ROLES = ("DRYER", "COOLER")
 
-_VESSEL_HEIGHT_PX = 72
+# Model caps holdup at tray capacity, so a backed-up tray reads ~100% (not >100).
+_FLOOD_LEVEL_PCT = 99.5
+
+_VESSEL_HEIGHT_PX = 56  # wider + shorter than the old 72px, for a low, wide card
+_VESSEL_WIDTH_PX = 40
 
 
 def _vessel(container: ui.element) -> tuple[ui.element, ui.element]:
-    """A bordered vessel column + its bottom-anchored fill div. Returns
-    `(outer, fill)` so `sync()` can restyle `fill`'s height/color each tick --
-    same low-level `ui.element('div').style(...)` pattern the original level
-    bar already used, just shaped like a vessel instead of a thin strip."""
+    """A bordered vessel box + its bottom-anchored fill div. Returns
+    `(outer, fill)` so `sync()` can restyle `fill`'s height/color each tick."""
     with container:
         outer = (
             ui.element("div")
-            .classes("w-full relative overflow-hidden")
+            .classes("relative overflow-hidden")
             .style(
-                f"height:{_VESSEL_HEIGHT_PX}px; border-radius:6px; "
+                f"height:{_VESSEL_HEIGHT_PX}px; width:{_VESSEL_WIDTH_PX}px; border-radius:6px; "
                 f"border:1px solid {theme.BORDER}; background:#ffffff;"
             )
         )
@@ -52,7 +54,7 @@ def _vessel(container: ui.element) -> tuple[ui.element, ui.element]:
     return outer, fill
 
 
-def _mv_slider(
+def _tray_mv_slider(
     container: ui.element,
     facade: RuntimeFacade,
     key: str,
@@ -60,17 +62,20 @@ def _mv_slider(
     label: str,
     color: str,
     scale: float = 1.0,
+    step: float = 1.0,
 ) -> ui.slider:
-    """One inline per-tray MV slider. `scale` converts the MV's own SI storage
-    unit to a nicer display unit (e.g. W -> kW) -- purely a display transform,
-    `facade.set_mv_manual_setpoint` always receives the SI value back."""
+    """One inline per-tray MV slider. `scale` converts the MV's SI storage unit
+    to a nicer display unit (e.g. W -> kg/s of condensing steam); the facade
+    always gets SI back. `step` snaps the display value so the label pill reads
+    cleanly (e.g. 1.11, not 1.1061946…)."""
     with container:
-        ui.label(label).classes("text-[10px] text-gray-500")
+        ui.label(label).classes("text-[10px] whitespace-nowrap").style(f"color:{theme.MUTED};")
         slider = (
             ui.slider(
-                min=mv.min * scale,
-                max=mv.max * scale,
-                value=mv.effective_value * scale,
+                min=round(mv.min * scale, 3),
+                max=round(mv.max * scale, 3),
+                value=round(mv.effective_value * scale, 3),
+                step=step,
                 on_change=lambda e, k=key, s=scale: facade.set_mv_manual_setpoint(k, e.value / s),
             )
             .props(f"label-always color={color} dense")
@@ -79,16 +84,19 @@ def _mv_slider(
     return slider
 
 
+def _cell(width: str = "flex:1 1 150px;"):
+    """A gap-0 slider cell (label + slider stack) so embedded sliders pack tight."""
+    return ui.column().classes("gap-0").style(width)
+
+
 class TowerView:
     """Owns the tower's NiceGUI widgets and their live-sync state. `build()`
     (re)constructs the DOM when the stage set changes (rare); `sync()` runs
-    every tick from `app.py`'s own timer, same split as the pre-redesign
-    `build_tower`/`sync` closures it replaces."""
+    every tick from `app.py`'s own timer."""
 
-    def __init__(self, facade: RuntimeFacade, dt_column: ui.column, dc_column: ui.column) -> None:
+    def __init__(self, facade: RuntimeFacade, column: ui.column) -> None:
         self._facade = facade
-        self._dt_column = dt_column
-        self._dc_column = dc_column
+        self._column = column
         self._stage_order: list[str] = []
         self._feed_card: ui.card | None = None
         self._product_card: ui.card | None = None
@@ -97,75 +105,193 @@ class TowerView:
         self._cards: dict[str, ui.card] = {}
         self._fills: dict[str, ui.element] = {}
         self._widgets: dict[str, dict[str, object]] = {}
-        # Per-DC-stage inlet air flow, captured on the "Air in:" pass and
-        # echoed on the "Air out:" line so the (conserved) dry-air flow is
-        # visible on both -- see `_build_dc_tray`'s own comment.
+        # Inter-tray solid-flow arrow captions, keyed by the stage whose OUTFLOW
+        # they show ("FEED" -> first tray); plus the DT vapor-outlet up-arrow.
+        self._flow_arrows: dict[str, ui.label] = {}
+        self._vapor_caption: ui.label | None = None
+        # Shared "Ambient Air" box arrows -> live air mass flow into DRYER/COOLER.
+        self._ambient_arrows: dict[str, ui.label] = {}
+        # Per-DC-stage inlet air flow, captured on the "air in" pass and echoed
+        # on the "air out" line so the (conserved) dry-air flow reads on both.
         self._air_flow_by_sid: dict[str, float] = {}
 
     # ------------------------------------------------------------------ build
     def build(
-        self, stage_order: list[str], stage_roles: dict[str, str], mvs: dict[str, MVSnapshot]
+        self,
+        stage_order: list[str],
+        stage_roles: dict[str, str],
+        mvs: dict[str, MVSnapshot],
+        dvs: dict[str, float],
+        steam: SteamInfo,
     ) -> None:
         self._stage_order = list(stage_order)
-        self._dt_column.clear()
-        self._dc_column.clear()
+        self._column.clear()
         self._feed_widgets.clear()
         self._product_widgets.clear()
         self._cards.clear()
         self._fills.clear()
         self._widgets.clear()
+        self._flow_arrows.clear()
+        self._ambient_arrows.clear()
+        self._vapor_caption = None
 
-        dc_stage_ids = [sid for sid in stage_order if stage_roles.get(sid) in DC_ROLES]
-        product_column = self._dc_column if dc_stage_ids else self._dt_column
+        dt_ids = [sid for sid in stage_order if stage_roles.get(sid) in DT_ROLES]
+        dc_ids = [sid for sid in stage_order if stage_roles.get(sid) in DC_ROLES]
 
-        with self._dt_column:
-            with (
-                ui.card()
-                .classes(f"w-full border-l-4 {theme.FEED_BORDER}")
-                .style("padding: 6px 10px;") as feed_card
-            ):
-                self._feed_card = feed_card
-                with ui.row().classes("items-center justify-between"):
-                    ui.label("FEED").classes("font-bold text-xs")
-                    ui.badge("IN").props("color=grey")
-                with ui.row().classes("gap-3 flex-wrap mt-1"):
+        with self._column:
+            # Vapor leaves the DT top -> condenser: an up-arrow above the feed.
+            with ui.row().classes("w-full items-center justify-center gap-1"):
+                ui.label("▲ vapor to condenser").style(
+                    f"color:{theme.TEAL}; font-size:11px; font-weight:600;"
+                )
+                self._vapor_caption = ui.label("").classes("font-mono").style(
+                    f"color:{theme.MUTED}; font-size:11px;"
+                )
+            self._build_feed_card(mvs, dvs)
+
+            if dt_ids:
+                self._add_flow_arrow("FEED")
+                ui.label("Desolventizer / Toaster").classes("hmi-section-title mt-1")
+            for pos, sid in enumerate(dt_ids):
+                self._build_dt_tray(sid, stage_roles[sid], mvs, steam)
+                if pos < len(dt_ids) - 1:
+                    self._add_flow_arrow(sid)
+
+            # DC section: the DRYER/COOLER trays in a sub-column, with a shared
+            # AMBIENT AIR box beside them (its weather feeds BOTH contactors).
+            if dc_ids:
+                if dt_ids:
+                    self._add_flow_arrow(dt_ids[-1])
+                ui.label("Dryer / Cooler").classes("hmi-section-title mt-1")
+                with ui.row().classes("w-full gap-3 items-stretch no-wrap"):
+                    with ui.column().classes("gap-1 flex-1"):
+                        for pos, sid in enumerate(dc_ids):
+                            self._build_dc_tray(sid, stage_roles[sid], mvs)
+                            if pos < len(dc_ids) - 1:
+                                self._add_flow_arrow(sid)
+                    self._build_ambient_box(dvs)
+
+            if stage_order:
+                self._add_flow_arrow(stage_order[-1])
+            self._build_product_card()
+
+    def _add_flow_arrow(self, key: str) -> None:
+        # Builds into the current layout context (the main column, or a DC
+        # sub-column), so callers control placement via their own `with` block.
+        self._flow_arrows[key] = theme.flow_arrow(down=True)
+
+    def _build_feed_card(self, mvs: dict[str, MVSnapshot], dvs: dict[str, float]) -> None:
+        with (
+            ui.card()
+            .classes(f"w-full border-l-4 {theme.FEED_BORDER}")
+            .style("padding: 8px 10px;") as feed_card
+        ):
+            self._feed_card = feed_card
+            with ui.row().classes("items-center justify-between w-full"):
+                ui.label("FEED").classes("font-bold text-xs")
+                ui.badge("IN").props("color=grey")
+            with ui.row().classes("w-full gap-4 items-start no-wrap mt-1"):
+                with ui.column().classes("gap-1").style("min-width:150px;"):
                     self._feed_widgets["flow"] = theme.compact_metric("kg/s")
                     self._feed_widgets["T"] = theme.compact_metric("°C")
                     self._feed_widgets["hex"] = theme.compact_metric("% hex")
                     self._feed_widgets["water"] = theme.compact_metric("% H2O")
+                # ◀ feed-stream operator inputs, folded onto the feed itself.
+                with ui.column().classes("gap-0 flex-1"):
+                    ui.label("◀ feed & throughput").classes("text-[10px]").style(
+                        f"color:{theme.TEAL};"
+                    )
+                    with ui.row().classes("w-full gap-4 items-end flex-wrap"):
+                        with _cell():
+                            controls.mv_slider(
+                                self._facade, "feed_flow_rate", "Feed flow [kg/s]",
+                                value=mvs["feed_flow_rate"].effective_value,
+                            )
+                        with _cell():
+                            controls.arm_speed_slider(self._facade, value=_mean_arm_rpm(mvs))
+                    ui.label("◀ feed disturbances").classes("text-[10px] mt-1").style(
+                        f"color:{theme.AMBER};"
+                    )
+                    with ui.row().classes("w-full gap-4 items-end flex-wrap"):
+                        with _cell():
+                            controls.dv_slider(
+                                self._facade, "feed_temperature", "Feed temp [°C]", 40, 80,
+                                value=dvs["feed_temperature"], to_si=theme.c_to_k, from_si=theme.k_to_c,
+                            )
+                        with _cell():
+                            controls.dv_slider(
+                                self._facade, "feed_moisture", "Feed moisture [%]", 5, 25,
+                                value=dvs["feed_moisture"], scale=100.0,
+                            )
+                        with _cell():
+                            controls.wet_hexane_slider(
+                                self._facade, x2=dvs["feed_hexane"], x1=dvs["feed_moisture"],
+                            )
+                        with _cell():
+                            controls.dv_slider(
+                                self._facade, "feed_oil", "Feed oil [%]", 0, 5,
+                                value=dvs["feed_oil"], scale=100.0,
+                            )
 
-        for sid in stage_order:
-            role = stage_roles.get(sid, "")
-            target = self._dc_column if role in DC_ROLES else self._dt_column
-            if role in DT_ROLES:
-                self._build_dt_tray(target, sid, role, mvs)
-            else:
-                self._build_dc_tray(target, sid, role)
+    def _build_product_card(self) -> None:
+        with (
+            ui.card()
+            .classes(f"w-full border-l-4 {theme.FEED_BORDER}")
+            .style("padding: 6px 10px;") as product_card
+        ):
+            self._product_card = product_card
+            with ui.row().classes("items-center justify-between"):
+                ui.label("PRODUCT").classes("font-bold text-xs")
+                ui.badge("OUT").props("color=grey")
+            with ui.row().classes("gap-3 flex-wrap mt-1"):
+                self._product_widgets["T"] = theme.compact_metric("°C")
+                self._product_widgets["hex"] = theme.compact_metric("ppm")
+                self._product_widgets["water"] = theme.compact_metric("% H2O")
 
-        with product_column:
-            with (
-                ui.card()
-                .classes(f"w-full border-l-4 {theme.FEED_BORDER}")
-                .style("padding: 6px 10px;") as product_card
-            ):
-                self._product_card = product_card
-                with ui.row().classes("items-center justify-between"):
-                    ui.label("PRODUCT").classes("font-bold text-xs")
-                    ui.badge("OUT").props("color=grey")
-                with ui.row().classes("gap-3 flex-wrap mt-1"):
-                    self._product_widgets["T"] = theme.compact_metric("°C")
-                    self._product_widgets["hex"] = theme.compact_metric("ppm")
-                    self._product_widgets["water"] = theme.compact_metric("% H2O")
+    def _build_ambient_box(self, dvs: dict[str, float]) -> None:
+        """Shared AMBIENT-AIR box beside the DRYER + COOLER: the weather (temp,
+        RH) that feeds BOTH contactors -- the dryer's air is this same ambient
+        parcel HEATED (so ambient temp sets the drying-air heating duty and the
+        absolute humidity carried in), the cooler's air is it directly. The two
+        arrows show the live air mass flow into each (filled by `sync()`)."""
+        with ui.card().classes("border-l-4 border-cyan-500").style(
+            "padding: 8px 10px; width: 220px; align-self: stretch;"
+        ):
+            ui.label("AMBIENT AIR").classes("font-bold text-[11px]")
+            ui.label("weather → both contactors").classes("text-[10px]").style(
+                f"color:{theme.MUTED};"
+            )
+            with _cell("width:100%;"):
+                controls.dv_slider(
+                    self._facade, "ambient_air_temp", "Ambient temp [°C]", -20, 45,
+                    value=dvs["ambient_air_temp"], to_si=theme.c_to_k, from_si=theme.k_to_c,
+                )
+            with _cell("width:100%;"):
+                controls.dv_slider(
+                    self._facade, "ambient_relative_humidity", "Ambient RH [%]", 0, 100,
+                    value=dvs["ambient_relative_humidity"], scale=100.0,
+                )
+            with ui.column().classes("gap-0 mt-2"):
+                self._ambient_arrows["DRYER"] = ui.label("→ Dryer").classes(
+                    "text-[11px] font-mono"
+                ).style(f"color:{theme.TEAL};")
+                self._ambient_arrows["COOLER"] = ui.label("→ Cooler").classes(
+                    "text-[11px] font-mono"
+                ).style(f"color:{theme.TEAL};")
 
     def _build_dt_tray(
-        self, container: ui.column, sid: str, role: str, mvs: dict[str, MVSnapshot]
+        self, sid: str, role: str, mvs: dict[str, MVSnapshot], steam: SteamInfo
     ) -> None:
         style = theme.ROLE_STYLE.get(role, {"border": "border-gray-400", "badge": "grey"})
         widgets: dict[str, object] = {}
-        with (
-            container,
-            ui.card().classes(f"w-full border-l-4 {style['border']}").style("padding: 8px;") as card,
-        ):
+        # Steam supply-header readout (constant) -- the "PARA" header conditions,
+        # same for jacket (indirect) and sparge (direct) steam.
+        steam_str = f"{steam.supply_barg:.1f} barg / {theme.k_to_c(steam.supply_T_K):.0f} °C"
+        # Jacket duty (W) shown as condensing-steam flow (kg/s): m = Q / dH_vap.
+        indirect_scale = 1.0 / steam.dH_vap_water
+        with ui.card().classes(f"w-full border-l-4 {style['border']}").style(
+            "padding: 8px;"
+        ) as card:
             with ui.row().classes("items-center justify-between w-full"):
                 with ui.row().classes("items-center gap-2"):
                     ui.label(sid).classes("font-bold text-xs")
@@ -174,12 +300,13 @@ class TowerView:
                 flood_badge.visible = False
                 widgets["flood"] = flood_badge
 
-            with ui.row().classes("w-full gap-2 mt-1 items-stretch no-wrap"):
-                vessel_col = ui.column().classes("gap-0").style("width:28px;")
-                outer, fill = _vessel(vessel_col)
+            # Wide + short: vessel | readouts | inline MV sliders, side by side.
+            with ui.row().classes("w-full gap-3 mt-1 items-start no-wrap"):
+                vessel_col = ui.column().classes("gap-0")
+                _outer, fill = _vessel(vessel_col)
                 self._fills[sid] = fill
 
-                with ui.column().classes("gap-1 flex-1"):
+                with ui.column().classes("gap-1").style("min-width:150px;"):
                     with ui.row().classes("gap-3 flex-wrap"):
                         widgets["T"] = theme.compact_metric("°C")
                         widgets["hex"] = theme.compact_metric("ppm")
@@ -187,54 +314,44 @@ class TowerView:
                     widgets["level_label"] = ui.label("- %").classes(
                         "text-[10px] font-mono text-gray-500"
                     )
+                    with ui.row().classes("gap-1 items-center"):
+                        ui.label("♨ Steam:").classes("text-[10px]").style(f"color:{theme.MUTED};")
+                        ui.label(steam_str).classes("text-[10px] font-mono whitespace-nowrap").style(
+                            f"color:{theme.DARK};"
+                        )
 
+                with ui.row().classes("gap-3 items-end flex-1 no-wrap"):
                     if role == "SPARGE":
                         key = f"direct_steam/{sid}"
                         if key in mvs:
-                            widgets["duty_slider"] = _mv_slider(
-                                ui.column().classes("gap-0 w-full"),
-                                self._facade,
-                                key,
-                                mvs[key],
-                                "Direct steam [kg/s]",
-                                theme.TEAL,
+                            widgets["duty_slider"] = _tray_mv_slider(
+                                _cell(), self._facade, key, mvs[key],
+                                "Direct steam [kg/s]", theme.TEAL, step=0.05,
                             )
                     else:
                         key = f"indirect_steam/{sid}"
                         if key in mvs:
-                            widgets["duty_slider"] = _mv_slider(
-                                ui.column().classes("gap-0 w-full"),
-                                self._facade,
-                                key,
-                                mvs[key],
-                                "Indirect steam [kW]",
-                                theme.TEAL,
-                                scale=1.0e-3,
+                            widgets["duty_slider"] = _tray_mv_slider(
+                                _cell(), self._facade, key, mvs[key],
+                                "Indirect steam [kg/s]", theme.TEAL,
+                                scale=indirect_scale, step=0.01,
                             )
-
                     gate_key = f"gate_opening/{sid}"
                     if gate_key in mvs:
-                        widgets["gate_slider"] = _mv_slider(
-                            ui.column().classes("gap-0 w-full"),
-                            self._facade,
-                            gate_key,
-                            mvs[gate_key],
-                            "Gate opening [%] (bed level)",
-                            theme.TEAL,
+                        widgets["gate_slider"] = _tray_mv_slider(
+                            _cell(), self._facade, gate_key, mvs[gate_key],
+                            "Gate [%] (0 = shut)", theme.TEAL, step=1.0,
                         )
 
         self._cards[sid] = card
         self._widgets[sid] = widgets
 
-    def _build_dc_tray(self, container: ui.column, sid: str, role: str) -> None:
+    def _build_dc_tray(self, sid: str, role: str, mvs: dict[str, MVSnapshot]) -> None:
         style = theme.ROLE_STYLE.get(role, {"border": "border-gray-400", "badge": "grey"})
         widgets: dict[str, object] = {}
-        with (
-            container,
-            ui.card()
-            .classes(f"w-full border-l-4 {style['border']}")
-            .style("padding: 6px 10px;") as card,
-        ):
+        with ui.card().classes(f"w-full border-l-4 {style['border']}").style(
+            "padding: 8px 10px;"
+        ) as card:
             with ui.row().classes("items-center justify-between w-full"):
                 with ui.row().classes("items-center gap-2"):
                     ui.label(sid).classes("font-bold text-xs")
@@ -242,39 +359,62 @@ class TowerView:
                 flood_badge = ui.badge("FLOOD").props("color=negative")
                 flood_badge.visible = False
                 widgets["flood"] = flood_badge
-            with ui.row().classes("gap-3 flex-wrap mt-1"):
-                widgets["T"] = theme.compact_metric("°C")
-                widgets["hex"] = theme.compact_metric("ppm")
-                widgets["water"] = theme.compact_metric("% H2O")
-            with ui.row().classes("gap-3 flex-wrap mt-1"):
-                ui.label("Air in:").classes("text-[10px] text-gray-500")
-                widgets["air"] = theme.compact_metric("°C / kg/s dry")
-            with ui.row().classes("gap-3 flex-wrap mt-1"):
-                ui.label("Air out:").classes("text-[10px] text-gray-500")
-                # Dry-air flow is repeated here (unchanged from inlet) so the readout
-                # can't be misread as "the air shrank" -- the air CONSERVES dry mass and
-                # only GAINS humidity (g H2O per kg dry air) as it dries the meal.
-                widgets["air_out"] = theme.compact_metric("°C / kg/s dry / g H2O·kg⁻¹")
-            with ui.row().classes("gap-3 flex-wrap mt-1"):
-                ui.label("Air hexane:").classes("text-[10px] text-gray-500")
-                # Hexane desorbed into the DC exhaust air, vs the ~1100 ppm (10% LEL)
-                # safety limit -- turns red if exceeded.
-                widgets["air_hex"] = theme.compact_metric("ppm (limit 1100)")
-            with ui.row().classes("items-center gap-2 w-full mt-1"):
-                bar_bg = (
-                    ui.element("div")
-                    .classes("flex-1")
-                    .style(
-                        f"height:6px; border-radius:3px; background:{theme.BORDER}; "
-                        "overflow:hidden;"
-                    )
-                )
-                with bar_bg:
-                    fill = ui.element("div").style(f"height:100%; width:0%; background:{theme.TEAL};")
-                widgets["level_fill"] = fill
-                widgets["level_label"] = ui.label("- %").classes(
-                    "text-[10px] font-mono text-gray-500 whitespace-nowrap"
-                )
+
+            # Wide + short: readouts on the left, air controls on the right.
+            with ui.row().classes("w-full gap-4 items-start no-wrap mt-1"):
+                with ui.column().classes("gap-1").style("min-width:230px;"):
+                    with ui.row().classes("gap-3 flex-wrap"):
+                        widgets["T"] = theme.compact_metric("°C")
+                        widgets["hex"] = theme.compact_metric("ppm")
+                        widgets["water"] = theme.compact_metric("% H2O")
+                    with ui.row().classes("gap-3 flex-wrap"):
+                        ui.label("→ Air in").classes("text-[10px] text-gray-500")
+                        widgets["air"] = theme.compact_metric("°C / kg/s dry")
+                    with ui.row().classes("gap-3 flex-wrap"):
+                        ui.label("Air out →").classes("text-[10px] text-gray-500")
+                        widgets["air_out"] = theme.compact_metric("°C / kg/s dry / g H2O·kg⁻¹")
+                    with ui.row().classes("gap-3 flex-wrap"):
+                        ui.label("Air hexane:").classes("text-[10px] text-gray-500")
+                        widgets["air_hex"] = theme.compact_metric("ppm (limit 1100)")
+                    with ui.row().classes("items-center gap-2 w-full"):
+                        bar_bg = (
+                            ui.element("div").classes("flex-1").style(
+                                f"height:6px; border-radius:3px; background:{theme.BORDER}; overflow:hidden;"
+                            )
+                        )
+                        with bar_bg:
+                            fill = ui.element("div").style(
+                                f"height:100%; width:0%; background:{theme.TEAL};"
+                            )
+                        widgets["level_fill"] = fill
+                        widgets["level_label"] = ui.label("- %").classes(
+                            "text-[10px] font-mono text-gray-500 whitespace-nowrap"
+                        )
+
+                # ◀ air-side operator inputs, folded onto the contactor.
+                with ui.column().classes("gap-0 flex-1"):
+                    if role == "DRYER":
+                        ui.label("◀ dryer air").classes("text-[10px]").style(f"color:{theme.TEAL};")
+                        with ui.row().classes("w-full gap-4 items-end flex-wrap"):
+                            with _cell():
+                                controls.mv_slider(
+                                    self._facade, "heated_air_temp", "Air temp [°C]",
+                                    value=mvs["heated_air_temp"].effective_value,
+                                    to_display=theme.k_to_c, from_display=theme.c_to_k,
+                                )
+                            with _cell():
+                                controls.mv_slider(
+                                    self._facade, "heated_air_flow", "Air flow [kg/s]",
+                                    value=mvs["heated_air_flow"].effective_value,
+                                )
+                    else:  # COOLER: just its own air flow (ambient weather is the shared box)
+                        ui.label("◀ cooler air").classes("text-[10px]").style(f"color:{theme.TEAL};")
+                        with ui.row().classes("w-full gap-4 items-end flex-wrap"):
+                            with _cell():
+                                controls.mv_slider(
+                                    self._facade, "ambient_air_flow", "Air flow [kg/s]",
+                                    value=mvs["ambient_air_flow"].effective_value,
+                                )
         self._cards[sid] = card
         self._widgets[sid] = widgets
 
@@ -283,9 +423,7 @@ class TowerView:
         feed_flow = snap.mvs["feed_flow_rate"].effective_value
         feed_temperature_k = snap.dvs["feed_temperature"]
         # The model stores feed_hexane/feed_moisture DRY-basis (kg/kg dry solid), but the feed
-        # card shows them as TOTAL mass fraction of the wet meal (dry solid + moisture + hexane),
-        # since that's how desolventizer feed is spec'd -- e.g. dry-basis 0.4743 hexane reads as
-        # ~30% of wet mass, not "47%". (Oil ~1% is omitted from the denominator, negligible.)
+        # card shows them as TOTAL mass fraction of the wet meal (dry solid + moisture + hexane).
         x1 = snap.dvs["feed_moisture"]
         x2 = snap.dvs["feed_hexane"]
         wet_denom = 1.0 + x1 + x2
@@ -302,8 +440,29 @@ class TowerView:
                 replace=f"background-color: {theme.heat_color(feed_temperature_k, 0.12)}"
             )
 
+        # Ambient-air box: live air mass flow into each contactor (dryer air is
+        # this ambient parcel heated; cooler air is it directly).
+        if self._ambient_arrows:
+            self._ambient_arrows["DRYER"].text = (
+                f"→ Dryer  {snap.mvs['heated_air_flow'].effective_value:.0f} kg/s (heated)"
+            )
+            self._ambient_arrows["COOLER"].text = (
+                f"→ Cooler  {snap.mvs['ambient_air_flow'].effective_value:.0f} kg/s"
+            )
+
         if outputs is None:
             return
+
+        # Annotate the stream-flow arrows. "FEED" -> incoming feed rate; each
+        # stage key -> its NET solid discharge; vapor arrow -> DT top outlet.
+        if "FEED" in self._flow_arrows:
+            self._flow_arrows["FEED"].text = f"{feed_flow:.1f} kg/s"
+        if self._vapor_caption is not None:
+            self._vapor_caption.text = f"{outputs.kpi_outlet_vapor_kg_s:.2f} kg/s"
+        for sid, caption in self._flow_arrows.items():
+            if sid == "FEED":
+                continue
+            caption.text = f"{outputs.stage_solid_out_kg_s.get(sid, 0.0):.1f} kg/s"
 
         for sid in self._stage_order:
             widgets = self._widgets.get(sid)
@@ -315,7 +474,10 @@ class TowerView:
             widgets["water"].text = f"{outputs.stage_X_w_pct[sid]:.2f} % H2O"
 
             level_pct = outputs.stage_level_pct[sid]
-            overfilled = level_pct > 100.0
+            # Holdup is capacity-capped in the model now, so a backed-up tray
+            # sits AT ~100% (rejecting inflow upstream) rather than climbing past
+            # it -- FLOOD triggers at capacity, not at a strict >100%.
+            overfilled = level_pct >= _FLOOD_LEVEL_PCT
             level_color = theme.RED if overfilled else theme.heat_color(t_val)
             widgets["level_label"].text = f"{level_pct:.0f} %"
             widgets["flood"].visible = overfilled
@@ -377,3 +539,9 @@ class TowerView:
                         f"background-color: {theme.heat_color(outputs.stage_T[last_sid], 0.12)}"
                     )
                 )
+
+
+def _mean_arm_rpm(mvs: dict[str, MVSnapshot]) -> float:
+    """Mean sweep-arm rpm across stages, to seed the single global arm slider."""
+    vals = [mv.effective_value for k, mv in mvs.items() if k.split("/", 1)[0] == "sweep_arm_speed"]
+    return sum(vals) / len(vals) if vals else 3.0

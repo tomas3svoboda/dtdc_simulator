@@ -291,19 +291,6 @@ def cp_vip(w_water_vapor: float, w_hexane_vapor: float, cps: tuple[float, float]
     return sum(w * cp for w, cp in zip(weights, cps))
 
 
-def cp_lmix(
-    alpha_L: float,
-    rho_L: float,
-    cp_L: float,
-    alpha_V: float,
-    rho_V: float,
-    cp_Vip: float,
-    rho_Lmix_: float,
-) -> float:
-    """CPLmix (eq. B.4) — cake/inter-particle mixture specific heat in the PHZ."""
-    return (alpha_L * rho_L * cp_L + alpha_V * rho_V * cp_Vip) / rho_Lmix_
-
-
 def nu_from_reynolds(Re: float, Pr: float) -> float:
     """Nu = 2.0 + 0.6 * Re^0.5 * Pr^(1/3) -- the canonical Ranz-Marshall
     single-sphere correlation, which Faner, Perez & Crapiste (2019) use for

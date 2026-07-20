@@ -92,6 +92,11 @@ class ModelConstants:
     dt_outer_tol: float
     dt_outer_max_iter: int
     dt_dcz_inner_max_iter: int
+    # Steam supply-header conditions for the HMI readout (like the DC air readout),
+    # shown for both jacket + sparge steam. Display-only; the physics BCs use
+    # dt_constants.T_direct_steam (from direct_steam_pressure_barg) unchanged.
+    steam_supply_barg: float = 0.0
+    steam_supply_T: float = 0.0  # K, saturation at the steam supply header pressure
 
 
 @dataclass(frozen=True)
@@ -120,6 +125,13 @@ class State:
     X1: np.ndarray  # moisture, kg/kg dry solid
     X2: np.ndarray  # hexane, kg/kg dry solid
     M: np.ndarray  # kg dry solid currently retained (bed holdup)
+    # M4 (GUI follow-up): effective per-stage solid discharge (kg/s dry) to the
+    # stage below (last entry = product rate) AFTER the gate throttle + any
+    # downstream back-pressure rejection -- computed in `step()`, read by
+    # `outputs()` for the inter-tray flow arrows + product mass balance. Carried
+    # on State (not recomputed in outputs) because the back-pressure cascade
+    # makes the NET inter-tray flow differ from a stage's own M*k discharge.
+    solid_out: np.ndarray
     # --- M3a: cached DT-solve targets + warm-start, one entry per DT-role stage ---
     dt_target_T: np.ndarray
     dt_target_X1: np.ndarray
@@ -142,6 +154,7 @@ class State:
             X1=self.X1.copy(),
             X2=self.X2.copy(),
             M=self.M.copy(),
+            solid_out=self.solid_out.copy(),
             dt_target_T=self.dt_target_T.copy(),
             dt_target_X1=self.dt_target_X1.copy(),
             dt_target_X2=self.dt_target_X2.copy(),
@@ -171,6 +184,12 @@ class Inputs:
     ambient_air_flow: float = 0.0  # kg/s
     feed_moisture: float = 0.0  # kg/kg dry solid
     feed_hexane: float = 0.0  # kg/kg dry solid
+    # M4 (GUI redesign): feed oil (X3) is now a LIVE disturbance, not the frozen
+    # `ModelConstants.oil_fraction` -- so an operator can vary incoming oil
+    # content. Threaded into the DT solve's `SolidFeed.X3` (`_resolve_dt`); the
+    # DC ignores oil (a documented ~1% correction, see `core/dc.py::desorb_hexane`).
+    # `init_state` still seeds from the constant (runs before any live DV change).
+    feed_oil: float = 0.01  # kg/kg dry solid
     # 0-1 fraction (weather RH, not an absolute humidity ratio) -- converted
     # to the absolute humidity `dc.air_contact_equilibrium` actually needs
     # in `_dc_equilibrium` below, evaluated at `ambient_air_temp` (heating
@@ -224,10 +243,26 @@ class Outputs:
     stage_air_T_out: dict[str, float]
     stage_air_humidity_out: dict[str, float]
     stage_air_hexane_ppm: dict[str, float]  # hexane in the DC exhaust air (mole ppm), vs ~1100 LEL limit
+    # M4 (GUI redesign): per-stage solid outflow (kg/s dry) = M/tau, so the HMI
+    # can annotate the inter-tray flow arrows with a real number (the same
+    # M/tau discharge `step()`'s own holdup balance uses).
+    stage_solid_out_kg_s: dict[str, float]
     kpi_residual_hexane_ppm: float
     kpi_meal_moisture_pct: float
     kpi_steam_consumption_kg_per_t: float
     kpi_throughput_t_per_day: float
+    # M4 (GUI redesign): energy + vapor-side KPIs for the process dashboard.
+    # All derived from the current tick's inputs + the last DT axial-profile
+    # resolve; reuse existing constants (dc.CP_AIR_J_KG_K, dH_vap_water/hexane).
+    kpi_exhaust_hexane_ppm: float  # DRYER exhaust-air hexane (mole ppm), vs ~1100 LEL limit
+    kpi_direct_steam_kg_s: float  # total sparge (direct) steam
+    kpi_indirect_heating_kw: float  # total indirect (jacket) heating duty
+    kpi_drying_air_heating_kw: float  # duty to heat ambient air up to the dryer setpoint
+    kpi_total_energy_kw: float  # indirect + drying-air + direct-steam latent
+    kpi_outlet_vapor_kg_s: float  # vapor leaving the DT top (to condenser)
+    kpi_outlet_vapor_hexane_kg_s: float  # hexane in that vapor
+    kpi_outlet_vapor_water_kg_s: float  # water in that vapor
+    kpi_condenser_duty_kw: float  # latent duty to condense the outlet vapor
     dt_solver_converged: bool
     dt_solver_outer_iterations: int
     mass_inventory: MassInventory
@@ -300,12 +335,10 @@ class Model:
     stages: tuple[StageSpec, ...]
     constants: ModelConstants
     base_residence_s: float = 90.0  # nominal per-stage lag time constant at 3 rpm sweep speed
-
-    def stage_index(self, stage_id: str) -> int:
-        for i, s in enumerate(self.stages):
-            if s.id == stage_id:
-                return i
-        raise KeyError(f"unknown stage id: {stage_id}")
+    # Full-tray (level=100%), gate=50% solid discharge, kg/s dry. Set ~2*feed so
+    # the default gate half-fills every tray regardless of its depth -- the
+    # geometry-consistent, level-driven discharge law (`_stage_discharge`).
+    nominal_discharge_kg_s: float = 50.0
 
     def init_state(self, seed: OperatingSeed, start_empty: bool = False) -> State:
         """Seeds `x0` via one real `solve_dt` call at the operating defaults
@@ -386,6 +419,7 @@ class Model:
             X1=X10,
             X2=X20,
             M=M0,
+            solid_out=np.zeros(n, dtype=float),  # populated on first step()
             dt_target_T=dt_target_T,
             dt_target_X1=dt_target_X1,
             dt_target_X2=dt_target_X2,
@@ -404,17 +438,36 @@ class Model:
         return stage.volume_m3 * c.rho_solid * (1.0 - c.bed_porosity)
 
     def _stage_tau(self, stage: StageSpec, u: Inputs) -> float:
+        """Solid transport/thermal-lag residence time (s), set by sweep-arm
+        speed only. gate_opening no longer enters here: it's a real DISCHARGE
+        throttle now (`_stage_discharge`), so a closed gate genuinely stops
+        outflow and backs material up rather than merely stretching the turnover
+        time. Faster arms -> shorter tau (quicker turnover)."""
         rpm = u.sweep_arm_speed.get(stage.id, 3.0)
-        # gate_opening restricts discharge, so it sets residence time too (§5.2:
-        # gate_opening "sets inter-stage solid flow / holdup (level)"). Normalized
-        # against the scenario's default 50% so today's default config produces
-        # the same tau as before this MV was wired up.
-        gate_norm = min(max(u.gate_opening.get(stage.id, 50.0) / 50.0, 0.1), 3.0)
-        if stage.role in DC_ROLES:
-            base = self.base_residence_s * 1.5
-        else:
-            base = self.base_residence_s
-        return base / max(rpm / 3.0, 0.1) / gate_norm
+        base = self.base_residence_s * (1.5 if stage.role in DC_ROLES else 1.0)
+        return base / max(rpm / 3.0, 0.1)
+
+    def _stage_discharge(self, stage: StageSpec, m_hold: float, u: Inputs) -> float:
+        """Solid discharge rate (kg/s dry) from a rotary valve / weir: driven by
+        the bed LEVEL (fill fraction `M/M_max`), NOT absolute holdup, so trays of
+        very different depth behave the SAME way for a given gate. Throttled by
+        `gate_opening` (§5.2: "sets inter-stage solid flow / holdup"):
+
+            m_out = (M / M_max) * (gate/50) * nominal_discharge_kg_s
+
+        With `nominal_discharge_kg_s ~ 2*feed`, gate=50% -> ~half-full at nominal
+        feed on EVERY tray, floods (level -> 100%) below ~25% gate everywhere,
+        and gate=0 fully STOPS discharge (accumulate + back-pressure). Level still
+        rises with feed (more throughput -> higher bed), and bigger trays get a
+        proportionally longer residence -- both physical. (Modelling discharge on
+        absolute holdup `M*k` instead made a deep tray sit near-empty and a
+        shallow one near-full at the same gate, since the trays' bed depths span
+        ~7x -- the reason the gate felt like it "did nothing" on the deep MN1.)"""
+        m_max = self._stage_M_max(stage)
+        if m_max <= 0.0:
+            return 0.0
+        gate = u.gate_opening.get(stage.id, 50.0)
+        return (m_hold / m_max) * (gate / 50.0) * self.nominal_discharge_kg_s
 
     def _dc_equilibrium(
         self, stage: StageSpec, T_in: float, X1_in: float, X2_in: float, u: Inputs, residence_s: float
@@ -486,7 +539,7 @@ class Model:
             T=u.feed_temperature,
             X1=u.feed_moisture,
             X2=u.feed_hexane,
-            X3=c.oil_fraction,
+            X3=u.feed_oil,  # M4: live DV, not the frozen c.oil_fraction (see Inputs.feed_oil)
             m_dry_kg_s=max(u.feed_flow_rate, 1e-9),
         )
         vapor_feed = dt_solver.VaporFeed(
@@ -533,7 +586,7 @@ class Model:
             x_next.dt_last_solve_sim_time = t
 
         T_in, X1_in, X2_in = u.feed_temperature, u.feed_moisture, u.feed_hexane
-        m_in = u.feed_flow_rate  # kg/s dry solid, chained bed-holdup mass balance
+        inflow = u.feed_flow_rate  # kg/s dry solid offered to the current stage
         dt_idx = 0
         for i, stage in enumerate(self.stages):
             tau = self._stage_tau(stage, u)
@@ -551,19 +604,37 @@ class Model:
             X1_new = X1_eq + (x.X1[i] - X1_eq) * decay
             X2_new = X2_eq + (x.X2[i] - X2_eq) * decay
 
-            # Bed holdup: same closed-form relaxation as T/X1/X2, toward the
-            # steady-state mass implied by current inflow and residence time.
-            M_eq = m_in * tau
-            M_new = M_eq + (x.M[i] - M_eq) * decay
-            m_out = M_new / tau
+            # Gated discharge + capacity-limited holdup with back-pressure
+            # (BuildSpec §5.2). gate_opening is a real rotary-valve throttle:
+            # discharge is driven by bed LEVEL (`_stage_discharge`), and is 0 at a
+            # shut gate. Inflow is accepted only up to the tray's remaining
+            # capacity; the surplus is REJECTED back into the tray above
+            # (x_next.M[i-1]), so a shut/flooded tray backs material up toward the
+            # feed instead of silently passing it through. M_old is the
+            # start-of-tick holdup; the tray above may still push its own
+            # rejection onto x_next.M[i] later this tick (cascade climbs one
+            # tray per tick).
+            m_max = self._stage_M_max(stage)
+            m_old = x.M[i]
+            m_out = self._stage_discharge(stage, m_old, u)
+            if dt > 0.0:
+                m_out = min(m_out, m_old / dt)  # can't discharge more than present
+            after_discharge = m_old - m_out * dt
+            room = max(m_max - after_discharge, 0.0)
+            accepted = min(inflow, room / dt) if dt > 0.0 else inflow
+            rejected = inflow - accepted
+            if rejected > 0.0 and i > 0:
+                x_next.M[i - 1] += rejected * dt
+                x_next.solid_out[i - 1] -= rejected  # record the NET accepted flow
 
             x_next.T[i] = T_new
             x_next.X1[i] = X1_new
             x_next.X2[i] = X2_new
-            x_next.M[i] = M_new
+            x_next.M[i] = after_discharge + accepted * dt
+            x_next.solid_out[i] = m_out
 
             T_in, X1_in, X2_in = T_new, X1_new, X2_new
-            m_in = m_out
+            inflow = m_out
 
         return x_next, self.outputs(x_next, u)
 
@@ -572,7 +643,18 @@ class Model:
         stage_T = {s.id: float(x.T[i]) for i, s in enumerate(self.stages)}
         stage_X_hex_ppm = {s.id: float(x.X2[i] * 1.0e6) for i, s in enumerate(self.stages)}
         stage_X_w_pct = {s.id: float(x.X1[i] * 100.0) for i, s in enumerate(self.stages)}
-        stage_vapor_temp = dict(stage_T)  # placeholder: no distinct vapor-phase state yet
+        # Per-stage vapor temperature: for DT stages, the PHYSICAL vapor temperature
+        # (binary hexane-water dew point) at the TOP of that stage from the last
+        # axial-profile solve -- the vapor leaving the stage upward. The profile is
+        # ordered top-to-bottom, so the first cell seen for a stage is its top face.
+        # DC (DRYER/COOLER) stages have no solvent-vapor phase, so they keep the
+        # solid temperature as a documented fallback.
+        stage_vapor_temp = dict(stage_T)
+        _seen_vapor: set[str] = set()
+        for _sid, _vT in zip(x.dt_axial_profile.stage_id, x.dt_axial_profile.vapor_T):
+            if _sid not in _seen_vapor:
+                stage_vapor_temp[_sid] = float(_vT)
+                _seen_vapor.add(_sid)
         # Not clamped to 100: an over-restricted gate can genuinely overfill a
         # tray, and showing >100% is the useful HMI "flood" signal for that.
         stage_level_pct = {
@@ -602,6 +684,11 @@ class Model:
                 stage_air_hexane_ppm[stage.id] = float(air_hexane_out * 1.0e6)
             T_in_diag, X1_in_diag, X2_in_diag = float(x.T[i]), float(x.X1[i]), float(x.X2[i])
 
+        # Per-stage NET solid outflow (kg/s dry) to the tray below -- recorded by
+        # step()'s gated-discharge + back-pressure balance (see State.solid_out),
+        # feeding the HMI's inter-tray flow arrows.
+        stage_solid_out_kg_s = {s.id: float(x.solid_out[i]) for i, s in enumerate(self.stages)}
+
         total_steam_kg_s = (
             sum(u.direct_steam.values()) + sum(u.indirect_steam.values()) / c.dH_vap_water
         )
@@ -609,9 +696,41 @@ class Model:
         steam_kg_per_t = total_steam_kg_s / throughput_kg_s * 1000.0
         throughput_t_per_day = u.feed_flow_rate * 86400.0 / 1000.0
 
-        last_stage = self.stages[-1]
-        tau_last = max(self._stage_tau(last_stage, u), 1e-9)
-        product_dry_solid_kg_s = float(x.M[-1]) / tau_last
+        # --- M4 energy KPIs (W -> kW) ---
+        direct_steam_kg_s = float(sum(u.direct_steam.values()))
+        indirect_heating_w = float(sum(u.indirect_steam.values()))
+        # Sensible duty to heat the ambient air parcel up to the dryer setpoint
+        # (only the DRYER heats its air; the COOLER runs on ambient air, no duty).
+        drying_air_heating_w = (
+            u.heated_air_flow * dc.CP_AIR_J_KG_K * max(u.heated_air_temp - u.ambient_air_temp, 0.0)
+        )
+        direct_steam_latent_w = direct_steam_kg_s * c.dH_vap_water
+        total_energy_w = indirect_heating_w + drying_air_heating_w + direct_steam_latent_w
+
+        # DRYER exhaust-air hexane, singled out from the per-stage map for the
+        # KPI band (the stream that carries the 10% LEL safety limit).
+        exhaust_hexane_ppm = 0.0
+        for s in self.stages:
+            if s.role is StageRole.DRYER and s.id in stage_air_hexane_ppm:
+                exhaust_hexane_ppm = stage_air_hexane_ppm[s.id]
+                break
+
+        # --- M4 vapor-side KPIs: the DT top-cell vapor stream to the condenser ---
+        # `dt_axial_profile` is ordered top-to-bottom, so cell 0 is the DT top
+        # outlet. Guard the empty-profile case (outputs() is also called once
+        # pre-tick from assemble(), before any solve has populated the profile).
+        prof = x.dt_axial_profile
+        if prof.vapor_flow_kg_s:
+            outlet_vapor_kg_s = float(prof.vapor_flow_kg_s[0])
+            outlet_vapor_hexane_kg_s = outlet_vapor_kg_s * float(prof.vapor_hexane_frac[0])
+            outlet_vapor_water_kg_s = outlet_vapor_kg_s * float(prof.vapor_water_frac[0])
+        else:
+            outlet_vapor_kg_s = outlet_vapor_hexane_kg_s = outlet_vapor_water_kg_s = 0.0
+        condenser_duty_w = (
+            outlet_vapor_water_kg_s * c.dH_vap_water + outlet_vapor_hexane_kg_s * c.dH_vap_hexane
+        )
+
+        product_dry_solid_kg_s = float(x.solid_out[-1])
         mass_inventory = MassInventory(
             total_dry_solid_holdup_kg=float(np.sum(x.M)),
             total_hexane_holdup_kg=float(np.sum(x.M * x.X2)),
@@ -633,10 +752,20 @@ class Model:
             stage_air_T_out=stage_air_T_out,
             stage_air_humidity_out=stage_air_humidity_out,
             stage_air_hexane_ppm=stage_air_hexane_ppm,
+            stage_solid_out_kg_s=stage_solid_out_kg_s,
             kpi_residual_hexane_ppm=float(x.X2[-1] * 1.0e6),
             kpi_meal_moisture_pct=float(x.X1[-1] * 100.0),
             kpi_steam_consumption_kg_per_t=steam_kg_per_t,
             kpi_throughput_t_per_day=throughput_t_per_day,
+            kpi_exhaust_hexane_ppm=float(exhaust_hexane_ppm),
+            kpi_direct_steam_kg_s=direct_steam_kg_s,
+            kpi_indirect_heating_kw=indirect_heating_w / 1.0e3,
+            kpi_drying_air_heating_kw=drying_air_heating_w / 1.0e3,
+            kpi_total_energy_kw=total_energy_w / 1.0e3,
+            kpi_outlet_vapor_kg_s=outlet_vapor_kg_s,
+            kpi_outlet_vapor_hexane_kg_s=outlet_vapor_hexane_kg_s,
+            kpi_outlet_vapor_water_kg_s=outlet_vapor_water_kg_s,
+            kpi_condenser_duty_kw=condenser_duty_w / 1.0e3,
             dt_solver_converged=bool(x.dt_converged),
             dt_solver_outer_iterations=int(x.dt_outer_iterations),
             mass_inventory=mass_inventory,

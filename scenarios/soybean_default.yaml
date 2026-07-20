@@ -34,10 +34,10 @@ geometry:
     # does NOT resolve -- only the packed solid beds are modeled, summing to ~1.9 m here
     # (the "packed bed total height" the meal-bed profile shows). Per-tray indirect_steam is
     # retuned below so PD1/PD2 actually reach hexane bp (~69 C) and desolventize, not just heat.
-    - {id: PD1, role: PREDESOLV, diameter_m: 6.0, bed_height_m: 0.15}   # shallow predesolv (feed)
-    - {id: PD2, role: PREDESOLV, diameter_m: 6.0, bed_height_m: 0.15}   # shallow predesolv
+    - {id: PD1, role: PREDESOLV, diameter_m: 6.0, bed_height_m: 0.30}   # predesolv ~300 mm high end (AOCS/Kemper 2019)
+    - {id: PD2, role: PREDESOLV, diameter_m: 6.0, bed_height_m: 0.30}   # predesolv ~300 mm high end
     - {id: MN1, role: MAIN,      diameter_m: 6.0, bed_height_m: 1.00}   # deep toasting (FTRZ/DCZ here)
-    - {id: SP1, role: SPARGE,    diameter_m: 6.0, bed_height_m: 0.60}   # deep sparge (direct steam)
+    - {id: SP1, role: SPARGE,    diameter_m: 6.0, bed_height_m: 1.00}   # deep sparge ~1000 mm (AOCS/Kemper 2019)
     # DR1/CL1 sized so the bed-holdup mass balance (added alongside gate_opening
     # becoming a real MV) settles at ~65% level at default gate/sweep settings,
     # leaving headroom before a narrowed gate genuinely floods the tray.
@@ -84,7 +84,15 @@ model:
   # dt_solver.py's own sparge-BC assumption): "clean" vapor arriving below the
   # bottommost DT tray (rotary lock / DC side), before SP1's own direct steam
   # mixes in. No real DC->DT vapor-return stream is modeled at this fidelity.
-  dt_vapor_feed_water_kg_s: 5.0   # kg/s  [PLACE]
+  # Trimmed from an oversized 5.0 [PLACE] to 3.3 this session: at 5.0 the exiting
+  # vent vapor was so water-rich its (physical) dew-point DOME temperature sat at
+  # ~83 C -- above the 70-75 C lean-steam optimum (AOCS/Kemper 2019 Fig. 4, where
+  # more vent water => higher dome => more solvent loss). 3.3 lands the dome at
+  # ~72 C while keeping the DT exit moisture in band. NB the DOME temperature
+  # itself was ALSO fixed this session (core/dt_solver.py): it now reports the
+  # binary hexane-water dew point of the vent vapor, not the top-tray SOLID temp
+  # (which read the ~59 C feed temperature -- below the physical azeotrope floor).
+  dt_vapor_feed_water_kg_s: 3.3   # kg/s  [PLACE, trimmed for a lean-steam ~72 C dome]
   dt_vapor_feed_hex_kg_s: 0.0005  # kg/s  [PLACE]
   dt_vapor_feed_T: 371.0          # K     [PLACE]
   # DC residual-hexane desorption -- mechanistic (core/dc.py::desorb_hexane): removal rate =
@@ -101,15 +109,18 @@ model:
   # do NOT apply the full 80; surface renewal in the tumbled bed is why the lumped MTC is still
   # needed. [PAPER-anchored]: magnitude from EPA Table 4-4, T-law from the escaping tendency.
   dc_hexane_mtc: 1.3e-2           # -  [PAPER-anchored] EPA AP-42 9.11.1 Table 4-4 meal-hexane cascade
-  # SPARGE (direct) steam supply pressure -- found this session: the model previously mixed
-  # direct_steam in at water's ATMOSPHERIC boiling point (~373 K), but that's the DT vessel's
-  # own internal vapor-space reference, not the steam SUPPLY temperature. This project's own
-  # literature_sources/Svoboda_Case_for_Advanced_Process_Control_VRX-DTDC_Concept.pdf documents
-  # indirect steam at 9.5 barG (~185 C) but not direct/sparge steam's own pressure. First guess
-  # (3 barG/144 C) was revised after the user's own more detailed operational knowledge: real
-  # sparge steam is LOW pressure, ~0.5-1.5 bar / 100-110 C saturated -- 0.3 barG (~107.5 C) is
-  # the middle of that range via the same antoine_water correlation used for T_boil_water.
-  direct_steam_pressure_barg: 0.3 # bar  [PAPER-adjacent, user-confirmed plant practice, revised]
+  # SPARGE (direct) steam CONTACT pressure -> its saturation temperature is the DCZ bottom-BC steam
+  # temperature (core/dt_solver.py's T_bottom). This is NOT the 6.9 barG supply header
+  # (steam_supply_pressure_barg above, the SCADA "PARA" reading) -- the steam THROTTLES from the
+  # header through the sparge-tray apertures (AOCS/Kemper 2019: a 0.35-0.70 bar drop across the
+  # sparge tray) into the meal bed, arriving as ~3 barG / ~144 C. That matches the doc's own
+  # "150-160 C superheated steam after the flow control valve". Using the full 170 C header as the
+  # CONTACT temperature is unphysical (superheated steam at bed pressure evaporates moisture rather
+  # than condensing onto the meal, so it over-DRIES the DT below the 16-21% exit band) -- the
+  # throttled ~144 C value both condenses correctly (giving realistic exit moisture) and keeps the
+  # dome vapor in its 70-75 C optimum. See DECISIONS / the model-constant tuning this session.
+  direct_steam_pressure_barg: 3.0 # bar g, sparge steam AT THE MEAL (throttled from the 6.9 barG header)
+  steam_supply_pressure_barg: 6.9 # bar g, steam header ~170 C saturated (SCADA "PARA") -- HMI readout only
   # DT solve convergence tuning (M3a follow-up, "A2") -- deliberately looser
   # than solve_dt()'s own validation-run defaults (outer_tol=1e-5, both
   # iteration caps=100), profiled+measured this session: dt_solver's own
@@ -130,20 +141,20 @@ model:
 # Coletto base case direction: feed ~26% solvent, ~35% at rotary lock; steam split DT.
 operating_defaults:
   feed_flow_rate: 25.0        # kg/s dry solid  [PLACE] (scale to your throughput)
-  # PD1/PD2 raised to 2.5e6 W each so the PREDESOLV section can strip feed hexane down to the
-  # measured critical content X_c ~0.20 (properties/soybean.yaml, Faner 2019) by surface
-  # evaporation -- i.e. the predesolventizer does the bulk of the desolventizing, as it does in
-  # a real DT. (At the old 9.0e5, the PHZ could only reach ~0.36 by surface evaporation, which
-  # was fine when X_c was the theoretical ~0.43 but leaves the meal above the real 0.20.) With
-  # 2.5e6 the flash front sits in PD2 and the DT exits ~1000 ppm hexane at ~100 C. MN1 (toasting)
-  # + SP1 (sparge) then finish the residual via the receding front + DCZ diffusion.
+  # PD1/PD2 held at 2.5e6 W each so the PREDESOLV section strips feed hexane down to the measured
+  # critical content X_c ~0.20 (properties/soybean.yaml, Faner 2019) by surface evaporation -- the
+  # predesolventizer does the bulk of the desolventizing, as in a real DT (below ~1.5e6 the PHZ
+  # can't reach X_c and solve_dt fails). MN1 (toasting) + SP1 (sparge) finish the residual. With
+  # the sparge CONTACT temperature at the throttled ~144 C (direct_steam_pressure_barg above) and
+  # the vent water trimmed (dt_vapor_feed_water above), this jacket/sparge split lands the DT exit
+  # at ~109 C / ~18% moisture / ~285 ppm hexane and the vent DOME at ~72 C -- all in band.
   indirect_steam:             # W per DT tray (jacket duty)  [PLACE]
     PD1: 2.5e6
     PD2: 2.5e6
     MN1: 2.0e6
     SP1: 4.0e5
   direct_steam:               # kg/s sparge steam  [PLACE]
-    SP1: 1.5
+    SP1: 1.05
   sweep_arm_speed:            # rpm  [PLACE] central-shaft sweep/rake arms (NOT agitation)
     PD1: 3.0
     PD2: 3.0
@@ -154,22 +165,17 @@ operating_defaults:
     PD2: 50
     MN1: 50
     SP1: 50
-  # heated_air_flow/ambient_air_flow — recalibrated against the first-principles DC rewrite
-  # (core/dc.py, Luz 2010 / Silva 2012) AND the flake particle_radius fix (properties/soybean.yaml),
-  # which raised the DT exit moisture into the realistic 18-24% band. The DC is a closed two-sided
-  # mass/energy balance with COUPLED air-solid heat transfer, so both air rates set a genuine
-  # thermodynamic duty:
-  #  * DRYER (heated_air_flow=60): meal enters ~100 C / ~24% moisture; evaporating that much water
-  #    carries latent heat away, so DR1 settles ~53 C (NOT held at air temperature) while shedding
-  #    moisture to ~12% -- correct evaporative-drying physics, and matches the real 311 SUSIC
-  #    (~50 C) dryer-outlet reading.
-  #  * COOLER (ambient_air_flow=55): DR1 already did most of the cooling (evaporatively), so the
-  #    cooler only drops ~53 C -> ~37 C, matching the SCADA CHLADIC reference (~38.5 C) at a normal
-  #    ~2:1 air:solid ratio. (Before the flake/moisture fix the dryer left the meal hot ~85 C and
-  #    the cooler needed ~400 kg/s; the realistic moisture regime made that unnecessary.)
-  heated_air_temp: 380.0      # K  [PLACE] dryer inlet air
-  heated_air_flow: 60.0       # kg/s  [PLACE, RETUNED] DRYER — DR1 ~53 C while drying ~24%->~12%
-  ambient_air_flow: 55.0      # kg/s  [PLACE, RETUNED] COOLER — ~2:1 air:solid, CL1 ~37 C
+  # DC air — RE-TUNED alongside the sparge-steam physics fixes. The DT exits ~109 C / ~18% moisture,
+  # so the DC dries it toward the trading limit and cools it to near ambient. The DC is a closed
+  # two-sided mass/energy balance with COUPLED air-solid heat transfer, so both air rates set a
+  # genuine thermodynamic duty:
+  #  * DRYER (360 K = ~87 C, 80 kg/s): the meal enters ~109 C; the air dries it and evaporatively
+  #    cools DR1 to ~66 C.
+  #  * COOLER (298 K ambient, 250 kg/s): a high ~10:1 air:solid ratio drops CL1 to ~36 C -- within
+  #    ~10 C of ambient, per the AOCS doc.
+  heated_air_temp: 360.0      # K = ~87 C  [PLACE, re-tuned] dryer inlet air
+  heated_air_flow: 80.0       # kg/s  [PLACE, re-tuned] DRYER — DR1 ~66 C
+  ambient_air_flow: 250.0     # kg/s  [PLACE, re-tuned] COOLER — ~10:1 air:solid, CL1 ~36 C
   # M3a follow-up ("C"): HOT, live-tunable from the UI/OPC UA while RUNNING
   # (RuntimeFacade.set_dt_resolve_interval_s) -- schema-enforced floor of
   # 120s (config/schema.py's OperatingDefaults.dt_resolve_interval_s): the
@@ -195,6 +201,8 @@ disturbance_defaults:
   # zone collapses), so desolventizing is physical. NB the GUI feed card shows this back as a
   # wet-mass fraction (~35%), not the dry-basis 0.58 -- see interfaces/ui/tower.py.
   feed_hexane:   0.5815        # kg/kg dry solid = 35% hexane by total wet mass [PAPER-adjacent]
+  feed_oil:      0.01          # kg/kg dry solid (X3) -- matches properties/soybean.yaml oil_fraction;
+                              # now a live disturbance (M4), so incoming oil can be varied from the HMI
   ambient_air_temp: 298.0     # K  [PLACE] cooler inlet air -- weather, not an operator setpoint
   ambient_relative_humidity: 0.50  # 0-1  [PLACE] ~50% RH at 298K -- matches the old 0.010 kg/kg default
 

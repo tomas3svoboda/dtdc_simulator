@@ -51,7 +51,6 @@ air:solid ratio, orthogonal to the water/energy physics above.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 from scipy.optimize import brentq

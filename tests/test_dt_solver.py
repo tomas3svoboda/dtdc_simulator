@@ -34,6 +34,8 @@ from dtdc_simulator.core.zones import phz as phz_mod
 GAB = thermo.GabParams(Xm=5.183e-3, C0=3.117e-3, dHC_R=2262.0, K0=9.172e-2, dHK_R=729.6)
 OIL = thermo.OilIsotherm(A0=0.9635, B=2.7036)
 ANTOINE_WATER = thermo.AntoineParams(A=5.11564, B=1687.54, C=-42.98)
+# n-hexane (NIST, log10(P[bar]) = A - B/(C+T[K])); gives bp 341.9 K == T_boil_hexane below.
+ANTOINE_HEXANE = thermo.AntoineParams(A=4.00266, B=1171.53, C=-48.784)
 VAPOR_REF = thermo.VaporEnthalpyRef(
     dH_vap_water=2.26e6,
     cp_water_vapor=1900.0,
@@ -107,6 +109,7 @@ CONSTANTS = dts.DTSolverConstants(
     # Derated 20x from Touffet's own 60 C peak measurement (6.2e-10) -- see
     # properties/soybean.yaml's own `water_diffusivity` comment for why.
     water_diffusivity=3.1e-11,
+    antoine_hexane=ANTOINE_HEXANE,
 )
 
 # scenarios/soybean_default.yaml's own reference geometry/duties.

@@ -214,6 +214,13 @@ class ModelParams(BaseModel):
     direct_steam_pressure_barg: float = Field(
         gt=0, description="bar gauge, sparge/direct steam supply pressure -- see comment above"
     )
+    # Steam SUPPLY-header conditions for the HMI readout (the "PARA" header on the
+    # plant SCADA: ~6.9 barG / ~170 C saturated), shown for BOTH the jacket
+    # (indirect) and sparge (direct) steam. Display-only -- the physics BCs use
+    # `direct_steam_pressure_barg` (the post-expansion sparge contact temp) unchanged.
+    steam_supply_pressure_barg: float = Field(
+        gt=0, default=6.9, description="bar gauge, steam supply header (HMI readout)"
+    )
     # DT solve convergence tuning (M3a follow-up, "A2"), kept SEPARATE from
     # dt_solver.solve_dt()'s own conservative validation-run defaults
     # (1e-5/100/100, unchanged) -- these real-time settings trade precision
@@ -266,6 +273,10 @@ class DisturbanceDefaults(BaseModel):
     feed_temperature: float = Field(gt=0, description="K")
     feed_moisture: float = Field(ge=0, description="kg/kg dry solid")
     feed_hexane: float = Field(ge=0, description="kg/kg dry solid")
+    # M4 (GUI redesign): feed oil (X3) is now a live disturbance, seeded here
+    # from the same value `physical.oil_fraction` carries (its default keeps
+    # scenarios that predate this field working). See core/model.py Inputs.feed_oil.
+    feed_oil: float = Field(default=0.01, ge=0, description="kg/kg dry solid, X3")
     # Weather, not an operator setpoint -- COOLER's own inlet air temperature
     # (see engine/facade.py's MV->DV reclassification comment).
     ambient_air_temp: float = Field(gt=0, description="K, COOLER inlet air")

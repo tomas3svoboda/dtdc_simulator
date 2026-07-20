@@ -47,6 +47,17 @@ class MVSnapshot:
 
 
 @dataclass
+class SteamInfo:
+    """Steam supply-header conditions for the HMI readout (analogous to the DC
+    air readout), shown for both jacket + sparge steam. `dH_vap_water` lets the
+    UI show the jacket (indirect) duty as a steam flow rate (kg/s) instead of kW."""
+
+    supply_barg: float
+    supply_T_K: float
+    dH_vap_water: float  # J/kg
+
+
+@dataclass
 class Snapshot:
     state: SimState
     sim_time: float
@@ -60,6 +71,7 @@ class Snapshot:
     stage_roles: dict[str, str]
     stage_order: list[str]
     dt_resolve_interval_s: float  # M3a follow-up ("C")
+    steam: SteamInfo | None = None
 
 
 class RuntimeFacade:
@@ -222,6 +234,9 @@ class RuntimeFacade:
             "feed_temperature": DisturbanceVariable("feed_temperature", dd.feed_temperature),
             "feed_moisture": DisturbanceVariable("feed_moisture", dd.feed_moisture),
             "feed_hexane": DisturbanceVariable("feed_hexane", dd.feed_hexane),
+            # M4 (GUI redesign): feed oil (X3) is a live disturbance now -- see
+            # core/model.py Inputs.feed_oil / _resolve_dt.
+            "feed_oil": DisturbanceVariable("feed_oil", dd.feed_oil),
             # Weather, not an operator setpoint -- reclassified from an MV (see
             # MV_LIMITS' own history / DECISIONS.md): nothing sets the COOLER's
             # inlet air temperature, it's a disturbance like ambient_relative_humidity.
@@ -248,6 +263,17 @@ class RuntimeFacade:
         with self._lock:
             for mv in self._mvs.values():
                 mv.set_mode(mode)
+
+    def set_mv_group_manual_setpoint(self, prefix: str, value: float) -> None:
+        """Broadcast one manual setpoint to every MV whose key shares `prefix`
+        (the part before the '/', or the whole key for non-per-stage MVs) --
+        e.g. a single 'arm rotation speed' HMI slider driving every
+        `sweep_arm_speed/<stage>` at once. Mirrors `set_global_mode`'s
+        fan-out; per-stage MVs stay individually addressable (OPC UA)."""
+        with self._lock:
+            for key, mv in self._mvs.items():
+                if key.split("/", 1)[0] == prefix:
+                    mv.set_manual_setpoint(value)
 
     def set_dv(self, key: str, value: float) -> None:
         with self._lock:
@@ -276,10 +302,6 @@ class RuntimeFacade:
     def mv_keys(self) -> list[str]:
         with self._lock:
             return list(self._mvs.keys())
-
-    def dv_keys(self) -> list[str]:
-        with self._lock:
-            return list(self._dvs.keys())
 
     # ------------------------------------------------------------------ tick loop
     def _read_effective_inputs_locked(self, dt: float) -> Inputs:
@@ -315,6 +337,7 @@ class RuntimeFacade:
             ambient_air_flow=self._mvs["ambient_air_flow"].tick(dt),
             feed_moisture=self._dvs["feed_moisture"].value,
             feed_hexane=self._dvs["feed_hexane"].value,
+            feed_oil=self._dvs["feed_oil"].value,
             ambient_relative_humidity=self._dvs["ambient_relative_humidity"].value,
             dt_resolve_interval_s=self._dt_resolve_interval_s,
         )
@@ -374,6 +397,14 @@ class RuntimeFacade:
                 for k, mv in self._mvs.items()
             }
             dvs = {k: dv.value for k, dv in self._dvs.items()}
+            steam = None
+            if self._model is not None:
+                c = self._model.constants
+                steam = SteamInfo(
+                    supply_barg=c.steam_supply_barg,
+                    supply_T_K=c.steam_supply_T,
+                    dH_vap_water=c.dH_vap_water,
+                )
             return Snapshot(
                 state=self._sm.state,
                 sim_time=self._sim_time,
@@ -387,4 +418,5 @@ class RuntimeFacade:
                 stage_roles=dict(self._stage_roles),
                 stage_order=list(self._stage_order),
                 dt_resolve_interval_s=self._dt_resolve_interval_s,
+                steam=steam,
             )

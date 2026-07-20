@@ -28,21 +28,44 @@ from dtdc_simulator.engine.facade import RuntimeFacade
 from dtdc_simulator.engine.mv import Mode
 from dtdc_simulator.engine.state_machine import SimState
 from dtdc_simulator.interfaces.ui import theme
-from dtdc_simulator.interfaces.ui.controls import ControlsView
 from dtdc_simulator.interfaces.ui.dt_profiles import DTProfileView
 from dtdc_simulator.interfaces.ui.tower import TowerView
 
 logger = logging.getLogger(__name__)
 
-HISTORY_LEN = 300
+HISTORY_LEN = 12000  # safety cap on trend-history length (real trimming is by TREND_WINDOW_S)
 SYNC_INTERVAL_S = 0.3
-OUTLET_WINDOW_S = 3600.0  # moving window for the outlet quality trend chart
+TREND_WINDOW_S = 1800.0  # sliding sim-time window shown on ALL trend charts (stage-temp + outlet)
 
-_KPI_TILES = (
-    ("kpi_residual_hexane_ppm", "Residual hexane [ppm]", "{:.0f}"),
-    ("kpi_meal_moisture_pct", "Meal moisture [%]", "{:.2f}"),
-    ("kpi_steam_consumption_kg_per_t", "Steam [kg/t]", "{:.2f}"),
-    ("kpi_throughput_t_per_day", "Throughput [t/day]", "{:.1f}"),
+# M4 (GUI redesign): the process-overview KPI band. Each entry is
+# (Outputs attribute, title, unit, format, status_fn) where status_fn(value)
+# returns None|"warn"|"crit" for the RESERVED status tint (out-of-spec / safety
+# limit) -- most KPIs are informational (status_fn=None).
+
+
+def _meal_hexane_status(v: float) -> str | None:
+    # Residual solvent in finished meal: typical spec well under ~1000 ppm.
+    return "crit" if v > 1000.0 else "warn" if v > 700.0 else None
+
+
+def _exhaust_hexane_status(v: float) -> str | None:
+    # DC exhaust air vs the ~1100 ppm (10% LEL) safety limit; warn at 50% LEL.
+    return "crit" if v > 1100.0 else "warn" if v > 550.0 else None
+
+
+_KPI_SPEC = (
+    ("kpi_residual_hexane_ppm", "Residual hexane (meal)", "ppm", "{:.0f}", _meal_hexane_status),
+    ("kpi_meal_moisture_pct", "Meal moisture", "%", "{:.2f}", None),
+    ("kpi_exhaust_hexane_ppm", "Exhaust-air hexane", "ppm", "{:.0f}", _exhaust_hexane_status),
+    ("kpi_direct_steam_kg_s", "Direct steam", "kg/s", "{:.2f}", None),
+    ("kpi_indirect_heating_kw", "Indirect heating", "kW", "{:.0f}", None),
+    ("kpi_drying_air_heating_kw", "Drying-air heating", "kW", "{:.0f}", None),
+    ("kpi_total_energy_kw", "Total energy", "kW", "{:.0f}", None),
+    ("kpi_outlet_vapor_kg_s", "Outlet vapour", "kg/s", "{:.2f}", None),
+    ("kpi_outlet_vapor_hexane_kg_s", "Vapour hexane", "kg/s", "{:.3f}", None),
+    ("kpi_outlet_vapor_water_kg_s", "Vapour water", "kg/s", "{:.3f}", None),
+    ("kpi_condenser_duty_kw", "Condenser duty", "kW", "{:.0f}", None),
+    ("kpi_throughput_t_per_day", "Throughput", "t/day", "{:.1f}", None),
 )
 
 # Per-MV-key display unit map for the Advanced drawer's generic MV table --
@@ -100,7 +123,7 @@ def create_app(
     def index() -> None:
         history_t: deque[float] = deque(maxlen=HISTORY_LEN)
         history_T: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
-        # (sim_time, value) pairs, trimmed to a rolling OUTLET_WINDOW_S regardless of
+        # (sim_time, value) pairs, trimmed to a rolling TREND_WINDOW_S regardless of
         # sample count -- speed_factor (and thus sim-seconds/tick) can change, so
         # count alone doesn't bound this to a fixed sim-time span.
         outlet_hex_history: deque[tuple[float, float]] = deque()
@@ -108,11 +131,7 @@ def create_app(
 
         theme.inject_theme()
 
-        with (
-            ui.header()
-            .classes("items-center justify-between px-4")
-            .style(f"background-color: {theme.DARK};")
-        ):
+        with ui.header().classes("items-center justify-between px-4 hmi-header"):
             with ui.column().classes("gap-0"):
                 ui.label("DTDC Real-Time Simulator").classes("text-xl font-bold text-white")
                 ui.label("Digital Twin — Desolventizer / Toaster / Dryer / Cooler").classes(
@@ -151,7 +170,9 @@ def create_app(
                     facade.configure(cfg)
                     facade.assemble()
                     error_label.text = ""
-                    controls_view.apply_scenario_defaults(cfg)
+                    # Operator sliders are (re)built + seeded from the assembled
+                    # snapshot inside TowerView.build() on the next sync -- no
+                    # separate seeding pass needed.
                     resolve_interval_input.value = cfg.operating_defaults.dt_resolve_interval_s
                 except (
                     Exception
@@ -165,6 +186,14 @@ def create_app(
                 state_label = ui.label()
                 sim_time_label = ui.label()
                 speed_label = ui.label()
+                # Plant-wide mass-inventory readout (the always-on conservation
+                # diagnostic, Outputs.mass_inventory): total dry-solid holdup and
+                # the net feed-minus-product accumulation rate (~0 at steady state;
+                # non-zero => material backing up / draining somewhere).
+                inventory_label = ui.label().tooltip(
+                    "Total dry-solid holdup in the unit, and the net feed - product "
+                    "rate (≈0 at steady state)"
+                )
                 undersample_badge = ui.badge("UNDERSAMPLE").props("color=warning outline")
                 undersample_badge.visible = False
                 solver_badge = ui.badge("SOLVER STRESS").props("color=negative outline")
@@ -203,24 +232,20 @@ def create_app(
                     on_change=lambda e: facade.set_global_mode(Mode(e.value)),
                 )
 
-            with ui.row().classes("w-full gap-4"):
-                with ui.card().classes("w-48"):
-                    ui.label("Feed flow [kg/s]").classes("text-xs text-gray-500")
-                    feed_flow_kpi = ui.label("-").classes("text-xl font-mono")
-                kpi_labels: dict[str, ui.label] = {}
-                for key, title, _fmt in _KPI_TILES:
-                    with ui.card().classes("w-48"):
-                        ui.label(title).classes("text-xs text-gray-500")
-                        kpi_labels[key] = ui.label("-").classes("text-xl font-mono")
+            # ---- KPI band -------------------------------------------------
+            ui.label("Process KPIs").classes("hmi-section-title")
+            with ui.row().classes("w-full gap-2 flex-wrap"):
+                kpi_tiles: dict[str, theme.KpiTile] = {}
+                for attr, title, unit, _fmt, _status in _KPI_SPEC:
+                    kpi_tiles[attr] = theme.kpi_tile(title, unit)
 
-            controls_container = ui.column().classes("w-full gap-2")
-            controls_view = ControlsView(facade, controls_container)
-
+            # ---- Process schematic + profiles/trends, split 50/50 ---------
             with ui.row().classes("w-full gap-4 items-start flex-wrap"):
-                # ---- left: compact 2-column tower (DT | DC) ----
-                with ui.column().classes("gap-2").style("flex: 0 0 620px"):
+                # ---- left: the single stacked tower column (operator sliders
+                # are folded onto the relevant trays inside TowerView) ----
+                with ui.column().classes("gap-1").style("flex: 1 1 460px; min-width: 460px"):
                     with ui.row().classes("items-center justify-between w-full"):
-                        ui.label("Tower").classes("text-lg font-semibold")
+                        ui.label("Process Overview").classes("text-lg font-semibold")
                         with ui.row().classes("items-center gap-2"):
                             ui.label("Cold").classes("text-xs text-gray-500")
                             ui.element("div").style(
@@ -229,41 +254,20 @@ def create_app(
                                 "rgb(37,99,235), rgb(250,204,21), rgb(220,38,38));"
                             )
                             ui.label("Hot").classes("text-xs text-gray-500")
-                    # Bounded + internally scrollable: the tower's own trays are at
-                    # most one small scroll away, but the rest of the dashboard
-                    # never needs the page to scroll for it.
-                    with (
-                        ui.row()
-                        .classes("w-full gap-3 items-start")
-                        .style("max-height: 700px; overflow-y: auto;")
-                    ):
-                        with ui.column().classes("gap-1").style("flex: 1 1 0%"):
-                            ui.label("DT — Desolventizer / Toaster").classes(
-                                "text-xs font-semibold text-gray-600 uppercase"
-                            )
-                            dt_column = ui.column().classes("w-full gap-1")
-                        with ui.column().classes("gap-1").style("flex: 1 1 0%"):
-                            ui.label("DC — Dryer / Cooler").classes(
-                                "text-xs font-semibold text-gray-600 uppercase"
-                            )
-                            dc_column = ui.column().classes("w-full gap-1")
+                    tower_column = ui.column().classes("w-full gap-1")
 
-                tower_view = TowerView(facade, dt_column, dc_column)
+                tower_view = TowerView(facade, tower_column)
 
-                # ---- right: DT zone-resolved axial profiles ----
-                profile_container = ui.column().classes("gap-2").style("flex: 1 1 0%; min-width: 480px")
+                # ---- right: DT axial profiles + live trend plots, filling the
+                # space beside the tall tower column (equal 50/50 width) ----
+                profile_container = ui.column().classes("gap-2").style("flex: 1 1 460px; min-width: 460px")
                 profile_view = DTProfileView(profile_container)
-
-            with ui.expansion("Advanced: trends & full MV table", value=False).classes(
-                "w-full"
-            ) as advanced_expansion:
-                with ui.column().classes("w-full gap-4"):
-                    ui.label("Stage Temperature Trend (time history)").classes(
-                        "text-lg font-semibold"
-                    )
+                with profile_container:
+                    ui.label("Trends").classes("hmi-section-title mt-3")
+                    ui.label("Stage Temperature Trend [°C]").classes("text-sm font-semibold")
                     trend_plot = ui.echart(
                         {
-                            "xAxis": {"type": "value", "name": "sim time [s]"},
+                            "xAxis": {"type": "value", "name": "sim time [s]", "scale": True},
                             "yAxis": {
                                 "type": "value",
                                 "name": "T [°C]",
@@ -274,37 +278,52 @@ def create_app(
                             "legend": {"data": []},
                             "tooltip": {"trigger": "axis"},
                         }
-                    ).classes("w-full h-64")
+                    ).classes("w-full h-56")
 
-                    ui.label("Outlet Quality Trend (last hour)").classes("text-lg font-semibold")
-                    outlet_trend_plot = ui.echart(
-                        {
-                            "xAxis": {"type": "value", "name": "sim time [s]"},
-                            "yAxis": [
-                                {"type": "value", "name": "Hexane [ppm]", "scale": True},
-                                {"type": "value", "name": "Moisture [%]", "scale": True},
-                            ],
-                            "series": [
-                                {
-                                    "name": "Outlet Hexane",
-                                    "type": "line",
-                                    "yAxisIndex": 0,
-                                    "showSymbol": False,
-                                    "data": [],
-                                },
-                                {
-                                    "name": "Outlet Moisture",
-                                    "type": "line",
-                                    "yAxisIndex": 1,
-                                    "showSymbol": False,
-                                    "data": [],
-                                },
-                            ],
-                            "legend": {"data": ["Outlet Hexane", "Outlet Moisture"]},
-                            "tooltip": {"trigger": "axis"},
-                        }
-                    ).classes("w-full h-64")
+                    # Two SINGLE-axis charts, not one dual-y-axis chart: hexane
+                    # (ppm) and moisture (%) share no scale, so a shared y-axis
+                    # would be misleading (dataviz: never a dual-axis chart).
+                    ui.label("Outlet Quality Trend (last hour)").classes("text-sm font-semibold")
+                    with ui.row().classes("w-full gap-3 flex-wrap"):
+                        outlet_hex_plot = ui.echart(
+                            {
+                                "title": {"text": "Outlet hexane [ppm]", "textStyle": {"fontSize": 12}},
+                                "xAxis": {"type": "value", "name": "sim time [s]", "scale": True},
+                                "yAxis": {"type": "value", "name": "ppm", "scale": True},
+                                "series": [
+                                    {
+                                        "name": "Outlet Hexane",
+                                        "type": "line",
+                                        "showSymbol": False,
+                                        "itemStyle": {"color": theme.RED},
+                                        "data": [],
+                                    }
+                                ],
+                                "tooltip": {"trigger": "axis"},
+                            }
+                        ).classes("h-52").style("flex: 1 1 200px;")
+                        outlet_moist_plot = ui.echart(
+                            {
+                                "title": {"text": "Outlet moisture [%]", "textStyle": {"fontSize": 12}},
+                                "xAxis": {"type": "value", "name": "sim time [s]", "scale": True},
+                                "yAxis": {"type": "value", "name": "%", "scale": True},
+                                "series": [
+                                    {
+                                        "name": "Outlet Moisture",
+                                        "type": "line",
+                                        "showSymbol": False,
+                                        "itemStyle": {"color": theme.TEAL},
+                                        "data": [],
+                                    }
+                                ],
+                                "tooltip": {"trigger": "axis"},
+                            }
+                        ).classes("h-52").style("flex: 1 1 200px;")
 
+            with ui.expansion("Advanced: full MV table & manual drive", value=False).classes(
+                "w-full"
+            ):
+                with ui.column().classes("w-full gap-4"):
                     ui.label("Drive a manipulated variable").classes("text-lg font-semibold")
                     with ui.row().classes("w-full items-center gap-4"):
                         mv_select = ui.select(options=[], label="MV key").classes("w-64")
@@ -353,15 +372,9 @@ def create_app(
                         pagination=10,
                     ).classes("w-full")
 
-        # A collapsed `ui.expansion`'s content is born at zero size, so charts
-        # inside it never draw until it's actually opened -- same fix the
-        # pre-redesign dashboard applied to its (now-removed) tab panels.
-        def _resize_advanced_charts() -> None:
-            if advanced_expansion.value:
-                trend_plot.run_chart_method("resize")
-                outlet_trend_plot.run_chart_method("resize")
-
-        advanced_expansion.on_value_change(_resize_advanced_charts)
+        # The trend charts now live in the always-visible right column (beside
+        # the tower), not in a collapsed expansion, so they draw immediately --
+        # no open-to-resize workaround needed anymore.
 
         known_mv_keys: list[str] = []
         built_stage_order: list[str] = []
@@ -396,7 +409,7 @@ def create_app(
 
             if snap.stage_order != built_stage_order:
                 built_stage_order = list(snap.stage_order)
-                tower_view.build(snap.stage_order, snap.stage_roles, snap.mvs)
+                tower_view.build(snap.stage_order, snap.stage_roles, snap.mvs, snap.dvs, snap.steam)
 
             mv_table.rows = [
                 {
@@ -414,8 +427,6 @@ def create_app(
             ]
             mv_table.update()
 
-            feed_flow_kpi.text = f"{snap.mvs['feed_flow_rate'].effective_value:.2f}"
-
             tower_view.sync(snap, snap.outputs)
             profile_view.sync(snap)
 
@@ -423,24 +434,50 @@ def create_app(
             if outputs is None:
                 return
 
-            for key, _title, fmt in _KPI_TILES:
-                kpi_labels[key].text = fmt.format(getattr(outputs, key))
+            mi = outputs.mass_inventory
+            net = mi.feed_dry_solid_kg_s - mi.product_dry_solid_kg_s
+            inventory_label.text = (
+                f"Inventory: {mi.total_dry_solid_holdup_kg / 1000.0:.1f} t "
+                f"(net {net:+.2f} kg/s)"
+            )
+
+            for attr, _title, _unit, fmt, status_fn in _KPI_SPEC:
+                value = getattr(outputs, attr)
+                kpi_tiles[attr].set(fmt.format(value), status_fn(value) if status_fn else None)
+
+            # All trend charts share one fixed, sliding sim-time window. Pinning
+            # the x-axis min/max (not just relying on the data range) is what makes
+            # it actually slide -- an unpinned value axis snaps its min back to 0.
+            t_now = snap.sim_time
+            window_start = t_now - TREND_WINDOW_S
+            x_min = round(max(0.0, window_start), 1)
+            x_max = round(t_now, 1)
 
             if snap.stage_order:
                 last_sid = snap.stage_order[-1]
-                outlet_hex_history.append((snap.sim_time, outputs.stage_X_hex_ppm[last_sid]))
-                outlet_moisture_history.append((snap.sim_time, outputs.stage_X_w_pct[last_sid]))
-                window_start = snap.sim_time - OUTLET_WINDOW_S
+                outlet_hex_history.append((t_now, outputs.stage_X_hex_ppm[last_sid]))
+                outlet_moisture_history.append((t_now, outputs.stage_X_w_pct[last_sid]))
                 for hist in (outlet_hex_history, outlet_moisture_history):
                     while hist and hist[0][0] < window_start:
                         hist.popleft()
-                outlet_trend_plot.options["series"][0]["data"] = list(outlet_hex_history)
-                outlet_trend_plot.options["series"][1]["data"] = list(outlet_moisture_history)
-                outlet_trend_plot.update()
+                for chart, hist in (
+                    (outlet_hex_plot, outlet_hex_history),
+                    (outlet_moist_plot, outlet_moisture_history),
+                ):
+                    chart.options["series"][0]["data"] = list(hist)
+                    chart.options["xAxis"]["min"] = x_min
+                    chart.options["xAxis"]["max"] = x_max
+                    chart.update()
 
-            history_t.append(snap.sim_time)
+            history_t.append(t_now)
             for sid, t_val in outputs.stage_T.items():
                 history_T[sid].append(theme.k_to_c(t_val))
+            # Slide the (parallel) stage-temp history to the same window.
+            while history_t and history_t[0] < window_start:
+                history_t.popleft()
+                for dq in history_T.values():
+                    if dq:
+                        dq.popleft()
 
             trend_plot.options["series"] = [
                 {
@@ -452,6 +489,8 @@ def create_app(
                 for sid in outputs.stage_T
             ]
             trend_plot.options["legend"] = {"data": list(outputs.stage_T.keys())}
+            trend_plot.options["xAxis"]["min"] = x_min
+            trend_plot.options["xAxis"]["max"] = x_max
             trend_plot.update()
 
         ui.timer(SYNC_INTERVAL_S, sync)
