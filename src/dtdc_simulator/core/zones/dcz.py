@@ -140,8 +140,53 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
+
 from dtdc_simulator.core import thermo
 from dtdc_simulator.core.zones import particle as pt
+
+
+def _dominant_mode_extrapolation(
+    x_k: "np.ndarray", f_k: "np.ndarray", f_prev: "np.ndarray", boost_max: float
+) -> "np.ndarray | None":
+    """Geometric (single-dominant-mode) extrapolation of a fixed-point iterate.
+
+    After a Picard iteration's fast modes decay, its residual ``f = H(x) − x`` is
+    dominated by ONE slow eigenmode with eigenvalue λ near 1 (the DCZ energy
+    coupling, ρ≈0.9998), so ``f_k ≈ λ f_{k-1}``. We estimate λ from the residual
+    alignment (a Rayleigh quotient) and take the geometric-series step toward the
+    fixed point, ``x* = x_k + f_k / (1 − λ)``, with the boost ``1/(1−λ)`` capped
+    at `boost_max`. Returns the extrapolated iterate, or ``None`` if the residual
+    does not look like a clean slow mode (then the caller takes a plain step).
+
+    This deliberately replaces multi-vector Anderson: the DCZ map is piecewise
+    (water condensation/isotherm branches switch as cells cross their dew point),
+    which makes Anderson's least-squares over residual DIFFERENCES ill-behaved. A
+    single scalar extrapolation along the current residual direction is far more
+    robust on such a map while still collapsing the O(10^4)-iteration crawl."""
+    denom = float(f_prev @ f_prev)
+    if denom <= 0.0:
+        return None
+    lam = float(f_k @ f_prev) / denom
+    if not (0.5 < lam < 0.9999):
+        return None  # not a clean, contracting slow mode -> plain step
+    boost = min(1.0 / (1.0 - lam), boost_max)
+    x_next = x_k + f_k * boost
+    if not np.all(np.isfinite(x_next)):
+        return None
+    return x_next
+
+
+# Physical convergence tolerances for the DCZ inner loop -- the solve is
+# "converged" when its REPORTED EXIT KPIs (bottom-cell residual hexane, moisture
+# and temperature) have stopped moving to within these, between consecutive
+# passes. This replaces the old per-particle-layer 1e-5 criterion, which chased
+# the near-neutral numerical mode (sub-0.01 K / sub-ppm changes that never move
+# the reported outputs) and so never tripped within a practical iteration cap.
+# These thresholds trip when the physics has actually settled (COAMO: ~cap 100).
+EXIT_TOL_T = 1.0e-2  # K, bottom-cell bulk temperature stability
+EXIT_TOL_X1 = 1.0e-4  # kg/kg dry solid, bottom-cell moisture stability
+EXIT_TOL_X2 = 1.0e-6  # kg/kg dry solid (~1 ppm), bottom-cell residual-hexane stability
 
 
 @dataclass(frozen=True)
@@ -163,6 +208,8 @@ class DCZConstants:
     luikov: thermo.LuikovParams  # subsaturated-regime sorption/desorption isotherm, see below
     water_diffusivity: float  # m2/s, water's own intraparticle diffusivity -- NOT hM, see
     # module docstring's "MOISTURE (H2O) BALANCE" section for why
+    vapor_enthalpy_ref: thermo.VaporEnthalpyRef  # hexane specific enthalpy Ĥ2 for the
+    # bed energy source SVm2·Ĥ2 (eq. A.34) -- same datum machinery zones/ftrz.py uses
 
 
 @dataclass(frozen=True)
@@ -233,6 +280,7 @@ def solve_dcz_zone(
     outer_max_iter: int = 100,
     outer_tol: float = 1.0e-5,
     outer_relaxation: float = 0.5,
+    residual_log: list[tuple[int, float, float]] | None = None,
 ) -> DCZZoneResult:
     """Solve the DCZ, `nz` axial cells top (FTRZ handoff) to bottom, via the
     Primary Internal Loop above. The particle's own initial condition at
@@ -316,10 +364,41 @@ def solve_dcz_zone(
     water_mass_rate_w_m3 = [0.0 for _ in range(nz)]
 
     iterations = 0
-    prev_wpg2_layers = [particles[j].wpg2 for j in range(nz)]
-    prev_Tp_layers = [particles[j].Tp for j in range(nz)]
+    # Previous-pass exit KPIs (bottom cell) for the physical convergence test;
+    # seeded at inf so the first pass can never trip.
+    prev_x2_exit = math.inf
+    prev_T_exit = math.inf
+    prev_x1_exit = math.inf
+
+    # Convergence acceleration of the vapor TEMPERATURE profile -- the
+    # near-neutral mode (ρ≈0.9998) lives entirely in the energy coupling
+    # (vapor_T <-> particle Tp); the hexane mass profile (vapor_wV2) already
+    # converges fast, so it is left on plain relaxed Picard. See
+    # `_dominant_mode_extrapolation`.
+    #  - `acc_start`: plain Picard first, so the fast modes decay and the
+    #    residual becomes a clean single slow mode before we extrapolate (an
+    #    early extrapolation can overshoot to a cold T where the GAB isotherm is
+    #    invalid, a_h ≥ 1/K).
+    #  - `acc_boost_max`: cap on the geometric boost 1/(1−λ).
+    #  - residual-decrease safeguard + `acc_cooldown`: if an accelerated step
+    #    grew the residual, take several plain passes before re-engaging. So the
+    #    accelerator can never do worse than base Picard.
+    #  - `[_T_lo, _T_hi]`: physical guard band; an out-of-band extrapolation is
+    #    discarded. `_reset_prev`: force a plain pass after each extrapolation so
+    #    the next λ estimate uses clean consecutive residuals.
+    acc_start = 8
+    acc_boost_max = 40.0
+    _T_lo = min(vapor_inf.T, T_L_sup) - 40.0
+    _T_hi = max(vapor_inf.T, T_L_sup) + 80.0
+    acc_f_prev: np.ndarray | None = None
+    acc_prev_res = math.inf
+    acc_cooldown = 0
 
     for iterations in range(1, outer_max_iter + 1):
+        # Accelerator iterate x_k = the vapor TEMPERATURE profile ENTERING this
+        # pass. The relaxed iteration body below is the fixed-point map H; its
+        # output h_k is captured after step 4.5 and fed to the extrapolation.
+        acc_x_k = np.array(vapor_T)
         # -- axial correction sources, lagged from the previous iteration's profile --
         Tp_bulk_profile = tuple(
             pt.volumetric_mean(particles[j].Tp, geometry.volumes) for j in range(nz)
@@ -342,18 +421,16 @@ def solve_dcz_zone(
         # cell's own wpg2 (from the previous iteration's mass cascade, step
         # 3 below) is carried through unchanged -- only Tp cascades here.
         new_particles_energy = []
-        sorption_sink_w_m3 = [0.0] * nz  # per m3 PARTICLE volume; see step 2's use
         running_Tp = initial_particle.Tp
         for j in range(nz):
             seed = pt.ParticleState(wpg2=particles[j].wpg2, Tp=running_Tp)
-            # Computed ONCE, reused for both the energy credit below (step 2)
-            # and the march's own source term -- see
-            # sorption_heat_source_per_layer_w_m3's own docstring for why
-            # this used to be computed twice (a profiled, now-fixed cost).
+            # eq. A.30 sorption/desorption heat source for the PARTICLE energy
+            # march (step 1). No longer also fed to the vapor balance -- the
+            # vapor now uses Coletto's own SVm2·Ĥ2 mass-enthalpy term (step 2),
+            # not this particle-volume sorption sink.
             sorption_sources = pt.sorption_heat_source_per_layer_w_m3(
                 seed, dwpg2_dt_prev[j], c.particle
             )
-            sorption_sink_w_m3[j] = pt.volumetric_mean(sorption_sources, geometry.volumes)
             full_sources = tuple(s + q_condL[j] for s in sorption_sources)
             updated, _ = pt.march_particle_energy(
                 seed,
@@ -384,49 +461,44 @@ def solve_dcz_zone(
         water_remaining_kg_s = (1.0 - vapor_inf.wV2) * m_vapor_kg_s
         for j in range(nz - 1, -1, -1):
             Tp12 = pt.outer_layer_value(particles[j].Tp)
+            wpg2_12 = pt.outer_layer_value(particles[j].wpg2)
             kappa_e = c.hQ * c.aV * c.alpha_L
-            # eq. A.34/A.37's SVm2*H2 and m_ax,net*H2 terms (enthalpy carried
-            # by the transferred hexane mass itself) were DROPPED in M2 Phase
-            # 3 -- literally implemented as an absolute mass-flux-times
-            # -enthalpy quantity, they produced runaway heating tens of
-            # degrees past both boundary temperatures. RESTORED here in M2
-            # Phase 4, but as a DIFFERENT (and correct) quantity than what
-            # was tried before: not `SVm2*H2` (the bed-scale *surface* mass
-            # flux), which turned out to have negligible magnitude at
-            # realistic DCZ residence times (a particle's own diffusive
-            # relaxation is far slower than one axial cell's residence time,
-            # so the surface flux badly lags the true internal desorption
-            # rate) -- but rather the particle-VOLUME-integrated sorption
-            # /desorption sink (`sorption_sink_w_m3[j]`, the same quantity
-            # step 1 just subtracted from the particle via eq. A.30's first
-            # two terms), credited back to the vapor at the SAME cell with
-            # the opposite sign. This is an EXACT, sign-consistent transfer
-            # between the two coupled energy balances -- it can only ever
-            # move energy already legitimately removed from the particle, so
-            # (unlike the earlier attempt) it cannot manufacture a runaway.
-            # Confirmed by direct instrumentation, not assumed: without this
-            # term the coupled particle<->vapor system has no floor and
-            # drifts to unboundedly low temperature over enough outer
-            # iterations (it isn't a bounded "runs a bit cooler" offset, as
-            # earlier documentation here characterized it -- eventually
-            # crashing the GAB isotherm's own validity range); with it,
-            # temperature genuinely converges to a bounded profile. See
-            # `zones/particle.py::sorption_heat_sink_volumetric_mean_w_m3`'s
-            # own docstring for the full derivation.
-            # `water_latent_w_m3[j]` is this cell's own net water sorption/
-            # desorption heat, LAGGED one outer iteration (computed in step
-            # 4.5 below from the previous pass's own converged-so-far
-            # profile) -- the SAME lag category as `q_condL`/`m_ax_net`
-            # above, not a new pattern. Plain `dH_vap_water`, not an
-            # isosteric excess: no water-specific heat-of-sorption data
-            # exists in this project's literature (the Gianini isotherm is
-            # explicitly temperature-independent, so a Clausius-Clapeyron
-            # -derived isosteric heat can't even be extracted from it) --
-            # `core/dc.py`'s own existing moisture-equilibrium mechanism
-            # already uses plain latent heat for the same reason, so this
-            # matches an established in-project precedent, not a new one.
+            # eq. A.34/A.37 vapor energy source, EXACTLY as Coletto prints it
+            # (D1, GROUNDING_MATRIX.md):
+            #   S_VQ = −a_v α_L J_QR·ř  +  SVm2·Ĥ2  +  q̇_Iv  +  ṁ'_ax·Ĥ2
+            # - `−a_v α_L J_QR` (particle<->vapor convection) is the
+            #   `kappa_e*(Tp12 − TV)` relaxation just below.
+            # - `SVm2·Ĥ2 + ṁ'_ax·Ĥ2` is the enthalpy carried by the hexane MASS
+            #   transferred into the vapor. `SVm2` is the SAME bed<->particle
+            #   hexane transfer the mass balance (step 4) uses, `hM ρV aV αL
+            #   (wpg2_12 − wV2)`; `ṁ'_ax` is the axial hexane flux `m_ax_net`;
+            #   `Ĥ2` is the hexane specific vapor enthalpy (same datum machinery
+            #   zones/ftrz.py uses, evaluated at the local vapor temperature).
+            # This REPLACES the previous non-paper `−sorption_sink·α_L`
+            # substitution, which injected the particle's FULL heat of sorption
+            # (mostly latent) into the vapor's SENSIBLE temperature balance
+            # (A.25 LHS is ρV·CPV·TV) -> the over-heating fixed point. Paired
+            # with particle.py's restored literal A.30 sign; validated as a PAIR.
+            # `water_latent_w_m3[j]` is the project's own (non-Coletto) water
+            # sorption/condensation latent term, lagged one outer iteration.
+            # Ĥ2 is the hexane's SENSIBLE vapor enthalpy relative to the local
+            # vapor temperature: the bed-scale transfer moves hexane that is
+            # ALREADY vapor (pore gas -> bulk vapor), so no phase change occurs
+            # here -- the desorption phase change lives entirely at the particle
+            # scale (A.30). It arrives at the particle-surface temperature Tp12
+            # and equilibrates into the vapor at TV, contributing only
+            # `cp_hex·(Tp12 − TV)` of sensible heat. (A.25's LHS is the SENSIBLE
+            # ρV·CPV·TV; putting the hexane's LATENT `dH_vap_hexane` here instead
+            # would inject phase-change energy into a sensible balance -- tested
+            # directly this session: it drove the DT meal to ~187 C. The latent
+            # heat is carried by the composition wV2, tracked by the mass
+            # balance A.24, not by this temperature balance.)
+            cp_hex = c.vapor_enthalpy_ref.cp_hexane_vapor
+            SVm2 = c.hM * c.rho_V * c.aV * c.alpha_L * (wpg2_12 - vapor_wV2[j])
             source = (
-                q_Iv_profile[j] - sorption_sink_w_m3[j] * c.alpha_L + water_latent_w_m3[j]
+                q_Iv_profile[j]
+                + (SVm2 + m_ax_net[j]) * cp_hex * (Tp12 - vapor_T[j])
+                + water_latent_w_m3[j]
             )
             T_in = T_running
 
@@ -546,7 +618,7 @@ def solve_dcz_zone(
         # `march_particle_mass`'s own FVM (see that module's docstring and
         # DECISIONS.md's "DCZ particle hexane mass-conservation gap" entry).
         vapor_wV2 = [
-            min(1.0, max(0.0, vapor_wV2[j] + outer_relaxation * (new_vapor_wV2[j] - vapor_wV2[j])))
+            min(1.0 - 1.0e-9, max(0.0, vapor_wV2[j] + outer_relaxation * (new_vapor_wV2[j] - vapor_wV2[j])))
             for j in range(nz)
         ]
 
@@ -619,20 +691,54 @@ def solve_dcz_zone(
             for j in range(nz)
         ]
 
-        # 5. convergence check across all cells and all particle layers
-        max_dw = max(
-            abs(particles[j].wpg2[i] - prev_wpg2_layers[j][i])
-            for j in range(nz)
-            for i in range(c.particle.Np)
+        # -- convergence acceleration of the vapor TEMPERATURE profile --
+        # h_k = H(x_k): the vapor_T the relaxed iteration body just produced.
+        # f_k = h_k − x_k is the fixed-point residual; ||f_k|| → 0 at convergence.
+        acc_h_k = np.array(vapor_T)  # h_k = H(x_k)
+        f_k = acc_h_k - acc_x_k
+        res_vap = float(np.max(np.abs(f_k)))
+        apply_acc = iterations >= acc_start and acc_cooldown == 0 and acc_f_prev is not None
+        if apply_acc and res_vap > 1.05 * acc_prev_res:
+            # Residual GREW -> the previous extrapolation overshot. Take several
+            # plain (relaxed-Picard) passes to re-settle before re-engaging.
+            acc_cooldown = acc_start
+            acc_f_prev = None
+            apply_acc = False
+        if acc_cooldown > 0:
+            acc_cooldown -= 1
+        if apply_acc:
+            x_next = _dominant_mode_extrapolation(acc_x_k, f_k, acc_f_prev, acc_boost_max)
+            if x_next is not None and all(
+                math.isfinite(t) and _T_lo <= t <= _T_hi for t in x_next
+            ):
+                vapor_T = [float(t) for t in x_next]
+                acc_f_prev = None  # force a plain pass next, for a clean λ estimate
+            else:
+                acc_f_prev = f_k
+        else:
+            acc_f_prev = f_k
+        # vapor_wV2 is ALWAYS the plain relaxed step (not accelerated -- init note).
+        acc_prev_res = res_vap
+
+        # 5. physical convergence check: the bottom cell's REPORTED exit KPIs
+        # (residual hexane X2_bulk, moisture X1, bulk temperature) stable to
+        # within their physical tolerances between passes. (`outer_tol` is
+        # retained in the signature for backward compatibility but is superseded
+        # by these KPI thresholds -- see EXIT_TOL_* and their comment.)
+        last = particles[-1]
+        x2_exit = pt.volumetric_mean(
+            tuple(_x2_so(w, t, c.particle) for w, t in zip(last.wpg2, last.Tp)),
+            geometry.volumes,
         )
-        max_dT = max(
-            abs(particles[j].Tp[i] - prev_Tp_layers[j][i])
-            for j in range(nz)
-            for i in range(c.particle.Np)
-        )
-        prev_wpg2_layers = [particles[j].wpg2 for j in range(nz)]
-        prev_Tp_layers = [particles[j].Tp for j in range(nz)]
-        if max_dw <= outer_tol and max_dT <= outer_tol:
+        T_exit = pt.volumetric_mean(last.Tp, geometry.volumes)
+        x1_exit = X1_profile[-1]
+        d_x2 = abs(x2_exit - prev_x2_exit)
+        d_T = abs(T_exit - prev_T_exit)
+        d_x1 = abs(x1_exit - prev_x1_exit)
+        prev_x2_exit, prev_T_exit, prev_x1_exit = x2_exit, T_exit, x1_exit
+        if residual_log is not None:
+            residual_log.append((iterations, d_x2, d_T))
+        if d_x2 <= EXIT_TOL_X2 and d_T <= EXIT_TOL_T and d_x1 <= EXIT_TOL_X1:
             break
 
     cells = []

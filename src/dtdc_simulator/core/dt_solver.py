@@ -416,6 +416,7 @@ def _build_dcz_domain(
         antoine_water=c.ftrz.antoine_water,
         luikov=c.luikov,
         water_diffusivity=c.water_diffusivity,
+        vapor_enthalpy_ref=c.ftrz.vapor_enthalpy_ref,
     )
     return dcz_c, tuple(profile)
 

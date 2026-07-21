@@ -62,7 +62,7 @@ model:
   # heat/mass-transfer regime than the passive Nu-Re packed-bed correlation alone predicts.
   # gain=1.0 (form: hQ *= 1 + gain*rpm^2) lands DCZ's converged temperature in its own
   # validated ~380-383 K band (vs ~390-410 K unwired/under-tuned) -- see DECISIONS.md.
-  sweep_arm_transfer_gain: 1.0   # [PLACE] hQ/hM sensitivity to sweep-arm agitation (empirically retuned)
+  sweep_arm_transfer_gain: 0.0   # D4: temporarily 0 to test pure-Coletto B.7 hQ (was 1.0 [PLACE])
   # M3a (BuildSpec §7.9): DT-role stage equilibrium targets now come from the
   # real core/dt_solver.py::solve_dt() zonal solve (PHZ/FTRZ/DCZ), re-run on
   # the periodic cadence below — no more fitted "duty saturation curve";

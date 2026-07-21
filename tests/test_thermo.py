@@ -155,12 +155,12 @@ def test_mixture_cp_per_kg_dry_solid_matches_cp_l_converted_to_dry_basis() -> No
     assert result > expected_per_kg_wet
 
 
-def test_ranz_marshall_nusselt_and_heat_transfer_coefficient() -> None:
-    # Ranz-Marshall single-sphere correlation Nu = 2 + 0.6 Re^0.5 Pr^(1/3)
-    # (Faner et al. 2019, eq. 11) -- note the +2.0 conduction floor at Re->0.
+def test_faner_b7_nusselt_and_heat_transfer_coefficient() -> None:
+    # Coletto eq. B.7 (Faner 2008), restored EXACTLY (D3, GROUNDING_MATRIX.md):
+    # Nuε = 0.6949 Reε^0.579 Pr^(1/3). No +2 conduction floor (the packed-bed
+    # regime it is used in does not reach Re->0).
     Nu = th.nu_from_reynolds(Re=70.0, Pr=1.0)
-    assert Nu == pytest.approx(2.0 + 0.6 * 70.0**0.5)
-    assert th.nu_from_reynolds(Re=0.0, Pr=1.0) == pytest.approx(2.0)  # conduction limit
+    assert Nu == pytest.approx(0.6949 * 70.0**0.579)
 
     hQ = th.hq_from_nu(Nu, r_P=1.0e-3, k_V=0.03, alpha_V=0.6, alpha_L=0.4)
     assert hQ > 0.0

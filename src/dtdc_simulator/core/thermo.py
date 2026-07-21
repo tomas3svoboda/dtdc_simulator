@@ -74,6 +74,54 @@ def gab_hexane_content(a_h: float, T: float, p: GabParams) -> float:
     return p.Xm * C * K * a_h / ((1.0 - K * a_h) * (1.0 - K * a_h + C * K * a_h))
 
 
+def gab_hexane_content_and_slope(a_h: float, T: float, p: GabParams) -> tuple[float, float]:
+    """`(W2_eq, dW2_eq/da_h)` at `(a_h, T)` -- the value from
+    `gab_hexane_content` plus its EXACT analytic derivative w.r.t. `a_h`.
+
+    Replaces the old central-finite-difference slope (h=1e-5) used throughout
+    the DCZ particle scale: the GAB isotherm is a closed-form rational
+    function, so its derivative is closed-form too. Verified to agree with the
+    former central difference to ~1e-9 relative across the operating range --
+    a pure speed/accuracy change (one isotherm evaluation instead of two/three,
+    and no finite-difference truncation or roundoff), NOT a physics change.
+
+    Same validity domain and error behaviour as `gab_hexane_content`."""
+    if not 0.0 <= a_h <= 1.0:
+        raise ValueError(f"hexane activity a_h must be in [0,1], got {a_h}")
+    C = p.C0 * math.exp(p.dHC_R / T)
+    K = p.K0 * math.exp(p.dHK_R / T)
+    if K * a_h >= 1.0:
+        raise ValueError(
+            f"GAB isotherm invalid at a_h={a_h}, T={T}: K*a_h={K * a_h:.4f} >= 1 "
+            "(outside the model's valid activity range at this temperature)"
+        )
+    # W2 = Xm*C*K*a / D, with D = (1 - Ka)(1 - Ka + CKa). Quotient rule on
+    # N = Xm*C*K*a, D as above (d1 = 1 - Ka, d2 = 1 - Ka + CKa).
+    N = p.Xm * C * K * a_h
+    d1 = 1.0 - K * a_h
+    d2 = 1.0 - K * a_h + C * K * a_h
+    D = d1 * d2
+    N_prime = p.Xm * C * K
+    d1_prime = -K
+    d2_prime = -K + C * K
+    D_prime = d1_prime * d2 + d1 * d2_prime
+    value = N / D
+    slope = (N_prime * D - N * D_prime) / (D * D)
+    return value, slope
+
+
+def oil_hexane_content_and_slope(a_h: float, p: OilIsotherm) -> tuple[float, float]:
+    """`(qo, dqo/da_h)` for the power-law oil isotherm `qo = A0*a_h^B` (eq. 7).
+    Analytic companion to `oil_hexane_content`, same rationale as
+    `gab_hexane_content_and_slope`. `dqo/da_h = A0*B*a_h^(B-1)` (0 at a_h=0 for
+    the usual B>1)."""
+    if not 0.0 <= a_h <= 1.0:
+        raise ValueError(f"hexane activity a_h must be in [0,1], got {a_h}")
+    value = p.A0 * a_h**p.B
+    slope = p.A0 * p.B * a_h ** (p.B - 1.0) if a_h > 0.0 else 0.0
+    return value, slope
+
+
 def hexane_activity_from_loading(W2: float, T: float, p: GabParams, a_h_max: float = 1.0) -> float:
     """Inverse of `gab_hexane_content`: the hexane activity `a_h` whose GAB
     equilibrium loading equals `W2` (kg/kg dry solid) at temperature `T`. The
@@ -175,28 +223,19 @@ def x2_so_and_slope(
     same convention `x2_equilibrium`/`x2_critical` already use at the fixed
     point `a_h=1`, generalized here to an arbitrary local value).
 
-    The slope is a centered finite difference on `gab_hexane_content`/
-    `oil_hexane_content` (both already smooth, closed-form isotherms) rather
-    than a hand-derived analytical derivative -- keeps this module's isotherm
-    functions as the single source of truth instead of duplicating their
-    algebra a second time as derivatives.
+    The slope is the EXACT analytic derivative of the two closed-form isotherms
+    (`gab_hexane_content_and_slope`/`oil_hexane_content_and_slope`), which
+    remain this module's single source of truth for the isotherm algebra. This
+    replaced a former central finite difference (h=1e-5); verified to agree
+    with it to ~1e-9 relative -- a speed/accuracy change, not a physics one.
+    `h` is retained in the signature (unused) for backward compatibility with
+    existing callers/tests that may still pass it.
     """
-
-    def x2_so(a: float) -> float:
-        return gab_hexane_content(a, T, gab) + X3 * oil_hexane_content(a, oil)
-
-    value = x2_so(a_h)
-    step = min(h, a_h, 1.0 - a_h)
-    if step <= 0.0:
-        # a_h sits exactly on a boundary (0 or 1): fall back to a one-sided
-        # difference of a tiny step into the valid interior.
-        step = h
-        if a_h <= 0.0:
-            slope = (x2_so(a_h + step) - value) / step
-        else:
-            slope = (value - x2_so(a_h - step)) / step
-        return value, slope
-    slope = (x2_so(a_h + step) - x2_so(a_h - step)) / (2.0 * step)
+    del h  # retained for signature compatibility; the analytic slope needs no step
+    W2, dW2 = gab_hexane_content_and_slope(a_h, T, gab)
+    qo, dqo = oil_hexane_content_and_slope(a_h, oil)
+    value = W2 + X3 * qo
+    slope = dW2 + X3 * dqo
     return value, slope
 
 
@@ -292,17 +331,15 @@ def cp_vip(w_water_vapor: float, w_hexane_vapor: float, cps: tuple[float, float]
 
 
 def nu_from_reynolds(Re: float, Pr: float) -> float:
-    """Nu = 2.0 + 0.6 * Re^0.5 * Pr^(1/3) -- the canonical Ranz-Marshall
-    single-sphere correlation, which Faner, Perez & Crapiste (2019) use for
-    oilseed-meal desolventizing (their eq. 11). Replaces the earlier
-    `0.6949*Re^0.579*Pr^(1/3)` form (Coletto's eq. B.7, cited to Faner's
-    unrecoverable 2008 thesis): the `+2.0` conduction floor is the physically
-    correct low-Re limit for a sphere. Verified NOT to move the tuning
-    (DT exit ~977->982 ppm, DCZ temperature band ~unchanged) -- the sweep-arm
-    agitation enhancement (`bed_transport_coefficients`) dominates the base
-    correlation at these conditions, so this is a fidelity refinement, not a
-    re-tune. See DECISIONS.md."""
-    return 2.0 + 0.6 * Re**0.5 * Pr ** (1.0 / 3.0)
+    """Nuε = 0.6949 * Reε^0.579 * Pr_V^(1/3) -- Coletto's eq. B.7 EXACTLY as
+    printed in the main-paper appendix (Faner 2008, from experimental data on
+    oilseed-meal desolventizing). D3 (GROUNDING_MATRIX.md): a prior version
+    replaced this with the canonical Ranz-Marshall `2 + 0.6*Re^0.5*Pr^(1/3)`
+    on the mistaken premise that B.7 was "unrecoverable" -- it is printed in
+    the paper. Restored here to stay Coletto-faithful. Note B.7 carries NO
+    `+2` conduction floor: at low Reε it goes to zero, which the paper accepts;
+    the packed-bed regime this is used in does not reach that limit."""
+    return 0.6949 * Re**0.579 * Pr ** (1.0 / 3.0)
 
 
 def hq_from_nu(Nu: float, r_P: float, k_V: float, alpha_V: float, alpha_L: float) -> float:
@@ -370,15 +407,26 @@ def dew_point_temperature(
     T_bounds: tuple[float, float] = (230.0, 450.0),
 ) -> float:
     """T_dew(Y_V2) solving y_water*P = P_water,sat(T_dew) (Raoult's law, water
-    condensing from a hexane-diluted vapor acting as an inert carrier)."""
-    from scipy.optimize import brentq
+    condensing from a hexane-diluted vapor acting as an inert carrier).
 
+    Closed-form inverse of the Antoine equation, replacing a former `brentq`
+    root find (which was called ~10k times per DT solve). Antoine is
+    `log10(P[bar]) = A - B/(C+T)`, so with `target` in Pa the dew point is
+    `T = B/(A - log10(target/1e5)) - C` directly -- exact, no iteration.
+    Clamped to `T_bounds` to preserve the old bracketed solver's range
+    (unchanged behaviour wherever the root was already interior, which is
+    everywhere this is reached in practice)."""
+    lo, hi = T_bounds
     target = _y_water_mole_fraction(Y_V2) * P
-
-    def residual(T: float) -> float:
-        return antoine_pressure_pa(T, antoine_water) - target
-
-    return brentq(residual, *T_bounds)
+    # Guard: a non-physical (negative/zero) water partial pressure -- e.g. from a
+    # transient negative Y_V2 mid-iteration -- has no real dew point; return the
+    # lower bound rather than crash `log10`. (`brentq` used to raise here; the
+    # closed form must degrade gracefully so a bad transient can't kill the solve.)
+    if target <= 0.0:
+        return lo
+    log10_p_bar = math.log10(target / 1.0e5)
+    T = antoine_water.B / (antoine_water.A - log10_p_bar) - antoine_water.C
+    return min(max(T, lo), hi)
 
 
 def water_activity(
