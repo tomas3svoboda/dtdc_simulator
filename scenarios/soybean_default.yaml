@@ -92,7 +92,11 @@ model:
   # itself was ALSO fixed this session (core/dt_solver.py): it now reports the
   # binary hexane-water dew point of the vent vapor, not the top-tray SOLID temp
   # (which read the ~59 C feed temperature -- below the physical azeotrope floor).
-  dt_vapor_feed_water_kg_s: 3.3   # kg/s  [PLACE, trimmed for a lean-steam ~72 C dome]
+  dt_vapor_feed_water_kg_s: 0.15  # kg/s  [PLACE] small makeup/purge vent; the meal's moisture water
+                                  # now comes from the calibrated 3.9 kg/s sparge, so the vent only
+                                  # sets the dome: trimmed to keep the dome hexane-rich (~89 wt%) and
+                                  # ~73 C. (Was 3.3 when the under-set sparge left the vent supplying
+                                  # the moisture -- that flooded the dome to 90 C / 68 wt% hexane.)
   dt_vapor_feed_hex_kg_s: 0.0005  # kg/s  [PLACE]
   dt_vapor_feed_T: 371.0          # K     [PLACE]
   # DC residual-hexane desorption -- mechanistic (core/dc.py::desorb_hexane): removal rate =
@@ -120,6 +124,11 @@ model:
   # throttled ~144 C value both condenses correctly (giving realistic exit moisture) and keeps the
   # dome vapor in its 70-75 C optimum. See DECISIONS / the model-constant tuning this session.
   direct_steam_pressure_barg: 3.0 # bar g, sparge steam AT THE MEAL (throttled from the 6.9 barG header)
+  # Lower-DT (FTRZ<->DCZ sparge) pressure above the ~atmospheric dome, from the sparge-tray
+  # aperture drop (Kemper 2019, 0.35-0.70 kg/cm2 ~= 0.34-0.69 bar). Raises the water saturation
+  # temperature to ~111 C so the WET meal in the toasting zone is pinned there (evaporative
+  # pinning) at a_w~0.8 holding ~19% moisture, instead of superheating to 123 C and over-drying.
+  dt_pressure_drop_barg: 0.5      # bar g, sparge-tray pressure drop (Kemper) -> DCZ T_sat ~111 C
   steam_supply_pressure_barg: 6.9 # bar g, steam header ~170 C saturated (SCADA "PARA") -- HMI readout only
   # DT solve convergence tuning (M3a follow-up, "A2") -- deliberately looser
   # than solve_dt()'s own validation-run defaults (outer_tol=1e-5, both
@@ -153,8 +162,13 @@ operating_defaults:
     PD2: 2.5e6
     MN1: 2.0e6
     SP1: 4.0e5
-  direct_steam:               # kg/s sparge steam  [PLACE]
-    SP1: 1.05
+  direct_steam:               # kg/s sparge steam -> ~110 kg/t_raw (Kemper/Svoboda industrial target)
+    # 3.9 kg/s puts the sparge at its realistic industrial rate (~110 kg/t_raw). Below ~2 kg/s the
+    # sparge is too weak/cool: the abundant vent steam supersaturates the bottom, the DCZ condenses
+    # low instead of the cold FTRZ condensing high, and the meal over-wets (the old 1.05 setpoint was
+    # a pre-evaporative-pinning tuning artifact). At >=2 kg/s the meal equilibrates to ~19% wb via the
+    # isotherm and the excess steam correctly leaves at the dome.
+    SP1: 3.9
   sweep_arm_speed:            # rpm  [PLACE] central-shaft sweep/rake arms (NOT agitation)
     PD1: 3.0
     PD2: 3.0

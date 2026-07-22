@@ -214,6 +214,15 @@ class ModelParams(BaseModel):
     direct_steam_pressure_barg: float = Field(
         gt=0, description="bar gauge, sparge/direct steam supply pressure -- see comment above"
     )
+    # DT internal operating pressure elevation of the LOWER DT (FTRZ + DCZ) above the
+    # ~atmospheric dome, from the sparge-tray aperture pressure drop (Kemper 2019:
+    # 0.35-0.70 kg/cm2 ~= 0.34-0.69 barg). This raises the water saturation temperature
+    # to ~108-115 C so live steam condenses onto the 68-108 C meal (17-21% moisture) and
+    # the sparge stays near-saturated (a_w -> 1). 0 keeps the whole DT at atmospheric.
+    dt_pressure_drop_barg: float = Field(
+        ge=0, default=0.0, description="bar gauge, lower-DT pressure above the dome (Kemper sparge drop). "
+        "0 = atmospheric (default until the FTRZ V-SAT enthalpy datum is made pressure-consistent; see builder)."
+    )
     # Steam SUPPLY-header conditions for the HMI readout (the "PARA" header on the
     # plant SCADA: ~6.9 barG / ~170 C saturated), shown for BOTH the jacket
     # (indirect) and sparge (direct) steam. Display-only -- the physics BCs use

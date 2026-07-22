@@ -3,6 +3,82 @@
 Log of `DECIDE` choices made while building the DTDC simulator, per
 `Specifications/DTDC_Simulator_BuildSpec.md`. Newest entries at the top.
 
+## DT moisture: evaporative-pinning water model + binary-VLE floor + calibration (2026-07-22)
+
+**Trigger.** After the Coletto-faithful DCZ rework, the DT still would not raise the meal
+moisture: the FTRZ condensed ~zero water and the DCZ *dried* the meal to ~8 %wb (vs the
+16-21 % industrial target). Root cause (confirmed by dumping the FTRZ cells): the water
+condensation was keyed to the **bulk vapor** temperature (superheated, ~106-120 °C, above its
+dew point → never condenses), while the physical mechanism is film condensation onto the
+**cold meal surface** (68-108 °C, far below the vapor dew point — A&G / Kemper / Paraíso;
+Gianini 2006 measured 19 %wb at a_w=0.799 sampled straight from a real DT outlet).
+
+**Surface-sorption water model, keyed to the SOLID surface (`zones/ftrz.py`, `zones/dcz.py`).**
+Both zones now equilibrate the meal toward its own sorption isotherm `Xe(a_w)` with `a_w`
+evaluated at the **solid-surface** temperature, not the bulk vapor. In the FTRZ the surface is
+as cold as `T_boil_hexane`, so the cool descending meal condenses steam toward `Xe(0.799)` =
+19 %wb — the moisture-raising the DT exists to do. This is an ADDITION beyond Coletto
+(hexane-only DT); it reuses the existing Luikov/GAB isotherms and `hM`/`aV`.
+
+**Evaporative pinning (extends eq. A.17 for water).** A WET meal surface cannot superheat past
+the water saturation temperature at the local pressure — condensing/evaporating water pins it
+there until it dries out. Eq. A.17 drives `T_L → T_V` once the hexane core is gone (`w_h → 0`),
+but that is the hexane-only closure; with water present the surface sits at
+`min(A.17 temp, T_sat,water)`. This both holds the cool FTRZ near ~100 °C (so `a_w` stays near
+1, clamped to the isotherm's validated 0.799) AND caps the DCZ toasting zone at the sparge
+`T_sat` (~112 °C) instead of the 123 °C runaway that was drying the meal back out. The latent
+heat absorbing the excess is the wet meal's own phase-change buffer (documented simplification,
+same category as the FTRZ's algebraic `T_L`).
+
+**Calibration.** The over-wetting first seen (29 %wb, with ~2.8 kg/s water conjured from
+nothing) was NOT the pinning — the scenario ran the sparge at **1.05 kg/s (≈30 kg/t_raw), a
+quarter of the industrial rate**. That cool, weak sparge let the abundant vent steam
+supersaturate the bottom so the DCZ condensed everything low. At the realistic **3.9 kg/s
+(≈110 kg/t, the Kemper/Svoboda target)** the DT lands on target and conserves. Retuned:
+`direct_steam=3.9`, `dt_vapor_feed_water=0.15` (the vent is now a small dome-setting purge, not
+the moisture source), `dt_pressure_drop_barg=0.5` (sparge `T_sat` ~111 °C). Scorecard went
+**4/6 FAIL → 9 PASS / 1 warn / 1 FAIL**: meal 18.99 %wb, 111.7 °C, 195 ppm; dome 88.5 wt%
+hexane / 75 °C; direct steam 110 kg/t — all in band. (Remaining fail: DC over-drying, separate.)
+
+**DCZ double-draw fix (mass conservation).** The DCZ walked the solid top→bottom but the vapor
+rises bottom→top, so a top isotherm cell could adsorb against the FULL water budget before a
+bottom condensed cell debited it — both branches drawing the same water, letting the meal gain
+more than the steam supplied (the ~29 %wb / dome-water-→-0 pathology). Fixed by PRE-counting the
+zone's whole condensation into the shared budget. **No-op at the calibrated point** (the sparge
+is strong enough that the meal reaches 19 % via the isotherm alone); binds only when under-set.
+
+**Binary-VLE water-saturation floor (`zones/ftrz.py`).** Answering the direct question "do we
+integrate binary VLE?": we had the binary *dew-point* for the dome temperature (`_binary_dew_T`)
+but the vapor *composition* was set purely by the condensation mass balance — nothing stopped it
+stripping the water to 0 % and emitting pure hexane. Added a floor: while liquid water is on the
+cold surface, the vapor stays in equilibrium with it, so its water partial pressure can't fall
+below the meal's own `a_w·p_sat,water(T_surface)` (Luikov `a_w`, hexane side already had
+`x2_equilibrium`). Water and hexane therefore always coexist. **Slack at realistic operation**
+(the meal's `Xe` limit stops the sorption while the vapor is still well above saturation), so it
+is a correct backstop, not a behaviour change; `y_w` and the floor are clamped against the
+`p_sat→P` transient.
+
+**Robustness guards.** (1) `thermo.gab_hexane_content[_and_slope]` now clamps `K·a_h` at its
+0.999 divergence boundary instead of raising — a cold off-design transient could drive the pore
+gas to hexane saturation where `K>1`. (2) The DCZ particle-energy march clamps `Tp` to a physical
+250-480 K band. Both **only engage off-design** (never at a calibrated operating point) and turn
+a crash into graceful degradation.
+
+**STOPGAP — sparge minimum input guard (`engine/facade.py`, flag for later).**
+`MV_LIMITS["direct_steam"]` lower bound raised 0 → 3.0 kg/s. Below ~3 kg/s (~85 kg/t, already
+under the industrial band) the coupled water-sorption↔energy iteration does **not converge** —
+the meal over-condenses, dome vapor water strips toward 0 %, and the solve returns
+`converged=False`. This min keeps the LIVE sim inside the reliable envelope but is **NOT a real
+fix**: the proper fix is to make the DCZ off-design iteration converge (proven this session that
+decoupling the water-latent feedback alone is insufficient — other divergence sources remain),
+after which the bound can drop back to 0. Flagged explicitly so it is not mistaken for physics.
+
+**Tests.** 137 pass (was 135 + 2 xfail). The two xfails the rework anticipated now PASS and were
+un-xfailed: `test_hexane_decreases_monotonically_across_the_whole_dt` and — the headline one —
+`test_direct_steam_does_not_invert_sparge_moisture` (more sparge steam now correctly RAISES
+moisture). `test_balance.py::test_dcz_solid_water_gain_...` relaxed from a strict one-sided
+`gain ≥ condensed` to allow the isotherm's small (<2 %) conservative desorption pullback.
+
 ## DC hexane coefficient anchored to real plant data (EPA AP-42) + Naiha diffusion physics (2026-07-19)
 
 **Trigger.** `dc_hexane_mtc` was the last hand-tuned `[PLACE]` number. The user supplied two papers

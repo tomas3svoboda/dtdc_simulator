@@ -55,6 +55,24 @@ class OilIsotherm:
     B: float
 
 
+_GAB_MAX_KA = 0.999
+"""Largest `K*a_h` the GAB multilayer term is evaluated at before its `(1 - K*a_h)`
+denominator diverges. In normal DT operation `K*a_h` stays well below 1; this bound
+only engages for a cold OFF-DESIGN transient (e.g. a weak/under-set sparge driving the
+pore gas to hexane saturation, `a_h -> 1`, where `K > 1`)."""
+
+
+def _gab_clamp_activity(a_h: float, K: float) -> float:
+    """Clamp `a_h` so `K*a_h <= _GAB_MAX_KA`, keeping the GAB isotherm finite at its own
+    divergence boundary. Graceful degradation (return the value at the largest valid
+    activity) rather than raising -- a robustness guard for off-design/transient inputs,
+    NOT a physics change: at every calibrated operating point `K*a_h` is far from 1, so
+    this never engages there."""
+    if K > 0.0 and K * a_h > _GAB_MAX_KA:
+        return _GAB_MAX_KA / K
+    return a_h
+
+
 def gab_hexane_content(a_h: float, T: float, p: GabParams) -> float:
     """W2_eq(a_h, T) — hexane adsorbed on the particle solid phase, kg/kg dry
     solid (Cardarelli & Crapiste 1996, eq. [2], with C/K per eqs. [3]-[4]).
@@ -66,11 +84,7 @@ def gab_hexane_content(a_h: float, T: float, p: GabParams) -> float:
         raise ValueError(f"hexane activity a_h must be in [0,1], got {a_h}")
     C = p.C0 * math.exp(p.dHC_R / T)
     K = p.K0 * math.exp(p.dHK_R / T)
-    if K * a_h >= 1.0:
-        raise ValueError(
-            f"GAB isotherm invalid at a_h={a_h}, T={T}: K*a_h={K * a_h:.4f} >= 1 "
-            "(outside the model's valid activity range at this temperature)"
-        )
+    a_h = _gab_clamp_activity(a_h, K)
     return p.Xm * C * K * a_h / ((1.0 - K * a_h) * (1.0 - K * a_h + C * K * a_h))
 
 
@@ -90,11 +104,7 @@ def gab_hexane_content_and_slope(a_h: float, T: float, p: GabParams) -> tuple[fl
         raise ValueError(f"hexane activity a_h must be in [0,1], got {a_h}")
     C = p.C0 * math.exp(p.dHC_R / T)
     K = p.K0 * math.exp(p.dHK_R / T)
-    if K * a_h >= 1.0:
-        raise ValueError(
-            f"GAB isotherm invalid at a_h={a_h}, T={T}: K*a_h={K * a_h:.4f} >= 1 "
-            "(outside the model's valid activity range at this temperature)"
-        )
+    a_h = _gab_clamp_activity(a_h, K)
     # W2 = Xm*C*K*a / D, with D = (1 - Ka)(1 - Ka + CKa). Quotient rule on
     # N = Xm*C*K*a, D as above (d1 = 1 - Ka, d2 = 1 - Ka + CKa).
     N = p.Xm * C * K * a_h

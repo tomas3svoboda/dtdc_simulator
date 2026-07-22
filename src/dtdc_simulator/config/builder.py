@@ -71,6 +71,9 @@ def _build_dt_solver_constants(
     hexane-dominated), `rho_pg<-rho_vapor_ref`."""
     gab = _thermo_gab(physical.gab_params)
     oil = _thermo_oil(physical.oil_isotherm)
+    # Lower-DT operating pressure (FTRZ + DCZ water calcs): dome ~atmospheric +
+    # the sparge-tray pressure drop (Kemper 2019). See ModelParams.dt_pressure_drop_barg.
+    dt_pressure_pa = (_ATM_PRESSURE_BAR + model.dt_pressure_drop_barg) * 1.0e5
 
     phz_c = phz.PHZConstants(
         T_boil_hexane=physical.T_boil_hexane,
@@ -104,6 +107,13 @@ def _build_dt_solver_constants(
         X3=physical.oil_fraction,
         bed_porosity=physical.bed_porosity,
         x2_critical_empirical=physical.x2_critical,
+        luikov=_thermo_luikov(physical.water_luikov),
+        cp_solid=physical.cp_solid,
+        # FTRZ left at atmospheric for now: its V-SAT condensation is an
+        # ENTHALPY balance referenced to water's atmospheric bp (T_boil_water),
+        # so an elevated dew point needs a matching datum shift -- a separate,
+        # deeper change. The DCZ (temperature-based, no such datum) gets the
+        # elevated pressure first (DTSolverConstants.pressure_pa below).
     )
     particle_c = pt.ParticleConstants(
         D_eff=model.D_eff,
@@ -144,6 +154,7 @@ def _build_dt_solver_constants(
         luikov=_thermo_luikov(physical.water_luikov),
         water_diffusivity=physical.water_diffusivity,
         antoine_hexane=_thermo_antoine(physical.antoine_hexane),
+        pressure_pa=dt_pressure_pa,
     )
 
 

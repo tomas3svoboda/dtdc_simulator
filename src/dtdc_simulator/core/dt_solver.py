@@ -183,6 +183,10 @@ class DTSolverConstants:
     # convective coefficient, is the right basis)
     antoine_hexane: thermo.AntoineParams  # hexane saturation pressure -- for the DT dome/vapor
     # temperature (binary hexane-water dew point of the exiting vapor, see the axial-profile build)
+    pressure_pa: float = thermo.ATM_PRESSURE_PA  # lower-DT internal operating pressure for the
+    # water dew-point / activity calc (FTRZ + DCZ). Above atmospheric per the sparge-tray
+    # pressure drop (Kemper 2019, 0.35-0.70 kg/cm2). The DOME stays at atmospheric (its own
+    # binary dew point, `_binary_dew_T`, is unchanged). Default atmospheric.
 
     @property
     def k_V(self) -> float:
@@ -417,6 +421,7 @@ def _build_dcz_domain(
         luikov=c.luikov,
         water_diffusivity=c.water_diffusivity,
         vapor_enthalpy_ref=c.ftrz.vapor_enthalpy_ref,
+        pressure_pa=c.pressure_pa,
     )
     return dcz_c, tuple(profile)
 
@@ -604,6 +609,7 @@ def solve_dt(
             aV_m2_per_m3=aV,
             diameter_m=diameter_m,
             c=c.ftrz,
+            X1_sup=solid_feed.X1,
         )
 
         if L_FTRZ_m is None:

@@ -23,7 +23,14 @@ DT_SCHEMA_ROLES = {SchemaStageRole.PREDESOLV, SchemaStageRole.MAIN, SchemaStageR
 MV_LIMITS: dict[str, tuple[float, float, float | None]] = {
     "feed_flow_rate": (0.0, 100.0, None),
     "indirect_steam": (0.0, 3.0e6, None),
-    "direct_steam": (0.0, 5.0, None),
+    # STOPGAP LOWER BOUND (flag for later, DECISIONS.md): a sparge below ~3 kg/s (~85 kg/t_raw,
+    # already under the ~110-116 kg/t industrial band) drives the DCZ into a regime the coupled
+    # water-sorption<->energy iteration does not converge in -- the meal over-condenses, the dome
+    # vapor water is stripped toward 0% (non-physical), and the solve returns converged=False.
+    # This min keeps the LIVE sim inside the reliable envelope; it is NOT a real fix. The real fix
+    # is to make the DCZ off-design iteration converge (decoupling the water-latent feedback alone
+    # was proven insufficient -- there are other divergence sources), after which this can drop to 0.
+    "direct_steam": (3.0, 5.0, None),
     "sweep_arm_speed": (0.0, 10.0, None),
     "gate_opening": (0.0, 100.0, None),
     "heated_air_temp": (280.0, 450.0, None),

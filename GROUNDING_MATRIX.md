@@ -47,6 +47,7 @@ acceleration or constant recalibration.** D2/D3/D4 are entangled with it.
 |---|---|---|---|---|
 | `gab_hexane_content` | GAB W2(a_h,T) | Cardarelli & Crapiste 1996 (have PDF) | ✅ PAPER (form) | GAB rational form correct; params (Xm,C0,dHC_R,K0,dHK_R) — verify values vs 1996 paper |
 | `gab_hexane_content_and_slope` | analytic dW2/da_h | — | ✅ (exact derivative) | Our own analytic derivative; matches FD to 1e-9 (speedup work) |
+| `_gab_clamp_activity` | `K·a_h ≤ 0.999` divergence guard | — | 🔵 GUARD (2026-07-22) | clamps at the GAB multilayer divergence instead of raising; engages only for a cold off-design transient, never at a calibrated point |
 | `oil_hexane_content` | `qo = A0·a_h^B` (eq. 7) | Cardarelli & Crapiste 1996 | ✅ PAPER | **A0=0.9635, B=2.7036 given in supplementary Table 1** — verify code/config match |
 | `heat_of_sorption` | `ΔH_s = ΔH_lv2 + C0·W2^C1` (eq. A.31) | Coletto A.31 | ✅ PAPER (form) | C0,C1 **not** in supp Table 1 → 🟡 PLACE (Cardarelli 1998 / Faner 2008 theses) |
 | `x2_critical` | eq. 4 `(α_pg ρ_hexL)/(α_ps ρ_ps)` | Coletto eq. 4 | ✅ PAPER | but default overridden by empirical Faner-2019 X_c≈0.20 → ⚠️ DEVIATION (documented choice) |
@@ -86,6 +87,9 @@ acceleration or constant recalibration.** D2/D3/D4 are entangled with it.
 | V-SCAL T-evolution mixing | — | — | ⚠️ | no explicit paper formula; documented construction |
 | `cell_thickness_m` (eq. A.18) `J_Q,cs` units | eq. A.18–A.20 | Coletto | ⚠️ DEVIATION (units) | documented "not a verified-exact transcription" |
 | `x2_critical_empirical` | Faner 2019 X_c≈0.20 | Faner 2019 (have PDF) | ⚠️ choice | overrides eq. 4 (documented) |
+| water surface sorption `Xe(a_w(T_L))` | — | Gianini 2006 + A&G/Kemper | ➕ ADDITION (2026-07-22) | condensation keyed to the SOLID surface (not bulk vapor); the DT moisture rise, absent from Coletto's hexane-only DT |
+| evaporative pinning `T_L=min(A.17, T_dew)` | extends eq. A.17 for water | A&G/Kemper/Paraíso | ➕ ADDITION (2026-07-22) | a wet surface can't superheat past `T_sat,water`; A.17 is the hexane-only closure |
+| binary-VLE water floor `p_w ≥ a_w·p_sat` | Raoult (immiscible) + Luikov `a_w` | standard + Gianini | ➕ ADDITION (2026-07-22) | vapor never pure-hexane; SLACK at design (Xe limits first), clamped vs `p_sat→P` |
 
 ## 5. DCZ particle scale — `particle.py`
 
@@ -108,6 +112,9 @@ acceleration or constant recalibration.** D2/D3/D4 are entangled with it.
 | axial dispersion/conduction (Laplacian, lagged) | eq. A.32/A.36 | Coletto | ✅ PAPER (structure) | 1-iter lag is a documented Picard choice |
 | water condensation + Luikov sorption branch | — | Gianini + ours | ➕ ADDITION | not in Coletto (hexane-only DCZ); for direct steam |
 | `kappa_w = 15 D_water/r_P²` (LDF) | Glueckauf LDF | standard | 🔵 DERIVED | water intraparticle rate |
+| evaporative pinning (cap T at `T_sat` while wet) | extends A.25 for water | A&G/Kemper | ➕ ADDITION (2026-07-22) | holds toasting meal ~112 °C / 19 %wb instead of a 123 °C runaway that dried it out |
+| water-budget pre-count (double-draw fix) | mass conservation | — | ➕ ADDITION (2026-07-22) | shares one condensation+adsorption budget so the meal can't gain more water than the vapor supplies; no-op at the calibrated point |
+| particle-`Tp` clamp 250–480 K | robustness | — | 🔵 GUARD (2026-07-22) | off-design only; graceful degradation, never engages at a calibrated point |
 
 ## 7. Dryer–Cooler — `dc.py`
 

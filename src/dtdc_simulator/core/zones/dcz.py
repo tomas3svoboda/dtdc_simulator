@@ -145,6 +145,23 @@ import numpy as np
 from dtdc_simulator.core import thermo
 from dtdc_simulator.core.zones import particle as pt
 
+# Free-water floor for the evaporative-pinning cap (see solve_dcz_zone step 2): above
+# this moisture the meal holds free/loosely-bound water that flashes off to pin its
+# temperature at the water saturation point; below it the meal is effectively dry and
+# the toasting vapor superheats normally. ~2x the GAB monolayer (Xm~0.05-0.08), the
+# capillary/free-water threshold. A magnitude, not a sharp physical constant.
+_WET_PIN_FLOOR = 0.12
+
+# Physical bounds for the particle temperature (K), a robustness clamp on the coupled
+# water-sorption <-> energy march (see solve_dcz_zone step 1). The DT operates entirely
+# within ~ -20..205 C; at every realistic operating point the particle sits far inside
+# this band, so the clamp only engages for a deeply off-design iterate (e.g. an under-set
+# sparge far below the ~110 kg/t design rate) where the lagged latent-heat feedback would
+# otherwise run the temperature away toward 0 K / overflow. Bounding keeps the iterate
+# finite so it degrades to a converged-but-imperfect result instead of crashing.
+_TP_MIN_K = 250.0
+_TP_MAX_K = 480.0
+
 
 def _dominant_mode_extrapolation(
     x_k: "np.ndarray", f_k: "np.ndarray", f_prev: "np.ndarray", boost_max: float
@@ -210,6 +227,10 @@ class DCZConstants:
     # module docstring's "MOISTURE (H2O) BALANCE" section for why
     vapor_enthalpy_ref: thermo.VaporEnthalpyRef  # hexane specific enthalpy Ĥ2 for the
     # bed energy source SVm2·Ĥ2 (eq. A.34) -- same datum machinery zones/ftrz.py uses
+    pressure_pa: float = thermo.ATM_PRESSURE_PA  # DT internal operating pressure for the
+    # water dew-point / activity calc: the lower DT runs above atmospheric (sparge-tray
+    # pressure drop 0.35-0.70 kg/cm2, Kemper 2019), which raises a_w = y_water*P/P_sat(T)
+    # toward 1 so the near-saturated-steam meal ADSORBS water instead of drying. See ftrz.py.
 
 
 @dataclass(frozen=True)
@@ -351,6 +372,13 @@ def solve_dcz_zone(
     # dominates enough here that the convective term's own contribution is negligible by
     # comparison) -- a leaner, still real-data-grounded fix.
     X1_profile = [X1_in for _ in range(nz)]  # solid moisture, top (j=0) to bottom (j=nz-1)
+    # Water saturation temperature at the local (elevated, sparge) pressure -- the ceiling a
+    # WET meal surface can reach: free/loosely-bound water flashes off (evaporative pinning)
+    # rather than letting the meal superheat past it. Used both to cap the surface temperature
+    # at which the moisture equilibrium a_w is evaluated (step 4.5) and to pin the bed
+    # temperature while the meal stays wet (step 2). A wet meal in near-saturated steam sits at
+    # saturation, NOT at the superheated toasting-vapor bulk temperature. (Y_V2=0 -> pure water.)
+    T_sat_water = thermo.dew_point_temperature(0.0, c.antoine_water, P=c.pressure_pa)
     water_latent_w_m3 = [0.0 for _ in range(nz)]  # lagged one iteration, "cold start" zeros
     # Water REMOVED from (adsorption, >0) or ADDED to (desorption, <0) the vapor phase by the
     # isotherm relaxation below, kg/(s*m3), same lag category as `water_latent_w_m3` -- without
@@ -442,6 +470,17 @@ def solve_dcz_zone(
                 c.particle,
                 X1=X1_profile[j],  # lagged one outer iteration, same category as dwpg2_dt_prev
             )
+            # Robustness clamp to a physical DT temperature band (see _TP_MIN_K/_TP_MAX_K):
+            # keeps the coupled sorption<->energy iterate finite at deeply off-design inputs
+            # so it degrades gracefully instead of running away to overflow. Never engages
+            # at realistic operating points.
+            if updated.Tp[0] < _TP_MIN_K or updated.Tp[-1] > _TP_MAX_K or any(
+                t < _TP_MIN_K or t > _TP_MAX_K for t in updated.Tp
+            ):
+                updated = pt.ParticleState(
+                    wpg2=updated.wpg2,
+                    Tp=tuple(min(max(t, _TP_MIN_K), _TP_MAX_K) for t in updated.Tp),
+                )
             new_particles_energy.append(updated)
             running_Tp = updated.Tp
         particles = new_particles_energy
@@ -506,7 +545,7 @@ def solve_dcz_zone(
             # supersaturation checks are needed, not one:
             wV2_j = vapor_wV2[j]
             Y_V2_j = wV2_j / (1.0 - wV2_j)
-            T_dew_j = thermo.dew_point_temperature(Y_V2_j, c.antoine_water)
+            T_dew_j = thermo.dew_point_temperature(Y_V2_j, c.antoine_water, P=c.pressure_pa)
 
             # (a) the INFLOW itself may already be below its own dew point
             # (e.g. SP1's own steam+upstream-vapor mix, `dt_solver.py`'s
@@ -552,6 +591,18 @@ def solve_dcz_zone(
                 ) / relax_factor
             else:
                 T_running = T_candidate
+            # Evaporative pinning (see T_sat_water above): while the meal still holds free/
+            # loosely-bound water, its surface and the near-saturated vapor in contact cannot
+            # superheat past the water saturation temperature at the local (sparge) pressure --
+            # excess heat flashes meal moisture to steam rather than raising T. Applied while
+            # the (lagged) meal moisture stays above the free-water floor; mirrors the FTRZ
+            # T_L pinning. The latent heat absorbing the excess is the wet meal's own phase-
+            # change buffer (documented simplification, same category as the FTRZ's algebraic
+            # T_L cap); the moisture the meal then holds is set by the isotherm at this pinned,
+            # near-saturated a_w in step 4.5. Once the meal genuinely dries below the floor the
+            # cap releases and the toasting vapor superheats normally.
+            if X1_profile[j] > _WET_PIN_FLOOR and T_running > T_sat_water:
+                T_running = T_sat_water
             new_vapor_T[j] = T_running
         vapor_T = [vapor_T[j] + outer_relaxation * (new_vapor_T[j] - vapor_T[j]) for j in range(nz)]
 
@@ -637,6 +688,30 @@ def solve_dcz_zone(
         new_water_latent_w_m3 = [0.0] * nz
         new_water_mass_rate_w_m3 = [0.0] * nz
         X1_running = X1_in
+        # Water-availability budget (mass conservation): the solid can adsorb at
+        # most the water the vapor carries into the zone. Without this cap a
+        # high-a_w regime (near-saturated steam, e.g. under an elevated DT
+        # pressure) drives the subsaturated adsorption below to pull MORE water
+        # onto the meal than exists in the vapor, sending the vapor's own water
+        # flow negative (found via the FTRZ handoff crash under a raised
+        # pressure). Condensation (step 2) is already limited by its own
+        # `water_remaining_kg_s`; this budget adds the same discipline to the
+        # subsaturated branch and shares the running total across both.
+        #
+        # The whole zone's condensation is PRE-COUNTED into the shared budget here,
+        # before the isotherm adsorption draws on it: the vapor rises bottom->top, so
+        # water condensed low (at the sparge) is gone before it reaches the meal higher
+        # up. Counting condensation only as each condensed cell is REACHED walking the
+        # solid top->bottom instead let a top isotherm cell adsorb against the FULL
+        # budget before a bottom condensed cell debited it -- both branches drawing the
+        # same water, so the meal could gain more than the steam actually supplied
+        # (found at an under-set sparge: DT exit ~29%wb, ~2.8 kg/s water conjured from
+        # nothing, dome vapor water driven to 0). Pre-counting caps the combined
+        # condensation+adsorption at the actual inflowing vapor water. At the calibrated
+        # operating point the sparge is strong enough that the meal reaches ~19% via the
+        # isotherm alone and this is slack; it binds only when the sparge is weak.
+        water_available_kg_s = (1.0 - vapor_inf.wV2) * m_vapor_kg_s
+        cum_water_to_solid_kg_s = sum(condensed_kg_s)
         for j in range(nz):
             if condensed_kg_s[j] > 0.0:
                 # a_w >= 1 (supersaturated) this cell -- mass-conservative
@@ -653,13 +728,21 @@ def solve_dcz_zone(
                 # basic more-duty-=hotter relationship in
                 # `test_model.py::test_more_steam_raises_dt_target_temperature`).
                 X1_new = X1_running + condensed_kg_s[j] / m_dry_kg_s
+                # (condensed mass already pre-counted into cum_water_to_solid_kg_s above)
             else:
                 # a_w < 1 (subsaturated) -- bidirectional adsorption/
                 # desorption toward the isotherm's own equilibrium, an
                 # implicit relaxation over this cell's own residence `dt`,
                 # the same form the particle-scale marches already use.
                 Y_V2_j = vapor_wV2[j] / (1.0 - vapor_wV2[j])
-                a_w = thermo.water_activity(Y_V2_j, vapor_T[j], c.antoine_water)
+                # Evaporative pinning: the WET meal surface sits at the water saturation
+                # temperature (min of the superheated toasting vapor and T_sat), NOT the bulk
+                # vapor temp -- so a_w = y_water*P/P_sat(T_sat) = y_water, holding ~19% in
+                # near-pure steam instead of drying against a 120+ C vapor. Mirrors the FTRZ
+                # T_L pinning (zones/ftrz.py). Once the meal genuinely dries out and the vapor
+                # is hexane-rich, y_water (hence a_w) falls and real drying resumes.
+                T_surface = min(vapor_T[j], T_sat_water)
+                a_w = thermo.water_activity(Y_V2_j, T_surface, c.antoine_water, P=c.pressure_pa)
                 # Clamp to the Gianini paper's OWN highest tested UR (0.799,
                 # its KCl data point), not 1.0 -- DCZ's vapor is nearly pure
                 # steam, so a_w sits close to 1 almost everywhere this zone
@@ -673,6 +756,15 @@ def solve_dcz_zone(
                 Xe = thermo.luikov_equilibrium_moisture(a_w, c.luikov)
                 X1_new = (X1_running + dt * kappa_w * Xe) / (1.0 + dt * kappa_w)
                 mass_rate_kg_s = m_dry_kg_s * (X1_new - X1_running)
+                # ADSORPTION (mass_rate > 0) is capped to the vapor water still
+                # available; DESORPTION (< 0) returns water to the vapor and is
+                # unconstrained (it replenishes the budget).
+                if mass_rate_kg_s > 0.0:
+                    headroom_kg_s = max(water_available_kg_s - cum_water_to_solid_kg_s, 0.0)
+                    if mass_rate_kg_s > headroom_kg_s:
+                        mass_rate_kg_s = headroom_kg_s
+                        X1_new = X1_running + mass_rate_kg_s / m_dry_kg_s
+                cum_water_to_solid_kg_s += mass_rate_kg_s
                 new_water_latent_w_m3[j] = mass_rate_kg_s * c.dH_vap_water / (A_bed * dz)
                 new_water_mass_rate_w_m3[j] = mass_rate_kg_s / (A_bed * dz)
             new_X1_profile[j] = X1_new

@@ -208,12 +208,6 @@ def test_ftrz_stays_thin_relative_to_a_full_tray(default_result: dts.DTResult) -
     assert 0.0 < default_result.L_FTRZ_m < 0.5
 
 
-@pytest.mark.xfail(
-    reason="DCZ Coletto-faithful rework (D1-D6): a ~1e-4 non-monotonicity at a "
-    "zone handoff in the not-yet-calibrated converged profile. Re-baseline after "
-    "Phase 3/4 calibration.",
-    strict=False,
-)
 def test_hexane_decreases_monotonically_across_the_whole_dt(default_result: dts.DTResult) -> None:
     x2_by_tray = [t.X2 for t in default_result.tray_summaries]
     assert len(x2_by_tray) == len(REFERENCE_TRAYS)
@@ -227,14 +221,6 @@ def test_dcz_exit_hexane_matches_last_tray_summary(default_result: dts.DTResult)
     assert default_result.solid_exit_X2 == pytest.approx(default_result.tray_summaries[-1].X2)
 
 
-@pytest.mark.xfail(
-    reason="DCZ Coletto-faithful rework (D1-D6): this fixture's uncalibrated "
-    "constants run SP1 at ~150-160 C, where the isotherm thermostatic feedback "
-    "inverts the steam->moisture response. Entangled with the not-yet-calibrated "
-    "over-heating; expected to resolve when Phase 3/4 calibration brings "
-    "temperatures into the physical range. Re-baseline then.",
-    strict=False,
-)
 def test_direct_steam_does_not_invert_sparge_moisture() -> None:
     """Found this session: an earlier bulk-vapor dew-point-only condensation
     mechanism made SP1's own X1 respond BACKWARDS to `direct_steam` (more
