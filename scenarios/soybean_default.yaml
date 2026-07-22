@@ -41,8 +41,14 @@ geometry:
     # DR1/CL1 sized so the bed-holdup mass balance (added alongside gate_opening
     # becoming a real MV) settles at ~65% level at default gate/sweep settings,
     # leaving headroom before a narrowed gate genuinely floods the tray.
-    - {id: DR1, role: DRYER,     diameter_m: 4.0, bed_height_m: 0.60}   # [PLACE]
-    - {id: CL1, role: COOLER,    diameter_m: 4.0, bed_height_m: 0.60}   # [PLACE]
+    # arm_mixing_factor: per-tray residence multiplier at the common shaft rpm (= tau/base_residence).
+    # The DC trays' arms turn over material FASTER than the DT trays (lower factor -> shorter residence),
+    # which rate-limits their falling-rate drying so the meal stops at the product spec instead of racing
+    # to the hot-/ambient-air isotherm equilibrium. DR1=1.07 -> ~94 s (dryer ~12.2%wb); CL1=0.69 -> ~61 s
+    # (cooler ~11%wb). DT trays omit it (default 1.0). This REPLACES the old per-tray rpm hack (physically
+    # impossible: one shaft = one rpm). Calibrated values; see DECISIONS.
+    - {id: DR1, role: DRYER,     diameter_m: 4.0, bed_height_m: 0.60, arm_mixing_factor: 1.07}   # [PLACE]
+    - {id: CL1, role: COOLER,    diameter_m: 4.0, bed_height_m: 0.60, arm_mixing_factor: 0.69}   # [PLACE]
 
 # ------------------------------------------------------------------ model params
 model:
@@ -169,22 +175,16 @@ operating_defaults:
     # a pre-evaporative-pinning tuning artifact). At >=2 kg/s the meal equilibrates to ~19% wb via the
     # isotherm and the excess steam correctly leaves at the dome.
     SP1: 3.9
-  sweep_arm_speed:            # rpm  [PLACE] central-shaft sweep/rake arms (NOT agitation)
+  sweep_arm_speed:            # rpm  [PLACE] the SINGLE central shaft -- ONE speed for the whole tower.
+    # All trays share one shaft, so these are all equal (the HMI exposes one "arm speed" control that
+    # drives every tray together). Per-tray residence differences do NOT come from per-tray rpm (a
+    # single shaft can't have that) -- they come from each tray's own geometry.arm_mixing_factor.
     PD1: 3.0
     PD2: 3.0
     MN1: 3.0
     SP1: 3.0
-    # DR1 raked faster than 3 rpm to SHORTEN its residence (tau = base*1.5/(rpm/3)): the meal
-    # otherwise races to the hot-dry-air isotherm equilibrium (~11% wb) -- rate-limiting it at
-    # ~94 s stops the falling-rate drying at the ~12.5% product target. (Air-side knobs alone
-    # can't: the moisture is equilibrium-limited, insensitive to air flow/temp.) CL1 left at 3.0.
-    DR1: 4.2
-    # CL1 also raked fast to SHORTEN its residence: the cooler's ambient air (25 C, 50% RH) would
-    # otherwise pull the meal to its ~10.5% equilibrium (over-drying the ~12% product below the
-    # 11-12.5% band). Rate-limiting at ~61 s (rpm 6.5) stops the incidental drying at ~11%wb. The
-    # air flow (kept high, below) still cools the product to ~32 C, within 10 K of ambient. (Cooler
-    # moisture, like the dryer, is equilibrium- not air-flow-limited -- only rpm/residence moves it.)
-    CL1: 6.5
+    DR1: 3.0
+    CL1: 3.0
   gate_opening:               # 0-100 % level/discharge gate per stage  [PLACE]
     PD1: 50
     PD2: 50

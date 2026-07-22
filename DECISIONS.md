@@ -110,6 +110,20 @@ gate). Product now **11.0 %wb / 32.2 °C / 28 ppm** -- in band. Scorecard back t
 carrying 3.14 wheels (nothing imported). Rebuilt against Python 3.14 (`py -3.14 -m venv .venv
 --clear` + `pip install -e .[dev]`), matching `requires-python >=3.14`; 137 tests green on it.
 
+**SINGLE-SHAFT correction (physics).** The DC recalibrations above were first done by setting
+DIFFERENT per-tray sweep-arm rpm (DR1 4.2, CL1 6.5 vs 3.0) -- physically impossible: the DTDC has
+ONE central shaft, so every tray turns at the SAME rpm (and the HMI's one arm-speed control would
+have overwritten the split uniformly anyway). Corrected: residence is now `base_residence_s *
+StageSpec.arm_mixing_factor / (shaft_rpm/3)`, where `shaft_rpm` is the single shaft speed
+(`model._shaft_rpm`, uniform across all trays) and `arm_mixing_factor` is a per-tray geometry
+constant (blade pitch/count/rake design) capturing the different turnover per tray. The DC tuning
+moved from per-tray rpm to `geometry.arm_mixing_factor` (DR1 1.07 → ~94 s, CL1 0.69 → ~61 s), which
+reproduces the exact same residences at the common 3 rpm -- so the calibration (dryer 12.2 %wb,
+product 11.1 %wb / 32.2 °C, 10 PASS / 1 warn / 0 FAIL) is unchanged. The old per-role 1.5×
+DC-residence multiplier is folded into these explicit per-tray factors. `sweep_arm_speed` stays a
+single tower-wide value; the per-stage MV dict is kept uniform (HMI group control) and the model's
+residence + bed-transport now both read one `_shaft_rpm`, never a per-tray rpm.
+
 ## DC hexane coefficient anchored to real plant data (EPA AP-42) + Naiha diffusion physics (2026-07-19)
 
 **Trigger.** `dc_hexane_mtc` was the last hand-tuned `[PLACE]` number. The user supplied two papers

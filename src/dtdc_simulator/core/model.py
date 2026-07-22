@@ -56,6 +56,10 @@ class StageSpec:
     role: StageRole
     diameter_m: float
     bed_height_m: float
+    # Per-tray sweep-arm turnover/residence multiplier (see schema.StageGeometry): the single
+    # central shaft fixes ONE rpm for every tray; this captures the per-tray mixing difference
+    # from arm geometry instead. Defaults 1.0 (arm identical to the base tray).
+    arm_mixing_factor: float = 1.0
 
     @property
     def volume_m3(self) -> float:
@@ -299,13 +303,16 @@ def _build_dt_trays(
     ]
 
 
-def _mean_sweep_arm_rpm(dt_stages: list[StageSpec], sweep_arm_speed: dict[str, float]) -> float:
-    """One representative rpm for `solve_dt`'s own single (not per-tray)
-    `bed_transport_coefficients` call -- mean across DT-role stages, same
-    3.0 rpm fallback `_stage_tau` already uses per stage when unconfigured."""
-    if not dt_stages:
+def _shaft_rpm(stages: list[StageSpec], sweep_arm_speed: dict[str, float]) -> float:
+    """The single central shaft's rpm. The DTDC has ONE shaft driving every tray's
+    sweep arms, so all trays turn at the same speed -- this returns that one value
+    (mean over the given trays, which are equal on one shaft; the mean is just robust
+    to a mis-authored non-uniform config). Used for BOTH `solve_dt`'s bed-transport
+    call and every stage's residence in `_stage_tau`. Per-tray mixing differences come
+    from `StageSpec.arm_mixing_factor` (arm geometry), NOT from a per-tray rpm."""
+    if not stages:
         return 3.0
-    return sum(sweep_arm_speed.get(s.id, 3.0) for s in dt_stages) / len(dt_stages)
+    return sum(sweep_arm_speed.get(s.id, 3.0) for s in stages) / len(stages)
 
 
 def _reconstruct_warm_start_vapor_in(
@@ -394,7 +401,7 @@ class Model:
             outer_tol=c.dt_outer_tol,
             outer_max_iter=c.dt_outer_max_iter,
             dcz_inner_max_iter=c.dt_dcz_inner_max_iter,
-            sweep_arm_rpm=_mean_sweep_arm_rpm(dt_stages, seed.sweep_arm_speed),
+            sweep_arm_rpm=_shaft_rpm(self.stages, seed.sweep_arm_speed),
         )
         dt_target_T = np.array([s.T for s in result.tray_summaries], dtype=float)
         dt_target_X1 = np.array([s.X1 for s in result.tray_summaries], dtype=float)
@@ -435,6 +442,7 @@ class Model:
                     * seed.ambient_relative_humidity
                 )
                 m_dry = max(seed.feed_flow_rate, 1e-9)
+                shaft_rpm = _shaft_rpm(self.stages, seed.sweep_arm_speed)
                 dc_T, dc_X1, dc_X2 = dt_target_T[-1], dt_target_X1[-1], dt_target_X2[-1]
                 for i, s in enumerate(self.stages):
                     if s.role is StageRole.DRYER:
@@ -443,8 +451,7 @@ class Model:
                         air_T, air_flow = seed.ambient_air_temp, seed.ambient_air_flow
                     else:
                         continue
-                    rpm = seed.sweep_arm_speed.get(s.id, 3.0)
-                    tau = self.base_residence_s * 1.5 / max(rpm / 3.0, 0.1)
+                    tau = self.base_residence_s * s.arm_mixing_factor / max(shaft_rpm / 3.0, 0.1)
                     eq = dc.air_contact_equilibrium(
                         dc_T, dc_X1, dc_X2, air_T, air_flow, air_humidity, m_dry, tau, c.dc_constants
                     )
@@ -475,14 +482,15 @@ class Model:
         return stage.volume_m3 * c.rho_solid * (1.0 - c.bed_porosity)
 
     def _stage_tau(self, stage: StageSpec, u: Inputs) -> float:
-        """Solid transport/thermal-lag residence time (s), set by sweep-arm
-        speed only. gate_opening no longer enters here: it's a real DISCHARGE
-        throttle now (`_stage_discharge`), so a closed gate genuinely stops
-        outflow and backs material up rather than merely stretching the turnover
-        time. Faster arms -> shorter tau (quicker turnover)."""
-        rpm = u.sweep_arm_speed.get(stage.id, 3.0)
-        base = self.base_residence_s * (1.5 if stage.role in DC_ROLES else 1.0)
-        return base / max(rpm / 3.0, 0.1)
+        """Solid transport/thermal-lag residence time (s). The DTDC has ONE central
+        shaft, so every tray turns at the SAME rpm (`_shaft_rpm`) -- faster shaft ->
+        shorter tau on ALL trays. Per-tray residence differences come from the tray's
+        own `arm_mixing_factor` (sweep-arm geometry), NOT a per-tray rpm (a single shaft
+        cannot have one). gate_opening no longer enters here: it's a real DISCHARGE
+        throttle now (`_stage_discharge`), so a closed gate genuinely stops outflow and
+        backs material up rather than merely stretching the turnover time."""
+        rpm = _shaft_rpm(self.stages, u.sweep_arm_speed)
+        return self.base_residence_s * stage.arm_mixing_factor / max(rpm / 3.0, 0.1)
 
     def _stage_discharge(self, stage: StageSpec, m_hold: float, u: Inputs) -> float:
         """Solid discharge rate (kg/s dry) from a rotary valve / weir: driven by
@@ -603,7 +611,7 @@ class Model:
                 dcz_inner_max_iter=c.dt_dcz_inner_max_iter,
                 warm_start_vapor_in=warm_vapor_in,
                 warm_start_T_L_sup=warm_T_L_sup,
-                sweep_arm_rpm=_mean_sweep_arm_rpm(dt_stages, u.sweep_arm_speed),
+                sweep_arm_rpm=_shaft_rpm(self.stages, u.sweep_arm_speed),
             )
             _apply_dt_result(x_next, result)
             x_next.dt_converged = result.converged

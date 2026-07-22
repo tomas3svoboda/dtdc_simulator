@@ -43,7 +43,7 @@ from dtdc_simulator.core.model import (  # noqa: E402
     StageRole,
     _build_dt_trays,
     _dt_role_stages,
-    _mean_sweep_arm_rpm,
+    _shaft_rpm,
 )
 
 # --- COAMO feed, dry-defatted-meal basis (report Table 1 "Model-state conversion") ---
@@ -139,7 +139,7 @@ def score_dt(model, cfg, u: Inputs) -> tuple[list[Metric], object]:
         nz_phz=c.dt_nz_phz, nz_ftrz=c.dt_nz_ftrz, nz_dcz=c.dt_nz_dcz,
         outer_tol=c.dt_outer_tol, outer_max_iter=c.dt_outer_max_iter,
         dcz_inner_max_iter=c.dt_dcz_inner_max_iter,
-        sweep_arm_rpm=_mean_sweep_arm_rpm(dt_stages, u.sweep_arm_speed),
+        sweep_arm_rpm=_shaft_rpm(model.stages, u.sweep_arm_speed),
     )
     ap = r.axial_profile
     dome_T = ap.vapor_T[0] - 273.15

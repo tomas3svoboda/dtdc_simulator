@@ -165,6 +165,7 @@ def assemble_model(config: ScenarioConfig) -> tuple[Model, State]:
             role=StageRole(s.role.value),
             diameter_m=s.diameter_m,
             bed_height_m=s.bed_height_m,
+            arm_mixing_factor=s.arm_mixing_factor,
         )
         for s in config.geometry.stages
     )

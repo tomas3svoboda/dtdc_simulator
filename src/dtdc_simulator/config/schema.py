@@ -29,6 +29,11 @@ class StageGeometry(BaseModel):
     role: StageRole
     diameter_m: float = Field(gt=0)
     bed_height_m: float = Field(gt=0)
+    # Per-tray material turnover/residence multiplier from THIS tray's own sweep-arm geometry
+    # (blade pitch/count/rake design). The DTDC has ONE central shaft, so every tray turns at the
+    # SAME rpm; the per-tray mixing differences come from arm geometry, captured here (not from a
+    # per-tray rpm, which a single shaft cannot have). tau_stage = base_residence_s * this / (rpm/3).
+    arm_mixing_factor: float = Field(gt=0, default=1.0)
 
 
 class Geometry(BaseModel):
