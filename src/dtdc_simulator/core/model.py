@@ -114,6 +114,15 @@ class OperatingSeed:
     indirect_steam: dict[str, float] = field(default_factory=dict)
     direct_steam: dict[str, float] = field(default_factory=dict)
     sweep_arm_speed: dict[str, float] = field(default_factory=dict)
+    # DC air-side conditions, so init_state can pre-solve the DRYER/COOLER to steady
+    # state too (chain the air-contact equilibrium from the DT exit). Default flows 0
+    # -> the DC seed is a no-op (air_contact_equilibrium returns the meal unchanged),
+    # a safe fallback for seeds constructed without these (e.g. unit tests).
+    heated_air_temp: float = 360.0
+    heated_air_flow: float = 0.0
+    ambient_air_temp: float = 298.0
+    ambient_air_flow: float = 0.0
+    ambient_relative_humidity: float = 0.5
 
 
 @dataclass
@@ -413,6 +422,34 @@ class Model:
                 if s.role in DT_ROLES:
                     T0[i], X10[i], X20[i] = dt_target_T[j], dt_target_X1[j], dt_target_X2[j]
                     j += 1
+            # Seed the DC (DRYER/COOLER) stages at THEIR steady state too, so x0 is the
+            # FULLY tuned steady state -- not just the DT. Chain the same air-contact
+            # equilibrium `step()`'s per-tick loop uses (below), starting from the DT exit
+            # (last DT-role target); its own lag then relaxes toward these same targets, so
+            # this just skips the DC's startup transient exactly as the DT-stage seeding
+            # above does. Air humidity evaluated at ambient for both roles (matching
+            # `_dc_equilibrium`). No-op if a DC air flow is 0 (equilibrium returns unchanged).
+            if any(s.role in DC_ROLES for s in self.stages):
+                air_humidity = (
+                    dc.saturation_humidity_ratio(seed.ambient_air_temp, c.dc_constants.antoine_water)
+                    * seed.ambient_relative_humidity
+                )
+                m_dry = max(seed.feed_flow_rate, 1e-9)
+                dc_T, dc_X1, dc_X2 = dt_target_T[-1], dt_target_X1[-1], dt_target_X2[-1]
+                for i, s in enumerate(self.stages):
+                    if s.role is StageRole.DRYER:
+                        air_T, air_flow = seed.heated_air_temp, seed.heated_air_flow
+                    elif s.role is StageRole.COOLER:
+                        air_T, air_flow = seed.ambient_air_temp, seed.ambient_air_flow
+                    else:
+                        continue
+                    rpm = seed.sweep_arm_speed.get(s.id, 3.0)
+                    tau = self.base_residence_s * 1.5 / max(rpm / 3.0, 0.1)
+                    eq = dc.air_contact_equilibrium(
+                        dc_T, dc_X1, dc_X2, air_T, air_flow, air_humidity, m_dry, tau, c.dc_constants
+                    )
+                    T0[i], X10[i], X20[i] = eq[0], eq[1], eq[2]
+                    dc_T, dc_X1, dc_X2 = eq[0], eq[1], eq[2]
 
         return State(
             T=T0,

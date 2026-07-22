@@ -228,6 +228,11 @@ def assemble_model(config: ScenarioConfig) -> tuple[Model, State]:
         indirect_steam=dict(config.operating_defaults.indirect_steam),
         direct_steam=dict(config.operating_defaults.direct_steam),
         sweep_arm_speed=dict(config.operating_defaults.sweep_arm_speed),
+        heated_air_temp=config.operating_defaults.heated_air_temp,
+        heated_air_flow=config.operating_defaults.heated_air_flow,
+        ambient_air_temp=config.disturbance_defaults.ambient_air_temp,
+        ambient_air_flow=config.operating_defaults.ambient_air_flow,
+        ambient_relative_humidity=config.disturbance_defaults.ambient_relative_humidity,
     )
     # §4: "Compute steady-state x0 via initializer at the operating defaults" --
     # init_state() now runs one real solve_dt() call (M3a, BuildSpec §7.8/§7.9).

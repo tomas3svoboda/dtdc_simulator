@@ -90,6 +90,16 @@ height — that only sets holdup), so raised `DR1` to **4.2 rpm** (tau 132→94 
 60.8 °C, cooler +5.4 K — **scorecard 10 PASS / 1 warn / 0 FAIL** (the lone warn is the dome
 temp, 75.1 vs 75 °C, 0.1° over). The whole DTDC is now in band.
 
+**`init_state` now pre-solves the DC too, so `main.py` opens at the FULLY tuned steady state.**
+`init_state` (start_empty=False) seeded only the DT stages at their converged targets and left
+the DRYER/COOLER at the raw feed state (X2=0.58, X1=0.07) -- so x0 showed a garbage DC that only
+settled after ~15 s of ticks. It now chains the same air-contact equilibrium `step()` uses, from
+the DT exit through DR1→CL1, seeding the DC at its steady state (DR1 12.1 %wb / 61.5 °C, product
+CL1 10.5 %wb / 30.7 °C). Added the DC air conditions to `OperatingSeed` for this. (Noted: the
+COOLER dries the 12.1 % dryer output further to ~10.5 %wb on the 250 kg/s ambient stream -- below
+the ~12.5 % product spirit though the scorecard only gates the DRYER moisture + cooler temp; a
+cooler-air recalibration for later.)
+
 ## DC hexane coefficient anchored to real plant data (EPA AP-42) + Naiha diffusion physics (2026-07-19)
 
 **Trigger.** `dc_hexane_mtc` was the last hand-tuned `[PLACE]` number. The user supplied two papers
