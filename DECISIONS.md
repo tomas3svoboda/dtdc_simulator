@@ -95,10 +95,20 @@ temp, 75.1 vs 75 °C, 0.1° over). The whole DTDC is now in band.
 the DRYER/COOLER at the raw feed state (X2=0.58, X1=0.07) -- so x0 showed a garbage DC that only
 settled after ~15 s of ticks. It now chains the same air-contact equilibrium `step()` uses, from
 the DT exit through DR1→CL1, seeding the DC at its steady state (DR1 12.1 %wb / 61.5 °C, product
-CL1 10.5 %wb / 30.7 °C). Added the DC air conditions to `OperatingSeed` for this. (Noted: the
-COOLER dries the 12.1 % dryer output further to ~10.5 %wb on the 250 kg/s ambient stream -- below
-the ~12.5 % product spirit though the scorecard only gates the DRYER moisture + cooler temp; a
-cooler-air recalibration for later.)
+CL1 11.0 %wb / 32.2 °C). Added the DC air conditions to `OperatingSeed` for this.
+
+**COOLER recalibration.** The cooler was over-drying the 12.1 % dryer output to ~10.5 %wb (below
+the 11-12.5 % band) AND over-cooling it to ~31 °C. Same diagnosis as the dryer: the cooler
+moisture is **equilibrium-limited** (the meal races to its ~10.5 % ambient-air isotherm regardless
+of air flow), so it too must be **rate-limited** -- raised `CL1` to **6.5 rpm** (tau ~61 s) to stop
+the incidental drying at ~11 %wb. Air flow left high (250 kg/s) since it only sets the temperature
+(not the moisture) and cools the meal to ~32 °C, 7 K above ambient (inside the scorecard's ≤10 K
+gate). Product now **11.0 %wb / 32.2 °C / 28 ppm** -- in band. Scorecard back to **10 PASS / 1 warn
+/ 0 FAIL** (lone warn: dome 75.1 vs 75 °C). Whole DTDC in band; x0 opens fully tuned end-to-end.
+
+**Env note (not code):** the local `.venv` was found broken this session -- a Python 3.8.2 venv
+carrying 3.14 wheels (nothing imported). Rebuilt against Python 3.14 (`py -3.14 -m venv .venv
+--clear` + `pip install -e .[dev]`), matching `requires-python >=3.14`; 137 tests green on it.
 
 ## DC hexane coefficient anchored to real plant data (EPA AP-42) + Naiha diffusion physics (2026-07-19)
 
