@@ -79,6 +79,17 @@ un-xfailed: `test_hexane_decreases_monotonically_across_the_whole_dt` and — th
 moisture). `test_balance.py::test_dcz_solid_water_gain_...` relaxed from a strict one-sided
 `gain ≥ condensed` to allow the isotherm's small (<2 %) conservative desorption pullback.
 
+**DC dryer recalibration (follow-on).** With the DT now delivering the correct 19 %wb (it used
+to over-dry to ~8 %), the dryer — tuned for that old drier feed — over-dried the product to
+10.7 %wb (target 12-13). Diagnosed as fully **equilibrium-limited**: the meal reaches the hot-
+dry-air Luz isotherm `X_e` (~11 %wb) regardless of air flow or temperature, so no air-side knob
+can raise it — a real dryer is instead **rate-limited** (sized so the meal stops before `X_e`).
+The residence knob in this model is the sweep-arm speed (`_stage_tau = base*1.5/(rpm/3)`, NOT bed
+height — that only sets holdup), so raised `DR1` to **4.2 rpm** (tau 132→94 s) and trimmed
+`heated_air_temp` 360→348 K to hold the outlet in the 55-65 °C band. Result: dryer 12.2 %wb /
+60.8 °C, cooler +5.4 K — **scorecard 10 PASS / 1 warn / 0 FAIL** (the lone warn is the dome
+temp, 75.1 vs 75 °C, 0.1° over). The whole DTDC is now in band.
+
 ## DC hexane coefficient anchored to real plant data (EPA AP-42) + Naiha diffusion physics (2026-07-19)
 
 **Trigger.** `dc_hexane_mtc` was the last hand-tuned `[PLACE]` number. The user supplied two papers

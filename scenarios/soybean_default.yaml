@@ -174,6 +174,12 @@ operating_defaults:
     PD2: 3.0
     MN1: 3.0
     SP1: 3.0
+    # DR1 raked faster than 3 rpm to SHORTEN its residence (tau = base*1.5/(rpm/3)): the meal
+    # otherwise races to the hot-dry-air isotherm equilibrium (~11% wb) -- rate-limiting it at
+    # ~94 s stops the falling-rate drying at the ~12.5% product target. (Air-side knobs alone
+    # can't: the moisture is equilibrium-limited, insensitive to air flow/temp.) CL1 left at 3.0.
+    DR1: 4.2
+    CL1: 3.0
   gate_opening:               # 0-100 % level/discharge gate per stage  [PLACE]
     PD1: 50
     PD2: 50
@@ -187,7 +193,7 @@ operating_defaults:
   #    cools DR1 to ~66 C.
   #  * COOLER (298 K ambient, 250 kg/s): a high ~10:1 air:solid ratio drops CL1 to ~36 C -- within
   #    ~10 C of ambient, per the AOCS doc.
-  heated_air_temp: 360.0      # K = ~87 C  [PLACE, re-tuned] dryer inlet air
+  heated_air_temp: 348.0      # K = ~75 C  [PLACE, re-tuned] dryer inlet air
   heated_air_flow: 80.0       # kg/s  [PLACE, re-tuned] DRYER — DR1 ~66 C
   ambient_air_flow: 250.0     # kg/s  [PLACE, re-tuned] COOLER — ~10:1 air:solid, CL1 ~36 C
   # M3a follow-up ("C"): HOT, live-tunable from the UI/OPC UA while RUNNING
