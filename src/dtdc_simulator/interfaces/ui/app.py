@@ -36,6 +36,23 @@ logger = logging.getLogger(__name__)
 HISTORY_LEN = 12000  # safety cap on trend-history length (real trimming is by TREND_WINDOW_S)
 SYNC_INTERVAL_S = 0.3
 TREND_WINDOW_S = 1800.0  # sliding sim-time window shown on ALL trend charts (stage-temp + outlet)
+TREND_HEIGHT_PX = 420  # compact middle ground between the original 208 px and 790 px
+
+_WHOLE_NUMBER_AXIS = {
+    ":formatter": "value => Math.round(value).toString()",
+}
+_TEMPERATURE_AXIS = {
+    ":formatter": "value => Number(value).toFixed(1)",
+}
+
+
+def _whole_trend_point(sim_time: float, value: float) -> tuple[int, int]:
+    return round(sim_time), round(value)
+
+
+def _temperature_trend_value(temperature_k: float) -> float:
+    return round(theme.k_to_c(temperature_k), 1)
+
 
 # M4 (GUI redesign): the process-overview KPI band. Each entry is
 # (Outputs attribute, title, unit, format, status_fn) where status_fn(value)
@@ -78,7 +95,7 @@ _MV_UNITS = {
     "indirect_steam": "W",
     "direct_steam": "kg/s",
     "sweep_arm_speed": "rpm",
-    "gate_opening": "%",
+    "transfer_device_position": "%",
 }
 _MV_TEMP_K_PREFIXES = {"heated_air_temp"}
 
@@ -264,22 +281,6 @@ def create_app(
                 profile_view = DTProfileView(profile_container)
                 with profile_container:
                     ui.label("Trends").classes("hmi-section-title mt-3")
-                    ui.label("Stage Temperature Trend [°C]").classes("text-sm font-semibold")
-                    trend_plot = ui.echart(
-                        {
-                            "xAxis": {"type": "value", "name": "sim time [s]", "scale": True},
-                            "yAxis": {
-                                "type": "value",
-                                "name": "T [°C]",
-                                "scale": True,
-                                "minInterval": 1,
-                            },
-                            "series": [],
-                            "legend": {"data": []},
-                            "tooltip": {"trigger": "axis"},
-                        }
-                    ).classes("w-full h-56")
-
                     # Two SINGLE-axis charts, not one dual-y-axis chart: hexane
                     # (ppm) and moisture (%) share no scale, so a shared y-axis
                     # would be misleading (dataviz: never a dual-axis chart).
@@ -288,8 +289,20 @@ def create_app(
                         outlet_hex_plot = ui.echart(
                             {
                                 "title": {"text": "Outlet hexane [ppm]", "textStyle": {"fontSize": 12}},
-                                "xAxis": {"type": "value", "name": "sim time [s]", "scale": True},
-                                "yAxis": {"type": "value", "name": "ppm", "scale": True},
+                                "xAxis": {
+                                    "type": "value",
+                                    "name": "sim time [s]",
+                                    "scale": True,
+                                    "minInterval": 1,
+                                    "axisLabel": _WHOLE_NUMBER_AXIS,
+                                },
+                                "yAxis": {
+                                    "type": "value",
+                                    "name": "ppm",
+                                    "scale": True,
+                                    "minInterval": 1,
+                                    "axisLabel": _WHOLE_NUMBER_AXIS,
+                                },
                                 "series": [
                                     {
                                         "name": "Outlet Hexane",
@@ -301,12 +314,29 @@ def create_app(
                                 ],
                                 "tooltip": {"trigger": "axis"},
                             }
-                        ).classes("h-52").style("flex: 1 1 200px;")
+                        ).style(
+                            f"height:{TREND_HEIGHT_PX}px; flex:1 1 200px;"
+                        )
                         outlet_moist_plot = ui.echart(
                             {
-                                "title": {"text": "Outlet moisture [%]", "textStyle": {"fontSize": 12}},
-                                "xAxis": {"type": "value", "name": "sim time [s]", "scale": True},
-                                "yAxis": {"type": "value", "name": "%", "scale": True},
+                                "title": {
+                                    "text": "Outlet moisture [%]",
+                                    "textStyle": {"fontSize": 12},
+                                },
+                                "xAxis": {
+                                    "type": "value",
+                                    "name": "sim time [s]",
+                                    "scale": True,
+                                    "minInterval": 1,
+                                    "axisLabel": _WHOLE_NUMBER_AXIS,
+                                },
+                                "yAxis": {
+                                    "type": "value",
+                                    "name": "%",
+                                    "scale": True,
+                                    "minInterval": 1,
+                                    "axisLabel": _WHOLE_NUMBER_AXIS,
+                                },
                                 "series": [
                                     {
                                         "name": "Outlet Moisture",
@@ -318,7 +348,49 @@ def create_app(
                                 ],
                                 "tooltip": {"trigger": "axis"},
                             }
-                        ).classes("h-52").style("flex: 1 1 200px;")
+                        ).style(
+                            f"height:{TREND_HEIGHT_PX}px; flex:1 1 200px;"
+                        )
+
+                    # Quality is the operator's primary outcome; temperature
+                    # diagnostics follow it. Separate plots let each physical
+                    # section autoscale independently instead of flattening the
+                    # cooler traces beneath the hot DT trays.
+                    ui.label("Tray Temperature Trends [°C]").classes("text-sm font-semibold mt-2")
+                    temperature_groups = {
+                        "predesolv": ("Predesolv · PD1–PD3", {"PREDESOLV"}),
+                        "toast": ("Toast · MN1–SP1", {"MAIN", "SPARGE"}),
+                        "dc": ("Dryer / Cooler · DR1–CL1", {"DRYER", "COOLER"}),
+                    }
+                    temp_trend_plots: dict[str, ui.echart] = {}
+                    with ui.row().classes("w-full gap-3 flex-wrap"):
+                        for group_key, (title, _roles) in temperature_groups.items():
+                            temp_trend_plots[group_key] = ui.echart(
+                                {
+                                    "title": {
+                                        "text": title,
+                                        "textStyle": {"fontSize": 12},
+                                    },
+                                    "xAxis": {
+                                        "type": "value",
+                                        "name": "sim time [s]",
+                                        "scale": True,
+                                        "minInterval": 1,
+                                        "axisLabel": _WHOLE_NUMBER_AXIS,
+                                    },
+                                    "yAxis": {
+                                        "type": "value",
+                                        "name": "°C",
+                                        "scale": True,
+                                        "axisLabel": _TEMPERATURE_AXIS,
+                                    },
+                                    "series": [],
+                                    "legend": {"data": []},
+                                    "tooltip": {"trigger": "axis"},
+                                }
+                            ).style(
+                                f"height:{TREND_HEIGHT_PX}px; flex:1 1 250px;"
+                            )
 
             with ui.expansion("Advanced: full MV table & manual drive", value=False).classes(
                 "w-full"
@@ -409,7 +481,14 @@ def create_app(
 
             if snap.stage_order != built_stage_order:
                 built_stage_order = list(snap.stage_order)
-                tower_view.build(snap.stage_order, snap.stage_roles, snap.mvs, snap.dvs, snap.steam)
+                tower_view.build(
+                    snap.stage_order,
+                    snap.stage_roles,
+                    snap.mvs,
+                    snap.dvs,
+                    snap.steam,
+                    snap.transfer_boundaries,
+                )
 
             mv_table.rows = [
                 {
@@ -450,13 +529,22 @@ def create_app(
             # it actually slide -- an unpinned value axis snaps its min back to 0.
             t_now = snap.sim_time
             window_start = t_now - TREND_WINDOW_S
-            x_min = round(max(0.0, window_start), 1)
-            x_max = round(t_now, 1)
+            x_min = round(max(0.0, window_start))
+            x_max = round(t_now)
+            trend_time = round(t_now)
 
             if snap.stage_order:
                 last_sid = snap.stage_order[-1]
-                outlet_hex_history.append((t_now, outputs.stage_X_hex_ppm[last_sid]))
-                outlet_moisture_history.append((t_now, outputs.stage_X_w_pct[last_sid]))
+                outlet_hex_history.append(
+                    _whole_trend_point(
+                        t_now, outputs.stage_X_hex_ppm[last_sid]
+                    )
+                )
+                outlet_moisture_history.append(
+                    _whole_trend_point(
+                        t_now, outputs.stage_X_w_pct[last_sid]
+                    )
+                )
                 for hist in (outlet_hex_history, outlet_moisture_history):
                     while hist and hist[0][0] < window_start:
                         hist.popleft()
@@ -469,9 +557,9 @@ def create_app(
                     chart.options["xAxis"]["max"] = x_max
                     chart.update()
 
-            history_t.append(t_now)
+            history_t.append(trend_time)
             for sid, t_val in outputs.stage_T.items():
-                history_T[sid].append(theme.k_to_c(t_val))
+                history_T[sid].append(_temperature_trend_value(t_val))
             # Slide the (parallel) stage-temp history to the same window.
             while history_t and history_t[0] < window_start:
                 history_t.popleft()
@@ -479,18 +567,25 @@ def create_app(
                     if dq:
                         dq.popleft()
 
-            trend_plot.options["series"] = [
-                {
-                    "name": sid,
-                    "type": "line",
-                    "showSymbol": False,
-                    "data": list(zip(history_t, history_T[sid])),
-                }
-                for sid in outputs.stage_T
-            ]
-            trend_plot.options["legend"] = {"data": list(outputs.stage_T.keys())}
-            trend_plot.options["xAxis"]["min"] = x_min
-            trend_plot.options["xAxis"]["max"] = x_max
-            trend_plot.update()
+            for group_key, (_title, roles) in temperature_groups.items():
+                stage_ids = [
+                    sid
+                    for sid in outputs.stage_T
+                    if snap.stage_roles.get(sid) in roles
+                ]
+                chart = temp_trend_plots[group_key]
+                chart.options["series"] = [
+                    {
+                        "name": sid,
+                        "type": "line",
+                        "showSymbol": False,
+                        "data": list(zip(history_t, history_T[sid])),
+                    }
+                    for sid in stage_ids
+                ]
+                chart.options["legend"] = {"data": stage_ids}
+                chart.options["xAxis"]["min"] = x_min
+                chart.options["xAxis"]["max"] = x_max
+                chart.update()
 
         ui.timer(SYNC_INTERVAL_S, sync)

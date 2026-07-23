@@ -9,8 +9,12 @@ KEY DESIGN INSIGHT (found while tracing the actual data dependencies between
 `zones/phz.py`, `zones/ftrz.py`, `zones/dcz.py`'s own signatures, not assumed
 upfront): PHZ's solid solve depends only on `Q_indirect` and the top feed BC
 -- NOT on vapor state (already true of the standalone `phz.py`: vapor is
-informational-only there). So PHZ, and the PHZ/FTRZ boundary location, are
-solved ONCE, up front -- no outer-loop dependency. The *only* two coupling
+informational-only there). So PHZ is solved ONCE, up front and is capped by
+the physical PREDESOLV hardware boundary. Crossing the receding-front critical
+content changes the jacket-driven mechanism *inside* that section; it never
+moves direct-steam FTRZ into a sealed PREDESOLV tray. Cold, boiling-point, or
+superheated PHZ outlet states are handed to FTRZ at the first countercurrent
+tray; no outer-loop dependency is introduced. The *only* two coupling
 scalars across the remaining FTRZ/DCZ interface are `DCZZoneResult.vapor_out`
 (top face) feeding FTRZ's `vapor_in` (bottom BC), and
 `FTRZZoneResult.solid_out.T` (bottom-most cell) feeding DCZ's `T_L_sup`. This
@@ -19,22 +23,15 @@ Gauss-Seidel loop, spanning trays rather than iterating within each one --
 simpler than a literal reading might suggest, and still faithful to it
 ("solve FTRZ before DCZ... repeat until profiles converge").
 
-FREE BOUNDARIES:
-- PHZ/FTRZ interface (`L_PHZ`, where `X2` crosses `X2,cr(T)`): located by
-  marching real trays top-down at full height (`zones/phz.py::solve_phz_tray`,
-  unchanged) until one tray's exit drops to/below `X2,cr`; within that one
-  "boundary tray," `brentq` locates the precise sub-height `z*` (re-solving
-  `solve_phz_tray` at trial heights, cheap since PHZ has no internal
-  iteration) -- mirroring the same rigor `ftrz.py` already applies to its own
-  free boundary `L_FTRZ`.
-- FTRZ/DCZ interface (`L_FTRZ`): already solved endogenously by
-  `solve_ftrz_zone`'s own internal fixed point (unchanged). This module only
-  freezes it (from the *first* outer-loop FTRZ solve) to fix DCZ's own mesh
-  geometry for the rest of the Gauss-Seidel loop -- re-meshing DCZ's `nz`
-  cells every single outer pass over a geometry that barely moves (FTRZ is
-  "order cm" against tray heights of 0.3-1.0 m) is unnecessary cost and a
-  needless source of noise in the DCZ<->particle Gauss-Seidel's own
-  convergence. A DOCUMENTED simplification, not an oversight.
+BOUNDARIES:
+- PHZ/FTRZ interface (`L_PHZ`): fixed at the bottom of the last contiguous
+  PREDESOLV tray. `X2,cr` is an internal PHZ mechanism switch (constant-rate
+  to jacket-driven falling-rate evaporation), not a steam-contact boundary.
+- FTRZ/DCZ interface (`L_FTRZ`): solved endogenously by
+  `solve_ftrz_zone`. Every resolved outer pass rebuilds the DCZ mesh at that
+  current physical boundary and interpolates the complete lagged DCZ state
+  onto the new cell centres. Extreme operation therefore cannot retain a
+  first-iterate geometry.
 
 DUTY APPORTIONMENT (bed height as a genuine spatial domain across trays, not
 one lumped quantity): each real tray's own `Q_indirect_w` is a *total*
@@ -60,7 +57,7 @@ Nuε-Reε correlation (eq. B.7) is cited to Faner's unpublished 2008 PhD
 thesis, and `aV` (specific interfacial area, eq. A.35) to Rhodes (2008), a
 textbook -- neither source, nor a defining formula for either quantity,
 appears anywhere in what we have. Closure, confirmed with the user: standard
-packed-bed correlations, clearly tagged `[DERIVED]`/`[PLACE]` like every
+packed-bed correlations, clearly tagged `[DERIVED]` like every
 other genuinely-unrecoverable constant already in this codebase --
 ```
 aV    = 3*(1 - eps_b) / rP                                  [DERIVED, packed spheres]
@@ -86,7 +83,7 @@ transcription of either source) converged on the SAME two formulas already
 implemented here (`Reε = ρ·us·dp/(μ·ε)`, its own top-ranked candidate; `aV =
 6(1-ε)/dp`, algebraically identical to `3(1-ε)/rP`) -- a reassuring second
 line of reasoning, not a primary-source verification. Still tagged
-`[DERIVED]`/`[PLACE]`, not upgraded to `[PAPER]`: that reconstruction's own
+`[DERIVED]`, not upgraded to `[PAPER]`: that reconstruction's own
 stated confidence tops out at "moderate" for `Reε`, and it does not resolve
 `sorption_C0`/`sorption_C1` (still unrecoverable) at all.
 
@@ -209,34 +206,10 @@ def bed_transport_coefficients(
     documented in this module's docstring (a confirmed literature gap, not an
     assumed one).
 
-    SWEEP-ARM AGITATION ENHANCEMENT (found this session, DECISIONS.md's "DCZ
-    hot-temperature root cause" entry): the Nu-Re correlation above describes
-    passive, FLOW-DRIVEN convection through a static packed bed -- but a real
-    DT bed is continuously mechanically swept/agitated by the central-shaft
-    arms (the `sweep_arm_speed` MV), a fundamentally different, much stronger
-    heat/mass-transfer regime (continuously-renewed gas-solid contact, not
-    boundary-layer-limited flow). `ModelParams.sweep_arm_transfer_gain`
-    already existed in `config/schema.py` with exactly this stated purpose
-    ("hQ/hM sensitivity to sweep-arm speed") but was never actually wired to
-    anything -- confirmed by a repo-wide search before adding this. Routing
-    agitation through the SAME Re-Nu correlation (e.g. adding an
-    arm-tip-speed contribution to `u_V_superficial_m_s`) was tried and
-    rejected: at this scenario's own tray radius, tip speed is only
-    comparable in magnitude to the vapor's own superficial velocity, so it
-    barely moves Nu (a ~38% bump at rpm=3, via Re^0.579) -- nowhere close to
-    what direct instrumentation (this session) showed was needed to bring
-    DCZ's converged temperature into its own validated band (~380-383 K,
-    matching literature_sources/Svoboda_Case_for_Advanced_Process_Control_
-    VRX-DTDC_Concept.pdf's own SD-tray reading, ~102 C) and let condensation
-    actually trigger. A mechanically-agitated bed isn't a stronger FLOW, it's
-    a different transfer REGIME -- so this is a direct, separate multiplier
-    on hQ (hM is then re-derived from the enhanced hQ via the SAME existing
-    Chilton-Colburn analogy below, keeping that relationship internally
-    consistent) rather than forcing it through the flow correlation.
-    `sweep_arm_transfer_gain` retuned from its old (never-effective, always
-    0.2) placeholder to reproduce that validated target -- still `[PLACE]`,
-    no fitted agitated-bed correlation exists in this project's literature,
-    but now at least load-bearing and empirically anchored.
+    The optional sweep-arm multiplier is retained for compatibility and
+    controlled experiments, but the authoritative scenario sets its gain to
+    zero. The release model therefore uses Coletto B.7-B.9 without an
+    empirical agitation enhancement.
     """
     r_P = c.particle.r_P
     eps_b = c.ftrz.bed_porosity
@@ -266,7 +239,8 @@ class PHZPassResult:
     # (height z_star_m), kept for the axial profile (DTAxialProfile) -- everything else here
     # already only needed the boundary tray's own EXIT state (`exit_state` below), but the
     # profile needs its per-cell interior too.
-    exit_state: phz_mod.SolidState  # X2 <= X2,cr, T == T_boil_hexane
+    # At T_boil_hexane; X2 may exceed X2,cr at the PREDESOLV hardware boundary.
+    exit_state: phz_mod.SolidState
     L_PHZ_m: float
 
 
@@ -278,9 +252,15 @@ def _phz_pass(
     nz_phz: int,
     c: DTSolverConstants,
 ) -> PHZPassResult:
+    predesolv_indices = [i for i, tray in enumerate(trays) if tray.role == "PREDESOLV"]
+    if not predesolv_indices:
+        raise ValueError("PHZ requires at least one PREDESOLV tray")
+    expected_prefix = list(range(predesolv_indices[-1] + 1))
+    if predesolv_indices != expected_prefix:
+        raise ValueError("PREDESOLV trays must form a contiguous prefix at the top of the DT")
+
     solid = phz_mod.SolidState(T=solid_feed.T, X2=solid_feed.X2)
     completed: list[phz_mod.PHZTrayResult] = []
-    cumulative_height = 0.0
 
     def _x2_cr(T: float) -> float:
         return thermo.x2_critical(
@@ -291,7 +271,19 @@ def _phz_pass(
             empirical=c.particle.x2_critical_empirical,
         )
 
-    for idx, tray in enumerate(trays):
+    x2_cr = _x2_cr(c.phz.T_boil_hexane)
+    x2_eq = thermo.x2_equilibrium(
+        max(vapor_hint.T, c.phz.T_boil_hexane),
+        solid_feed.X3,
+        c.ftrz.gab,
+        c.ftrz.oil,
+        c.particle.alpha_pg,
+        c.particle.alpha_ps,
+        c.particle.rho_ps,
+    )
+
+    for idx in predesolv_indices:
+        tray = trays[idx]
         result = phz_mod.solve_phz_tray(
             nz_phz,
             tray.bed_height_m,
@@ -304,66 +296,62 @@ def _phz_pass(
             solid_feed.X1,
             solid_feed.X3,
             c.phz,
+            X2_critical=x2_cr,
+            X2_equilibrium=x2_eq,
         )
-        exit_state = result.solid_out
-        if exit_state.X2 > _x2_cr(exit_state.T):
-            completed.append(result)
-            cumulative_height += tray.bed_height_m
-            solid = exit_state
-            continue
+        completed.append(result)
+        solid = result.solid_out
 
-        def residual(
-            h: float, _tray: DTTray = tray, _solid_in: phz_mod.SolidState = solid
-        ) -> float:
-            frac = h / _tray.bed_height_m if _tray.bed_height_m > 0.0 else 0.0
-            r = phz_mod.solve_phz_tray(
-                nz_phz,
-                h,
-                _tray.diameter_m,
-                _tray.Q_indirect_w * frac,
-                _solid_in,
-                vapor_hint,
-                solid_feed.m_dry_kg_s,
-                m_vapor_water_kg_s,
-                solid_feed.X1,
-                solid_feed.X3,
-                c.phz,
-            )
-            return r.solid_out.X2 - _x2_cr(r.solid_out.T)
-
-        z_star = 0.0 if residual(0.0) <= 0.0 else brentq(residual, 0.0, tray.bed_height_m)
-        frac = z_star / tray.bed_height_m if tray.bed_height_m > 0.0 else 0.0
-        boundary_result = phz_mod.solve_phz_tray(
-            nz_phz,
-            z_star,
-            tray.diameter_m,
-            tray.Q_indirect_w * frac,
-            solid,
-            vapor_hint,
-            solid_feed.m_dry_kg_s,
-            m_vapor_water_kg_s,
-            solid_feed.X1,
-            solid_feed.X3,
-            c.phz,
-        )
-        return PHZPassResult(
-            tray_results=tuple(completed),
-            boundary_tray_index=idx,
-            z_star_m=z_star,
-            boundary_tray_result=boundary_result,
-            exit_state=boundary_result.solid_out,
-            L_PHZ_m=cumulative_height + z_star,
-        )
-
-    raise ValueError(
-        "PHZ never reaches X2_cr within the given trays -- add more PREDESOLV/MAIN "
-        "trays or increase indirect steam duty"
+    # Hardware boundary: direct steam cannot contact the sealed PREDESOLV
+    # beds, so FTRZ always begins at the first countercurrent tray.  Reaching
+    # X2_cr inside PREDESOLV now changes the local jacket-driven mechanism
+    # (constant -> falling rate); it does not move the hardware handoff.
+    last_idx = predesolv_indices[-1]
+    last_tray = trays[last_idx]
+    last_result = completed.pop()
+    return PHZPassResult(
+        tray_results=tuple(completed),
+        boundary_tray_index=last_idx,
+        z_star_m=last_tray.bed_height_m,
+        boundary_tray_result=last_result,
+        exit_state=last_result.solid_out,
+        L_PHZ_m=sum(trays[i].bed_height_m for i in predesolv_indices),
     )
 
 
 # ---------------------------------------------------------------------------
 # DCZ domain assembly (per-tray duty apportionment -- see module docstring)
 # ---------------------------------------------------------------------------
+
+
+def _tray_q_Iv(tray: DTTray, A_bed_m2: float) -> float:
+    return tray.Q_indirect_w / (A_bed_m2 * tray.bed_height_m) if tray.bed_height_m > 0.0 else 0.0
+
+
+def _average_q_Iv_over_depth(trays: list[DTTray], depth_m: float, A_bed_m2: float) -> float:
+    """Length/volume-average jacket heat density over a zone from its top.
+
+    This lets the thin FTRZ cross a real-tray boundary without inheriting the
+    first tray's duty density over its entire length.  The FTRZ free-boundary
+    iteration calls it with its current length guess.
+    """
+    if depth_m <= 0.0:
+        return _tray_q_Iv(trays[0], A_bed_m2)
+    remaining_m = depth_m
+    integral_w_m2 = 0.0
+    covered_m = 0.0
+    for tray in trays:
+        share_m = min(max(remaining_m, 0.0), tray.bed_height_m)
+        integral_w_m2 += _tray_q_Iv(tray, A_bed_m2) * share_m
+        covered_m += share_m
+        remaining_m -= share_m
+        if remaining_m <= 1.0e-12:
+            break
+    if remaining_m > 1.0e-9:
+        raise ValueError(
+            f"FTRZ length ({depth_m:.4f} m) exceeds the remaining DT bed height ({covered_m:.4f} m)"
+        )
+    return integral_w_m2 / max(covered_m, 1.0e-12)
 
 
 def _build_dcz_domain(
@@ -376,20 +364,25 @@ def _build_dcz_domain(
     c: DTSolverConstants,
     nz_dcz: int,
 ) -> tuple[dcz.DCZConstants, tuple[float, ...]]:
-    host = remaining[0]
-    host_q_Iv = (
-        host.Q_indirect_w / (A_bed_m2 * host.bed_height_m) if host.bed_height_m > 0.0 else 0.0
-    )
-    host_remainder_m = host.bed_height_m - L_FTRZ_m
-
-    segments: list[tuple[float, float, float]] = [(0.0, host_remainder_m, host_q_Iv)]
-    z = host_remainder_m
-    for tray in remaining[1:]:
-        q_Iv_tray = (
-            tray.Q_indirect_w / (A_bed_m2 * tray.bed_height_m) if tray.bed_height_m > 0.0 else 0.0
+    total_remaining_m = sum(tray.bed_height_m for tray in remaining)
+    if L_FTRZ_m >= total_remaining_m:
+        raise ValueError(
+            f"FTRZ length ({L_FTRZ_m:.4f} m) leaves no DCZ domain within "
+            f"the remaining DT bed ({total_remaining_m:.4f} m)"
         )
-        segments.append((z, z + tray.bed_height_m, q_Iv_tray))
-        z += tray.bed_height_m
+
+    segments: list[tuple[float, float, float]] = []
+    ftrz_left_m = L_FTRZ_m
+    z = 0.0
+    for tray in remaining:
+        ftrz_share_m = min(max(ftrz_left_m, 0.0), tray.bed_height_m)
+        dcz_share_m = tray.bed_height_m - ftrz_share_m
+        ftrz_left_m -= ftrz_share_m
+        if dcz_share_m <= 1.0e-12:
+            continue
+        q_Iv_tray = _tray_q_Iv(tray, A_bed_m2)
+        segments.append((z, z + dcz_share_m, q_Iv_tray))
+        z += dcz_share_m
     L_DCZ_total_m = z
 
     dz = L_DCZ_total_m / nz_dcz
@@ -404,7 +397,7 @@ def _build_dcz_domain(
         profile.append(q)
 
     dcz_c = dcz.DCZConstants(
-        diameter_m=host.diameter_m,
+        diameter_m=remaining[0].diameter_m,
         bed_height_m=L_DCZ_total_m,
         hM=hM,
         hQ=hQ,
@@ -424,6 +417,22 @@ def _build_dcz_domain(
         pressure_pa=c.pressure_pa,
     )
     return dcz_c, tuple(profile)
+
+
+def _adapt_relaxation(
+    value: float,
+    residual: float,
+    previous_residual: float,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    """Safeguarded residual-monotonic damping update for the outer coupling."""
+    if not math.isfinite(residual) or residual > 1.20 * previous_residual:
+        return max(minimum, 0.7 * value)
+    if residual < 0.995 * previous_residual:
+        return min(maximum, 1.05 * value)
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -447,11 +456,9 @@ class DTAxialProfile:
     values). Parallel tuples, one entry per cell, ordered top-to-bottom by
     `z_m` (cumulative distance from the DT's own top face).
 
-    `vapor_flow_kg_s` is a REAL, cell-varying quantity in PHZ/FTRZ (hexane
-    evaporation/condensation changes the vapor's own total mass flow as it
-    travels) but a FIXED *input* to DCZ's own zone solve (`solve_dcz_zone`
-    takes one scalar `m_vapor_kg_s`, not a per-cell profile) -- so this trace
-    is flat across the DCZ segment by construction, not a rendering artifact.
+    `vapor_flow_kg_s` is a real, cell-varying quantity throughout: PHZ/FTRZ
+    evaporation/condensation and DCZ particle transfer/water sorption all
+    change the explicit component flows as vapor travels upward.
     """
 
     z_m: tuple[float, ...]
@@ -464,6 +471,17 @@ class DTAxialProfile:
     vapor_flow_kg_s: tuple[float, ...]  # total (water + hexane)
     vapor_hexane_frac: tuple[float, ...]  # mass fraction, 0-1
     vapor_water_frac: tuple[float, ...]  # mass fraction, 0-1
+    mechanism: tuple[str, ...]  # local transfer closure, finer than hardware zone
+
+
+@dataclass(frozen=True)
+class DTCouplingResiduals:
+    solid_interface_T: float = math.inf
+    vapor_interface_T: float = math.inf
+    vapor_interface_hexane_fraction: float = math.inf
+    vapor_interface_water_flow: float = math.inf
+    vapor_interface_hexane_flow: float = math.inf
+    ftrz_length: float = math.inf
 
 
 @dataclass(frozen=True)
@@ -481,12 +499,114 @@ class DTResult:
     aV: float
     outer_iterations: int
     converged: bool
+    coupling_residuals: DTCouplingResiduals = DTCouplingResiduals()
 
     @property
     def solid_exit_X2(self) -> float:
         """Hexane leaving the whole DT (kg/kg dry solid) -- the DCZ's own
         volumetric-mean exit value, Coletto's own KPI (Fig. 9(a))."""
         return self.dcz.solid_out_X2
+
+
+def validate_dt_result(result: DTResult, solid_feed: SolidFeed, c: DTSolverConstants) -> None:
+    """Raise ``ValueError`` unless a result is safe to publish.
+
+    ``solve_dt`` intentionally returns its best iterate when it reaches the
+    outer-iteration cap.  That is useful diagnostically, but a digital-twin
+    acceptance boundary must not replace its last trusted state with either a
+    nonconverged iterate or a numerically finite yet physically impossible
+    profile.
+
+    The lower temperature bound expresses the no-refrigeration character of
+    the DT: jackets, condensing steam, and hot vapor cannot cool the bulk meal
+    below the colder of the incoming meal and hexane's boiling temperature.
+    In particular, a water dew-point closure may describe an interface but
+    cannot overwrite the FTRZ bulk temperature governed by Coletto A.17.
+    """
+    if not result.converged:
+        raise ValueError("DT solve did not converge")
+    if not result.dcz.converged:
+        raise ValueError("DT solve contains a nonconverged DCZ inner solution")
+    if result.dcz.residuals.maximum_scaled > 1.0:
+        raise ValueError("DT solve contains unresolved DCZ fixed-point residuals")
+
+    profile = result.axial_profile
+    parallel_fields = (
+        profile.z_m,
+        profile.zone,
+        profile.stage_id,
+        profile.solid_T,
+        profile.solid_X1,
+        profile.solid_X2,
+        profile.vapor_T,
+        profile.vapor_flow_kg_s,
+        profile.vapor_hexane_frac,
+        profile.vapor_water_frac,
+        profile.mechanism,
+    )
+    n = len(profile.z_m)
+    if n == 0 or any(len(values) != n for values in parallel_fields):
+        raise ValueError("DT axial profile fields must be nonempty and parallel")
+    if any(not math.isfinite(value) for value in profile.z_m):
+        raise ValueError("DT axial coordinates must be finite")
+    if any(b < a for a, b in zip(profile.z_m, profile.z_m[1:])):
+        raise ValueError("DT axial coordinates must be ordered top-to-bottom")
+
+    numeric_profile_fields = (
+        profile.solid_T,
+        profile.solid_X1,
+        profile.solid_X2,
+        profile.vapor_T,
+        profile.vapor_flow_kg_s,
+        profile.vapor_hexane_frac,
+        profile.vapor_water_frac,
+    )
+    if any(not math.isfinite(value) for values in numeric_profile_fields for value in values):
+        raise ValueError("DT axial profile contains a non-finite state")
+
+    min_bulk_T = min(solid_feed.T, c.ftrz.T_boil_hexane) - 1.0
+    if any(value < min_bulk_T for value in profile.solid_T):
+        raise ValueError("DT bulk-meal temperature fell below its physical lower bound")
+    if any(value <= 0.0 for value in profile.vapor_T):
+        raise ValueError("DT vapor temperature must remain above absolute zero")
+    if any(value <= 0.0 for value in profile.vapor_flow_kg_s):
+        raise ValueError("DT vapor flow must remain positive")
+    for values, name in (
+        (profile.solid_X1, "solid moisture"),
+        (profile.solid_X2, "solid hexane"),
+        (profile.vapor_hexane_frac, "vapor hexane fraction"),
+        (profile.vapor_water_frac, "vapor water fraction"),
+    ):
+        if any(value < -1.0e-9 or value > 1.0 + 1.0e-9 for value in values):
+            raise ValueError(f"DT {name} left the physical [0, 1] range")
+    if any(
+        abs(hexane + water - 1.0) > 1.0e-6
+        for hexane, water in zip(profile.vapor_hexane_frac, profile.vapor_water_frac)
+    ):
+        raise ValueError("DT binary-vapor mass fractions do not sum to one")
+
+    if not result.tray_summaries:
+        raise ValueError("DT result must contain tray summaries")
+    for summary in result.tray_summaries:
+        if not all(math.isfinite(value) for value in (summary.T, summary.X1, summary.X2)):
+            raise ValueError(f"DT tray {summary.id} contains a non-finite state")
+        if summary.T < min_bulk_T:
+            raise ValueError(f"DT tray {summary.id} temperature is below its physical lower bound")
+        if not (0.0 <= summary.X1 <= 1.0 and 0.0 <= summary.X2 <= 1.0):
+            raise ValueError(f"DT tray {summary.id} composition left the physical [0, 1] range")
+
+    lengths = (result.L_PHZ_m, result.L_FTRZ_m, result.L_DCZ_m)
+    if any(not math.isfinite(value) or value < 0.0 for value in lengths):
+        raise ValueError("DT zone lengths must be finite and non-negative")
+    if not all(math.isfinite(value) and value > 0.0 for value in (result.hQ, result.hM, result.aV)):
+        raise ValueError("DT transport coefficients must be finite and positive")
+    if abs(result.L_FTRZ_m - result.ftrz.L_FTRZ_m) > 1.0e-3:
+        raise ValueError("DT FTRZ result and moving-boundary geometry are inconsistent")
+    if (
+        result.dcz.warm_start is None
+        or abs(result.L_DCZ_m - result.dcz.warm_start.bed_height_m) > 1.0e-9
+    ):
+        raise ValueError("DT DCZ result and remeshed geometry are inconsistent")
 
 
 def solve_dt(
@@ -501,9 +621,11 @@ def solve_dt(
     outer_tol: float = 1.0e-5,
     outer_max_iter: int = 100,
     dcz_inner_max_iter: int = 100,
+    dcz_continuation_max_blocks: int = 100,
     warm_start_vapor_in: ftrz.VaporState | None = None,
     warm_start_T_L_sup: float | None = None,
     sweep_arm_rpm: float = 0.0,
+    residual_log: list[tuple[int, DTCouplingResiduals, float, float, float]] | None = None,
 ) -> DTResult:
     """Solve the integrated DT: PHZ once, then FTRZ<->DCZ Gauss-Seidel (see
     module docstring for the full design). `warm_start_vapor_in`/
@@ -514,6 +636,18 @@ def solve_dt(
     """
     if not trays:
         raise ValueError("solve_dt requires at least one DT tray")
+    if solid_feed.X3 < 0.0:
+        raise ValueError("feed oil content X3 must be non-negative")
+
+    # Oil is a live feed disturbance, not a frozen material constant. PHZ
+    # already consumes ``solid_feed.X3`` directly; give FTRZ's equilibrium
+    # relation and DCZ's particle inventory the same current value. ``replace``
+    # keeps the caller-owned frozen constants immutable across solves.
+    c = replace(
+        c,
+        ftrz=replace(c.ftrz, X3=solid_feed.X3),
+        particle=replace(c.particle, X3=solid_feed.X3),
+    )
     diameters = {t.diameter_m for t in trays}
     if len(diameters) != 1:
         raise ValueError("dt_solver currently requires a uniform tray diameter across the DT")
@@ -576,10 +710,9 @@ def solve_dt(
             "domain remains for the given trays/duties"
         )
 
-    host = remaining[0]
-    host_q_Iv = (
-        host.Q_indirect_w / (A_bed_m2 * host.bed_height_m) if host.bed_height_m > 0.0 else 0.0
-    )
+    def ftrz_q_Iv(length_m: float) -> float:
+        return _average_q_Iv_over_depth(remaining, length_m, A_bed_m2)
+
     X2_sup = phz_result.exit_state.X2
 
     # --- FTRZ<->DCZ Gauss-Seidel outer loop ---
@@ -595,8 +728,18 @@ def solve_dt(
     q_Iv_profile: tuple[float, ...] | None = None
     ftrz_result: ftrz.FTRZZoneResult | None = None
     dcz_result: dcz.DCZZoneResult | None = None
+    dcz_warm_start: dcz.DCZWarmStart | None = None
     converged = False
+    coupling_residuals = DTCouplingResiduals()
     iterations = 0
+    base_relaxation = min(max(outer_relaxation, 1.0e-3), 1.0)
+    temperature_relaxation = base_relaxation
+    hexane_relaxation = base_relaxation
+    water_relaxation = min(base_relaxation, 0.15)
+    previous_temperature_residual = math.inf
+    previous_hexane_residual = math.inf
+    previous_water_residual = math.inf
+    previous_raw_L_FTRZ_m: float | None = None
 
     for iterations in range(1, outer_max_iter + 1):
         ftrz_result = ftrz.solve_ftrz_zone(
@@ -604,83 +747,61 @@ def solve_dt(
             X2_sup=X2_sup,
             m_dry_kg_s=solid_feed.m_dry_kg_s,
             vapor_in=vapor_in,
-            q_Iv_w_m3=host_q_Iv,
+            q_Iv_w_m3=ftrz_q_Iv,
             hQ=hQ,
+            hM=hM,
             aV_m2_per_m3=aV,
             diameter_m=diameter_m,
             c=c.ftrz,
             X1_sup=solid_feed.X1,
+            T_solid_sup=phz_result.exit_state.T,
         )
 
-        if L_FTRZ_m is None:
-            L_FTRZ_m = ftrz_result.L_FTRZ_m
-            if L_FTRZ_m >= host.bed_height_m:
-                raise ValueError(
-                    f"FTRZ length ({L_FTRZ_m:.4f} m) exceeds its host tray {host.id}'s "
-                    f"own remaining height ({host.bed_height_m:.4f} m) -- geometry/duty "
-                    "inputs are not physically consistent with a thin FTRZ"
-                )
-            dcz_c, q_Iv_profile = _build_dcz_domain(
-                remaining, L_FTRZ_m, A_bed_m2, hQ, hM, aV, c, nz_dcz
+        raw_L_FTRZ_m = ftrz_result.L_FTRZ_m
+        L_FTRZ_m = raw_L_FTRZ_m
+        d_length = (
+            math.inf
+            if previous_raw_L_FTRZ_m is None
+            else abs(raw_L_FTRZ_m - previous_raw_L_FTRZ_m)
+        )
+        previous_raw_L_FTRZ_m = raw_L_FTRZ_m
+        dcz_c, q_Iv_profile = _build_dcz_domain(
+            remaining, L_FTRZ_m, A_bed_m2, hQ, hM, aV, c, nz_dcz
+        )
+
+        # A cap-limited inner result is not a valid outer-map evaluation.
+        # Continue it in bounded blocks from the complete lagged state while
+        # keeping the FTRZ boundary and DCZ mesh fixed.  Outer iteration
+        # accounting therefore means what it says: one count per fully
+        # resolved FTRZ<->DCZ map, not one count per arbitrary inner block.
+        for _ in range(dcz_continuation_max_blocks):
+            dcz_result = dcz.solve_dcz_zone(
+                nz=nz_dcz,
+                m_dry_kg_s=solid_feed.m_dry_kg_s,
+                m_vapor_kg_s=m_vapor_total_kg_s,
+                T_L_sup=T_L_sup,
+                vapor_inf=vapor_inf,
+                q_Iv_w_m3=q_Iv_profile,
+                c=dcz_c,
+                X1_in=solid_feed.X1 + ftrz_result.solid_out.X1,
+                outer_max_iter=dcz_inner_max_iter,
+                outer_relaxation=outer_relaxation,
+                warm_start=dcz_warm_start,
             )
-
-        dcz_result = dcz.solve_dcz_zone(
-            nz=nz_dcz,
-            m_dry_kg_s=solid_feed.m_dry_kg_s,
-            m_vapor_kg_s=m_vapor_total_kg_s,
-            T_L_sup=T_L_sup,
-            vapor_inf=vapor_inf,
-            q_Iv_w_m3=q_Iv_profile,
-            c=dcz_c,
-            # X1 entering DCZ is FTRZ's own exit moisture, computable each
-            # outer pass since FTRZ (above) already solved this iteration --
-            # see the tray-summary loop below for the OUTPUT-side use of the
-            # same quantity.
-            X1_in=solid_feed.X1 + ftrz_result.solid_out.X1,
-            # Defaults to solve_dcz_zone's own default (100) -- exposed as a
-            # tunable rather than hardcoded because DCZ's OWN inner
-            # Gauss-Seidel loop doesn't strictly need to fully re-converge
-            # every single outer dt_solver pass (THIS loop keeps re-solving
-            # it with updated T_L_sup/vapor_inf until ITS OWN convergence
-            # criterion is met). Empirically, though, lowering this cap for
-            # speed measurably changes the converged profile near the FTRZ
-            # /DCZ interface (confirmed: dropping to 30 breaks strict
-            # monotonicity of the reported hexane profile there) -- so the
-            # default stays conservative; only lower it deliberately, e.g.
-            # for a future real-time (M3) wrapper's own speed/accuracy
-            # trade-off, not silently for this module's own convenience.
-            outer_max_iter=dcz_inner_max_iter,
-        )
+            dcz_warm_start = dcz_result.warm_start
+            if dcz_result.converged:
+                break
+        if not dcz_result.converged:
+            break
 
         new_T_L_sup = ftrz_result.solid_out.T
         dcz_top = dcz_result.vapor_out
-        # Water NET transferred from vapor to solid within DCZ (moisture
-        # balance, see zones/dcz.py's own module docstring) leaves the total
-        # vapor mass reaching FTRZ's own bottom BC lower than the fixed
-        # whole-DT total -- account for it here rather than silently
-        # reintroducing it at the handoff. Found this session (a second,
-        # related gap the same design pass that found dcz.py's own
-        # condensation/wV2 gap also turned up): using ONLY
-        # `dcz_result.total_condensed_kg_s` here undercounts this -- that
-        # property sums ONLY the supersaturated-condensation branch, not the
-        # (now real, isotherm-driven) subsaturated adsorption/desorption
-        # branch, which in the common (non-supersaturated) operating regime
-        # is often the ONLY branch doing anything at all (confirmed directly
-        # during the direct_steam inversion work: `total_condensed_kg_s` was
-        # zero in the real scenario while `X1` still moved measurably) --
-        # meaning this correction was previously a near no-op in the typical
-        # case, silently reintroducing isotherm-adsorbed water into the
-        # vapor stream it had just left. The SOLID's own net X1 change
-        # (dry-solid-mass-scaled) captures BOTH branches' combined effect
-        # exactly, independent of which branch(es) contributed.
-        X1_in_to_dcz = solid_feed.X1 + ftrz_result.solid_out.X1
-        total_water_to_solid_kg_s = solid_feed.m_dry_kg_s * (
-            dcz_result.solid_out_X1 - X1_in_to_dcz
-        )
-        m_vapor_into_ftrz_kg_s = m_vapor_total_kg_s - total_water_to_solid_kg_s
+        # DCZ now marches explicit water and hexane component flows. Use
+        # those solved boundary values directly instead of reconstructing a
+        # total flow from solid moisture and then splitting it by wV2.
         new_vapor_in = ftrz.VaporState(
-            m_water_kg_s=(1.0 - dcz_top.wV2) * m_vapor_into_ftrz_kg_s,
-            m_hex_kg_s=dcz_top.wV2 * m_vapor_into_ftrz_kg_s,
+            m_water_kg_s=dcz_result.vapor_water_out_kg_s,
+            m_hex_kg_s=dcz_result.vapor_hexane_out_kg_s,
             T=dcz_top.T,
         )
 
@@ -692,17 +813,72 @@ def solve_dt(
             dcz_top.wV2 - vapor_in.m_hex_kg_s / (vapor_in.m_water_kg_s + vapor_in.m_hex_kg_s)
         )
         d_TV = abs(dcz_top.T - vapor_in.T)
-
-        T_L_sup = T_L_sup + outer_relaxation * (new_T_L_sup - T_L_sup)
-        vapor_in = ftrz.VaporState(
-            m_water_kg_s=vapor_in.m_water_kg_s
-            + outer_relaxation * (new_vapor_in.m_water_kg_s - vapor_in.m_water_kg_s),
-            m_hex_kg_s=vapor_in.m_hex_kg_s
-            + outer_relaxation * (new_vapor_in.m_hex_kg_s - vapor_in.m_hex_kg_s),
-            T=vapor_in.T + outer_relaxation * (new_vapor_in.T - vapor_in.T),
+        d_m_water = abs(new_vapor_in.m_water_kg_s - vapor_in.m_water_kg_s)
+        d_m_hex = abs(new_vapor_in.m_hex_kg_s - vapor_in.m_hex_kg_s)
+        coupling_residuals = DTCouplingResiduals(
+            solid_interface_T=d_T,
+            vapor_interface_T=d_TV,
+            vapor_interface_hexane_fraction=d_wV2,
+            vapor_interface_water_flow=d_m_water,
+            vapor_interface_hexane_flow=d_m_hex,
+            ftrz_length=d_length,
         )
 
-        if max(d_T, d_TV, d_wV2) <= outer_tol:
+        T_L_sup = T_L_sup + temperature_relaxation * (new_T_L_sup - T_L_sup)
+        vapor_in = ftrz.VaporState(
+            m_water_kg_s=vapor_in.m_water_kg_s
+            + water_relaxation * (new_vapor_in.m_water_kg_s - vapor_in.m_water_kg_s),
+            m_hex_kg_s=vapor_in.m_hex_kg_s
+            + hexane_relaxation * (new_vapor_in.m_hex_kg_s - vapor_in.m_hex_kg_s),
+            T=vapor_in.T + temperature_relaxation * (new_vapor_in.T - vapor_in.T),
+        )
+
+        temperature_residual = max(d_T, d_TV)
+        hexane_residual = max(d_wV2, d_m_hex)
+        water_residual = d_m_water
+        temperature_relaxation = _adapt_relaxation(
+            temperature_relaxation,
+            temperature_residual,
+            previous_temperature_residual,
+            minimum=0.05,
+            maximum=base_relaxation,
+        )
+        hexane_relaxation = _adapt_relaxation(
+            hexane_relaxation,
+            hexane_residual,
+            previous_hexane_residual,
+            minimum=0.05,
+            maximum=base_relaxation,
+        )
+        water_relaxation = _adapt_relaxation(
+            water_relaxation,
+            water_residual,
+            previous_water_residual,
+            minimum=0.025,
+            maximum=min(base_relaxation, 0.25),
+        )
+        previous_temperature_residual = temperature_residual
+        previous_hexane_residual = hexane_residual
+        previous_water_residual = water_residual
+        if residual_log is not None:
+            residual_log.append(
+                (
+                    iterations,
+                    coupling_residuals,
+                    temperature_relaxation,
+                    hexane_relaxation,
+                    water_relaxation,
+                )
+            )
+
+        # Finite-rate FTRZ water uptake makes the total vapor flow a genuine
+        # coupling variable: matching only temperature and composition can
+        # falsely declare convergence while kg/s is still changing.  Include
+        # both component flow residuals in the same physical outer gate.
+        if (
+            max(d_T, d_TV, d_wV2, d_m_water, d_m_hex) <= outer_tol
+            and d_length <= min(outer_tol, 1.0e-3)
+        ):
             converged = True
             break
 
@@ -713,6 +889,17 @@ def solve_dt(
     for r, t in zip(phz_result.tray_results, trays[: phz_result.boundary_tray_index]):
         tray_summaries.append(
             TraySummary(id=t.id, T=r.solid_out.T, X1=solid_feed.X1, X2=r.solid_out.X2)
+        )
+    boundary_tray = trays[phz_result.boundary_tray_index]
+    boundary_is_full_tray = abs(phz_result.z_star_m - boundary_tray.bed_height_m) <= 1.0e-9
+    if boundary_is_full_tray:
+        tray_summaries.append(
+            TraySummary(
+                id=boundary_tray.id,
+                T=phz_result.exit_state.T,
+                X1=solid_feed.X1,
+                X2=phz_result.exit_state.X2,
+            )
         )
 
     # X1 is carried unchanged through PHZ (its own scope excludes a moisture
@@ -735,22 +922,32 @@ def solve_dt(
         j = min(max(int((z_local_m - 1.0e-9) / dz_dcz), 0), nz_dcz - 1)
         return dcz_result.cells[j]
 
-    # The boundary (host) tray's own physical bottom face sits at DCZ-local
-    # z = host.bed_height_m - L_FTRZ_m (DCZ's z=0 is the FTRZ/DCZ interface,
-    # i.e. right where FTRZ finishes within this same tray).
-    z_local = host.bed_height_m - L_FTRZ_m
-    host_cell = _dcz_cell_at_bottom_face(z_local)
-    tray_summaries.append(
-        TraySummary(
-            id=host.id,
-            T=dcz.bulk_temperature(host_cell, geometry),
-            X1=host_cell.X1_bulk,
-            X2=host_cell.X2_bulk,
-        )
-    )
-    for tray in remaining[1:]:
-        z_local += tray.bed_height_m
-        cell = _dcz_cell_at_bottom_face(z_local)
+    def _ftrz_cell_at_bottom_face(depth_m: float) -> ftrz.FTRZCellResult:
+        z = 0.0
+        for cell in ftrz_result.cells:
+            z += cell.dz_m
+            if depth_m <= z + 1.0e-9:
+                return cell
+        return ftrz_result.cells[-1]
+
+    # A thin free-boundary zone may cross a real-tray boundary.  Sample every
+    # tray's physical bottom face from whichever zone actually contains it,
+    # rather than assuming FTRZ fits wholly inside ``remaining[0]``.
+    depth_from_ftrz_top_m = 0.0
+    for tray in remaining:
+        depth_from_ftrz_top_m += tray.bed_height_m
+        if depth_from_ftrz_top_m <= L_FTRZ_m + 1.0e-9:
+            cell = _ftrz_cell_at_bottom_face(depth_from_ftrz_top_m)
+            tray_summaries.append(
+                TraySummary(
+                    id=tray.id,
+                    T=cell.solid.T,
+                    X1=solid_feed.X1 + cell.solid.X1,
+                    X2=cell.solid.X2,
+                )
+            )
+            continue
+        cell = _dcz_cell_at_bottom_face(depth_from_ftrz_top_m - L_FTRZ_m)
         tray_summaries.append(
             TraySummary(
                 id=tray.id,
@@ -761,15 +958,17 @@ def solve_dt(
         )
 
     # --- whole-DT axial profile (visualization only, see DTAxialProfile docstring) ---
-    def _dcz_stage_id_at(z_local_m: float) -> str:
-        """Same half-open-interval bucketing `_build_dcz_domain`'s own q_Iv
-        profile already uses, just keyed on real tray id instead of duty."""
+    def _remaining_stage_id_at(depth_from_ftrz_top_m: float) -> str:
         z = 0.0
         for tray in remaining:
-            if z - 1.0e-9 <= z_local_m < z + tray.bed_height_m + 1.0e-9:
+            if z - 1.0e-9 <= depth_from_ftrz_top_m < z + tray.bed_height_m + 1.0e-9:
                 return tray.id
             z += tray.bed_height_m
         return remaining[-1].id
+
+    def _dcz_stage_id_at(z_local_m: float) -> str:
+        """Map a DCZ-local position back to its real tray."""
+        return _remaining_stage_id_at(L_FTRZ_m + z_local_m)
 
     prof_z: list[float] = []
     prof_zone: list[str] = []
@@ -781,6 +980,7 @@ def solve_dt(
     prof_vapor_flow: list[float] = []
     prof_vapor_hex: list[float] = []
     prof_vapor_water: list[float] = []
+    prof_mechanism: list[str] = []
 
     def _append_profile_point(
         z: float,
@@ -793,6 +993,7 @@ def solve_dt(
         v_flow: float,
         v_hex: float,
         v_water: float,
+        mechanism: str,
     ) -> None:
         prof_z.append(z)
         prof_zone.append(zone_name)
@@ -804,6 +1005,7 @@ def solve_dt(
         prof_vapor_flow.append(v_flow)
         prof_vapor_hex.append(v_hex)
         prof_vapor_water.append(v_water)
+        prof_mechanism.append(mechanism)
 
     # PHZ vapor -- PHYSICAL (not the old per-cell "informational" placeholder).
     # PHZ's SOLID solve is legitimately vapor-decoupled (the bed is jacket-heated,
@@ -866,10 +1068,22 @@ def solve_dt(
         dews = []
         if m_water > 1.0e-9:
             y_w = n_water / n_tot
-            dews.append(brentq(lambda T: thermo.antoine_pressure_pa(T, antoine_water) - y_w * P_atm, 230.0, 470.0))
+            dews.append(
+                brentq(
+                    lambda T: thermo.antoine_pressure_pa(T, antoine_water) - y_w * P_atm,
+                    230.0,
+                    470.0,
+                )
+            )
         if m_hex > 1.0e-9:
             y_h = n_hex / n_tot
-            dews.append(brentq(lambda T: thermo.antoine_pressure_pa(T, antoine_hexane) - y_h * P_atm, 230.0, 470.0))
+            dews.append(
+                brentq(
+                    lambda T: thermo.antoine_pressure_pa(T, antoine_hexane) - y_h * P_atm,
+                    230.0,
+                    470.0,
+                )
+            )
         return max(dews) if dews else fallback
 
     for i, (z, stage, cell) in enumerate(phz_points):
@@ -895,23 +1109,23 @@ def solve_dt(
             v_flow,
             m_hex / v_flow if v_flow > 0.0 else 0.0,
             m_water_phz / v_flow if v_flow > 0.0 else 1.0,
+            cell.regime,
         )
     z_cum = phz_result.L_PHZ_m  # authoritative, avoids float drift from the sum above
 
-    # FTRZ: thin zone, entirely within the boundary/host tray (solve_dt already
-    # raises above if L_FTRZ_m doesn't fit inside it). NOTE `cell.solid.X1` is the
-    # water CONDENSED within FTRZ only (it initializes at 0 and accumulates
-    # condensate top-to-bottom -- see zones/ftrz.py) -- so the displayed TOTAL
-    # moisture adds back the feed moisture the solid already carried through PHZ
-    # (`solid_feed.X1`, carried unchanged). Without this the profile drops to ~0%
-    # at the flash front and jumps back up at DCZ -- a display artifact, not real.
+    # FTRZ may cross a real-tray boundary. NOTE `cell.solid.X1` is the net
+    # water transferred within FTRZ only (bulk condensation plus finite-rate
+    # sorption, initialized at 0 and accumulated top-to-bottom), so the
+    # displayed TOTAL adds the feed moisture carried through PHZ.
+    ftrz_depth_m = 0.0
     for cell in ftrz_result.cells:
         z_cum += cell.dz_m
+        ftrz_depth_m += cell.dz_m
         v_flow = cell.vapor_out.m_water_kg_s + cell.vapor_out.m_hex_kg_s
         _append_profile_point(
             z_cum,
             "FTRZ",
-            host.id,
+            _remaining_stage_id_at(ftrz_depth_m),
             cell.solid.T,
             solid_feed.X1 + cell.solid.X1,
             cell.solid.X2,
@@ -919,11 +1133,11 @@ def solve_dt(
             v_flow,
             cell.vapor_out.m_hex_kg_s / v_flow,
             cell.vapor_out.m_water_kg_s / v_flow,
+            "STEAM_FLASH",
         )
     z_cum = phz_result.L_PHZ_m + L_FTRZ_m
 
-    # DCZ: vapor_flow_kg_s is the zone's own fixed scalar input, not a per-cell
-    # solved quantity (see DTAxialProfile docstring).
+    # DCZ: explicit component flows vary cell by cell.
     for j, cell in enumerate(dcz_result.cells):
         z_local_end = (j + 1) * dz_dcz
         z_local_center = (j + 0.5) * dz_dcz
@@ -936,9 +1150,10 @@ def solve_dt(
             cell.X1_bulk,
             cell.X2_bulk,
             cell.vapor_top.T,
-            m_vapor_total_kg_s,
+            cell.vapor_flow_kg_s,
             cell.vapor_top.wV2,
             1.0 - cell.vapor_top.wV2,
+            "DIFFUSION_CONTROLLED",
         )
 
     axial_profile = DTAxialProfile(
@@ -952,6 +1167,7 @@ def solve_dt(
         vapor_flow_kg_s=tuple(prof_vapor_flow),
         vapor_hexane_frac=tuple(prof_vapor_hex),
         vapor_water_frac=tuple(prof_vapor_water),
+        mechanism=tuple(prof_mechanism),
     )
 
     return DTResult(
@@ -968,4 +1184,5 @@ def solve_dt(
         aV=aV,
         outer_iterations=iterations,
         converged=converged,
+        coupling_residuals=coupling_residuals,
     )

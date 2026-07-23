@@ -1,7 +1,4 @@
-"""Pre-Heating Zone (PHZ) sub-model — Coletto, Bandoni & Blanco (2022), §2.2 and
-§7.3/Table A.1 (BuildSpec). M2 Phase 1 (BuildSpec §14): a standalone, pure,
-unit-tested per-tray solver — not yet wired into `core/model.py` (that's M2
-Phase 4, the tray-by-tray fixed-point sweep).
+"""Predesolventizing / pre-heating (PHZ) sub-model.
 
 Per §2.1, each tray in a zone is discretized into `nz` axial cells of uniform
 height; indirect steam duty is per-tray (`Q_indirect_w`, matching the existing
@@ -10,7 +7,18 @@ tray's cells (eq. A.2a). Only the solid's temperature and hexane content are
 tracked (Table A.1 has no water mass balance for the PHZ solid — moisture is
 carried at a constant value throughout, only used for the mixture heat
 capacity); hexane evaporation switches on only once a cell reaches
-`T_boil_hexane` (eq. A.1a).
+`T_boil_hexane` (Coletto et al., 2022, eq. A.1a).
+
+The original implementation held the meal at the hexane boiling point until
+*all* solvent was exhausted.  That closure is only the constant-rate period.
+For ``X2 <= X2_critical`` this module now applies Faner et al. (2019), eqs.
+(5)--(7): a receding wet core and a growing dry-shell thermal resistance reduce
+the fraction of delivered jacket heat that can reach the evaporation front.
+The remainder heats the dry solid matrix, so the reported bulk meal
+temperature can rise above the normal hexane boiling point while pore solvent
+is still present.  Faner's experiments used convective superheated hexane;
+using the same particle resistance with the *delivered jacket heat flux* is a
+new boundary coupling in this model, not a verbatim equation from that paper.
 
 GAPS THE PAPER LEAVES IMPLICIT for PHZ specifically (flagged, not hidden):
 - The "mixture" heat capacity §2.1 specifies (eqs. B.1-B.6) combines solid +
@@ -45,6 +53,9 @@ class PHZConstants:
     cp_oil: float
     cp_water_vapor: float
     cp_hexane_vapor: float
+    particle_radius: float = 0.0
+    dry_shell_conductivity: float = 0.0
+    jacket_temperature: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -66,6 +77,8 @@ class PHZCellResult:
     vapor_out: VaporState
     hexane_evaporated_kg_s: float
     z_from_top_m: float  # position of this cell's solid outlet, top of tray = 0
+    regime: str = "SENSIBLE"
+    wet_core_fraction: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -103,30 +116,118 @@ def solve_phz_cell(
     X1: float,
     X3: float,
     c: PHZConstants,
+    *,
+    X2_critical: float | None = None,
+    X2_equilibrium: float = 0.0,
+    h_external_w_m2_k: float = 0.0,
 ) -> PHZCellResult:
-    """One PHZ cell: solid sensibly heats to `T_boil_hexane` (eq. A.1a's
-    `S_Lm2=0` branch), then evaporates hexane isothermally (the other branch).
+    """One PREDESOLV cell with sensible, constant-rate, and falling-rate periods.
+
+    Above ``X2_critical`` the closure is Coletto's sensible-then-isothermal
+    source switch.  Below it, Faner's spherical wet-core relation gives
+
+    ``Di/Dp = ((X2-Xeq)/(Xcr-Xeq))**(1/3)``
+
+    and the fraction of jacket heat reaching the front is ``U/h`` from their
+    eq. (6).  Energy not reaching the front heats the meal matrix.  Internal
+    energy substeps make the transition continuous within an axial cell.
+
     `m_dry_kg_s` is the (constant) dry-solid mass flow; `m_vapor_water_kg_s` is
     the (constant, per Table A.1's water mass balance) vapor water mass flow.
     """
-    cp_mix = _mixture_cp_per_kg_dry_solid(X1, solid_in.X2, X3, c)
-    E_preheat_w = m_dry_kg_s * cp_mix * max(c.T_boil_hexane - solid_in.T, 0.0)
+    if q_cell_w < 0.0:
+        raise ValueError("PHZ cell duty must be non-negative")
+    if m_dry_kg_s <= 0.0:
+        raise ValueError("PHZ dry-solid flow must be positive")
 
-    if q_cell_w < E_preheat_w:
-        T_out = solid_in.T + q_cell_w / (m_dry_kg_s * cp_mix)
-        X2_out = solid_in.X2
-        hexane_evap_kg_s = 0.0
-    else:
-        q_remaining_w = q_cell_w - E_preheat_w
-        hexane_evap_kg_s = q_remaining_w / c.dH_vap_hexane
-        X2_out = solid_in.X2 - hexane_evap_kg_s / m_dry_kg_s
-        if X2_out < 0.0:
-            # More heat than available hexane — shouldn't happen at PHZ's
-            # intended duties (Coletto §2.2: PHZ always exits with X2 > 0),
-            # but clamp rather than produce a negative hexane content.
-            hexane_evap_kg_s = solid_in.X2 * m_dry_kg_s
-            X2_out = 0.0
-        T_out = c.T_boil_hexane
+    falling_enabled = (
+        X2_critical is not None
+        and X2_critical > X2_equilibrium >= 0.0
+        and c.particle_radius > 0.0
+        and c.dry_shell_conductivity > 0.0
+        and h_external_w_m2_k > 0.0
+    )
+    x_cr = X2_critical if X2_critical is not None else 0.0
+    x_eq = max(min(X2_equilibrium, x_cr), 0.0)
+    T_out = solid_in.T
+    X2_out = solid_in.X2
+    hexane_evap_kg_s = 0.0
+    regimes: set[str] = set()
+
+    # Eight energy slices are enough to resolve the rapidly growing shell
+    # resistance without introducing another nonlinear iteration into the
+    # real-time axial solve.
+    n_energy_steps = 8 if falling_enabled else 1
+    for _ in range(n_energy_steps):
+        q_remaining_w = q_cell_w / n_energy_steps
+        cp_mix = _mixture_cp_per_kg_dry_solid(X1, X2_out, X3, c)
+
+        if T_out < c.T_boil_hexane and q_remaining_w > 0.0:
+            q_preheat_w = min(
+                q_remaining_w,
+                m_dry_kg_s * cp_mix * (c.T_boil_hexane - T_out),
+            )
+            T_out += q_preheat_w / (m_dry_kg_s * cp_mix)
+            q_remaining_w -= q_preheat_w
+            regimes.add("SENSIBLE")
+
+        if q_remaining_w <= 0.0:
+            continue
+
+        if not falling_enabled:
+            evaporated = min(
+                q_remaining_w / c.dH_vap_hexane,
+                m_dry_kg_s * max(X2_out, 0.0),
+            )
+            X2_out -= evaporated / m_dry_kg_s
+            hexane_evap_kg_s += evaporated
+            q_remaining_w -= evaporated * c.dH_vap_hexane
+            regimes.add("CONSTANT_RATE")
+        else:
+            if X2_out > x_cr:
+                evaporated = min(
+                    q_remaining_w / c.dH_vap_hexane,
+                    m_dry_kg_s * (X2_out - x_cr),
+                )
+                X2_out -= evaporated / m_dry_kg_s
+                hexane_evap_kg_s += evaporated
+                q_remaining_w -= evaporated * c.dH_vap_hexane
+                regimes.add("CONSTANT_RATE")
+
+            if q_remaining_w > 0.0 and X2_out > x_eq:
+                wet_fraction = min(max((X2_out - x_eq) / (x_cr - x_eq), 0.0), 1.0)
+                diameter = 2.0 * c.particle_radius
+                wet_core_diameter = diameter * wet_fraction ** (1.0 / 3.0)
+                wet_core_diameter = max(wet_core_diameter, diameter * 1.0e-9)
+                resistance_ratio = (
+                    h_external_w_m2_k
+                    * diameter
+                    * (diameter - wet_core_diameter)
+                    / (2.0 * c.dry_shell_conductivity * wet_core_diameter)
+                )
+                latent_fraction = 1.0 / (1.0 + resistance_ratio)
+                latent_w = min(
+                    q_remaining_w * latent_fraction,
+                    m_dry_kg_s * (X2_out - x_eq) * c.dH_vap_hexane,
+                )
+                evaporated = latent_w / c.dH_vap_hexane
+                X2_out -= evaporated / m_dry_kg_s
+                hexane_evap_kg_s += evaporated
+                sensible_w = q_remaining_w - latent_w
+                cp_mix = _mixture_cp_per_kg_dry_solid(X1, X2_out, X3, c)
+                T_out += sensible_w / (m_dry_kg_s * cp_mix)
+                regimes.add("FALLING_RATE")
+                q_remaining_w = 0.0
+
+        if q_remaining_w > 0.0:
+            cp_mix = _mixture_cp_per_kg_dry_solid(X1, X2_out, X3, c)
+            T_out += q_remaining_w / (m_dry_kg_s * cp_mix)
+            regimes.add("DRY_HEATING")
+
+        if c.jacket_temperature > 0.0:
+            T_out = min(T_out, c.jacket_temperature)
+
+    X2_out = max(X2_out, x_eq if falling_enabled else 0.0)
 
     solid_out = SolidState(T=T_out, X2=X2_out)
 
@@ -148,6 +249,18 @@ def solve_phz_cell(
         vapor_out=vapor_out,
         hexane_evaporated_kg_s=hexane_evap_kg_s,
         z_from_top_m=0.0,  # filled in by solve_phz_tray, which knows cell height
+        regime=(
+            "FALLING_RATE"
+            if "FALLING_RATE" in regimes
+            else "DRY_HEATING"
+            if "DRY_HEATING" in regimes
+            else "CONSTANT_RATE"
+            if "CONSTANT_RATE" in regimes
+            else "SENSIBLE"
+        ),
+        wet_core_fraction=(
+            min(max((X2_out - x_eq) / (x_cr - x_eq), 0.0), 1.0) if falling_enabled else 1.0
+        ),
     )
 
 
@@ -163,6 +276,9 @@ def solve_phz_tray(
     X1: float,
     X3: float,
     c: PHZConstants,
+    *,
+    X2_critical: float | None = None,
+    X2_equilibrium: float = 0.0,
 ) -> PHZTrayResult:
     """Solve one PHZ tray, discretized into `nz` cells (eq. A.2a: `q_Iv =
     Q_I/(A_bed*L_PHZ)`, spread uniformly — for a uniform cell height this
@@ -177,12 +293,27 @@ def solve_phz_tray(
     """
     dz = bed_height_m / nz
     q_cell_w = Q_indirect_w / nz  # uniform split of the tray's total duty across its nz cells
+    area_m2 = 3.141592653589793 / 4.0 * diameter_m**2
+    jacket_driving_k = max(c.jacket_temperature - max(solid_in.T, c.T_boil_hexane), 1.0)
+    h_external = Q_indirect_w / (area_m2 * jacket_driving_k) if area_m2 > 0.0 else 0.0
 
     cells: list[PHZCellResult] = []
     solid = solid_in
     vapor = vapor_in
     for i in range(nz):
-        result = solve_phz_cell(solid, vapor, q_cell_w, m_dry_kg_s, m_vapor_water_kg_s, X1, X3, c)
+        result = solve_phz_cell(
+            solid,
+            vapor,
+            q_cell_w,
+            m_dry_kg_s,
+            m_vapor_water_kg_s,
+            X1,
+            X3,
+            c,
+            X2_critical=X2_critical,
+            X2_equilibrium=X2_equilibrium,
+            h_external_w_m2_k=h_external,
+        )
         result = replace(result, z_from_top_m=(i + 1) * dz)
         cells.append(result)
         solid = result.solid_out

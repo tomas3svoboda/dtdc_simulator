@@ -5,6 +5,8 @@ moisture rises, solid temperature approaches (never exceeds) the vapor inlet
 temperature, and the zone is thin (paper reports <2 cm at its own base case).
 """
 
+from dataclasses import replace
+
 import pytest
 
 from dtdc_simulator.core import thermo
@@ -35,12 +37,20 @@ CONSTANTS = ftrz.FTRZConstants(
     rho_ps=1513.0,
     X3=0.0139,
     bed_porosity=0.4,
+    water_diffusivity=3.1e-11,
+    particle_radius=1.0e-3,
 )
 M_DRY_KG_S = 11.89  # Fig. 1 base case, dry-solid basis (see test_phz.py)
 
 
 def _solve(
-    vapor_in: ftrz.VaporState, X2_sup: float, q_Iv_w_m3: float, nz: int = 20
+    vapor_in: ftrz.VaporState,
+    X2_sup: float,
+    q_Iv_w_m3: float,
+    nz: int = 20,
+    constants: ftrz.FTRZConstants = CONSTANTS,
+    X1_sup: float = 0.0,
+    T_solid_sup: float | None = None,
 ) -> ftrz.FTRZZoneResult:
     return ftrz.solve_ftrz_zone(
         nz=nz,
@@ -49,9 +59,12 @@ def _solve(
         vapor_in=vapor_in,
         q_Iv_w_m3=q_Iv_w_m3,
         hQ=500.0,
+        hM=0.01,
         aV_m2_per_m3=1000.0,
         diameter_m=4.0,
-        c=CONSTANTS,
+        c=constants,
+        X1_sup=X1_sup,
+        T_solid_sup=T_solid_sup,
     )
 
 
@@ -75,6 +88,37 @@ def test_solid_temperature_bounded_by_hexane_bp_and_vapor_temp() -> None:
         X2=0.005, X2_cr=0.1, X2_eq=0.01, T_boil_hexane=T_hex_bp, T_V=T_v
     )
     assert T_l_dry == pytest.approx(T_v)  # fully dry -> equals vapor temperature
+
+
+def test_superheated_matrix_credit_is_mesh_independent_and_not_added_twice_to_vapor() -> None:
+    vapor_in = ftrz.VaporState(m_water_kg_s=5.0, m_hex_kg_s=0.5, T=373.0)
+    constants = replace(
+        CONSTANTS,
+        cp_solid=2317.0,
+        cp_hexane_liquid=2260.0,
+        cp_oil=2000.0,
+    )
+    coarse = _solve(
+        vapor_in,
+        X2_sup=0.03,
+        q_Iv_w_m3=0.0,
+        nz=10,
+        constants=constants,
+        T_solid_sup=400.0,
+    )
+    fine = _solve(
+        vapor_in,
+        X2_sup=0.03,
+        q_Iv_w_m3=0.0,
+        nz=40,
+        constants=constants,
+        T_solid_sup=400.0,
+    )
+
+    assert coarse.L_FTRZ_m == pytest.approx(1.0e-9)
+    assert fine.L_FTRZ_m == pytest.approx(coarse.L_FTRZ_m)
+    assert max(cell.vapor_out.T for cell in fine.cells) < 450.0
+    assert all(cell.sensible_heat_to_solid_w == 0.0 for cell in fine.cells)
 
 
 # ------------------------------------------------------------------ single-cell regimes
@@ -166,3 +210,84 @@ def test_condensation_raises_solid_moisture_when_the_zone_saturates() -> None:
     assert result.vapor_out.m_water_kg_s == pytest.approx(
         vapor_in.m_water_kg_s - total_condensed_kg_s
     )
+
+
+# ------------------------------------------------------------------ finite-rate water transfer
+
+
+def test_water_transfer_rate_combines_internal_and_external_resistances() -> None:
+    k_internal = 15.0 * 3.1e-11 / 1.0e-3**2
+    k_external = 0.01 * 1000.0
+    rate = ftrz.water_transfer_rate_s(3.1e-11, 1.0e-3, 0.01, 1000.0)
+
+    assert 0.0 < rate < min(k_internal, k_external)
+    assert rate == pytest.approx(1.0 / (1.0 / k_internal + 1.0 / k_external))
+    assert ftrz.water_transfer_rate_s(0.0, 1.0e-3, 0.01, 1000.0) == 0.0
+
+
+def test_moisture_relaxation_is_rate_limited_and_bounded() -> None:
+    X1_initial = 0.10
+    X1_equilibrium = 0.25
+
+    unchanged = ftrz.relax_moisture(X1_initial, X1_equilibrium, 30.0, 0.0)
+    short = ftrz.relax_moisture(X1_initial, X1_equilibrium, 30.0, 0.01)
+    long = ftrz.relax_moisture(X1_initial, X1_equilibrium, 300.0, 0.01)
+
+    assert unchanged == X1_initial
+    assert X1_initial < short < long < X1_equilibrium
+
+
+def test_finite_rate_sorption_responds_to_water_diffusivity_and_conserves_mass() -> None:
+    vapor_in = ftrz.VaporState(m_water_kg_s=5.0, m_hex_kg_s=0.5, T=373.0)
+    luikov = thermo.LuikovParams(A1=0.880, A2=12.184)
+    slow_constants = replace(CONSTANTS, luikov=luikov, water_diffusivity=3.1e-11)
+    fast_constants = replace(CONSTANTS, luikov=luikov, water_diffusivity=3.1e-7)
+
+    slow = _solve(vapor_in, X2_sup=0.10, q_Iv_w_m3=2.0e5, constants=slow_constants, X1_sup=0.10)
+    fast = _solve(vapor_in, X2_sup=0.10, q_Iv_w_m3=2.0e5, constants=fast_constants, X1_sup=0.10)
+
+    assert 0.0 < slow.solid_out.X1 < fast.solid_out.X1
+    for result in (slow, fast):
+        vapor_water_loss = vapor_in.m_water_kg_s - result.vapor_out.m_water_kg_s
+        assert vapor_water_loss == pytest.approx(M_DRY_KG_S * result.solid_out.X1, abs=1.0e-10)
+        assert vapor_water_loss == pytest.approx(
+            sum(cell.condensed_water_kg_s for cell in result.cells), abs=1.0e-10
+        )
+
+
+def test_water_interface_dew_point_does_not_replace_bulk_a17_temperature() -> None:
+    """A hexane-rich vapor can have a water dew point below hexane's boiling
+    point. That value belongs to the water interface/sorption closure; it must
+    not overwrite the bulk meal temperature supplied by Coletto A.17."""
+    constants = replace(
+        CONSTANTS,
+        luikov=thermo.LuikovParams(A1=0.880, A2=12.184),
+    )
+    result = _solve(
+        ftrz.VaporState(m_water_kg_s=1.0, m_hex_kg_s=10.0, T=380.0),
+        X2_sup=0.26,
+        q_Iv_w_m3=2.0e5,
+        constants=constants,
+        X1_sup=0.12,
+        T_solid_sup=constants.T_boil_hexane,
+    )
+
+    assert any(cell.water_surface_T < constants.T_boil_hexane for cell in result.cells)
+    assert all(cell.solid.T >= constants.T_boil_hexane for cell in result.cells)
+    assert all(cell.solid.T >= cell.water_surface_T for cell in result.cells)
+
+
+def test_zero_sorption_rate_preserves_bulk_condensation_without_double_counting() -> None:
+    T_dew0 = thermo.dew_point_temperature(0.1, ANTOINE_WATER)
+    vapor_in = ftrz.VaporState(m_water_kg_s=5.0, m_hex_kg_s=0.5, T=T_dew0)
+    constants = replace(
+        CONSTANTS,
+        luikov=thermo.LuikovParams(A1=0.880, A2=12.184),
+        water_diffusivity=0.0,
+    )
+    result = _solve(vapor_in, X2_sup=0.10, q_Iv_w_m3=0.0, constants=constants)
+
+    total_bulk = sum(cell.bulk_condensed_water_kg_s for cell in result.cells)
+    assert total_bulk > 0.0
+    assert sum(cell.sorbed_water_kg_s for cell in result.cells) == 0.0
+    assert result.solid_out.X1 == pytest.approx(total_bulk / M_DRY_KG_S)

@@ -2,8 +2,8 @@
 meal bed (T/hexane/moisture), both plotted against real height down the DT
 (PHZ -> FTRZ -> DCZ), not the single lumped per-tray average the pre-redesign
 dashboard showed. Source data is `Outputs.dt_axial_profile`
-(`core/dt_solver.py::DTAxialProfile`), which only refreshes when `solve_dt`
-reruns (`dt_resolve_interval_s` sim-time cadence, §7.9's quasi-steady map) --
+(`core/dt_solver.py::DTAxialProfile`), which only refreshes when a `solve_dt`
+attempt is accepted (`dt_resolve_interval_s` cadence, §7.9's quasi-steady map) --
 hence the "updated Ns ago" badge instead of a continuously-moving trace.
 
 Talks only to `RuntimeFacade`/`Snapshot` (BuildSpec §3): never imports `core/`
@@ -16,6 +16,18 @@ from __future__ import annotations
 from nicegui import ui
 
 from dtdc_simulator.interfaces.ui import theme
+
+
+def _profile_status_text(outputs, sim_time: float) -> str:
+    """Describe the latest attempt separately from the retained profile."""
+    accepted_age_s = sim_time - outputs.dt_last_solve_sim_time
+    if outputs.dt_solver_converged:
+        return f"(accepted profile resolved {accepted_age_s:.0f}s of sim time ago)"
+    attempt_age_s = sim_time - outputs.dt_last_attempt_sim_time
+    return (
+        f"(latest solve rejected {attempt_age_s:.0f}s ago; showing last accepted "
+        f"profile from {accepted_age_s:.0f}s ago)"
+    )
 
 
 def _chart(title: str, height_axis_name: str = "Height [m]") -> ui.echart:
@@ -95,8 +107,8 @@ class DTProfileView:
             ui.label("DT Meal-Bed Profile").classes("text-lg font-semibold mt-2")
             with ui.row().classes("w-full gap-2 flex-wrap"):
                 self._solid_T = _chart("T [°C]", "Packed bed height [m]")
-                self._solid_hex = _chart("Hexane [ppm]", "Packed bed height [m]")
-                self._solid_moist = _chart("Moisture [%]", "Packed bed height [m]")
+                self._solid_hex = _chart("Hexane [ppm dry basis]", "Packed bed height [m]")
+                self._solid_moist = _chart("Moisture [% wet basis]", "Packed bed height [m]")
 
     def sync(self, snap) -> None:
         outputs = snap.outputs
@@ -105,8 +117,7 @@ class DTProfileView:
         profile = outputs.dt_axial_profile
         zone = list(profile.zone)
         stage_id = list(profile.stage_id)
-        age_s = snap.sim_time - outputs.dt_last_solve_sim_time
-        self._updated_badge.text = f"(profile last resolved {age_s:.0f}s of sim time ago)"
+        self._updated_badge.text = _profile_status_text(outputs, snap.sim_time)
 
         # Vapor charts: GEOMETRIC height (vapor fills the whole tray). Meal charts:
         # PACKED height, each tray compressed by its live fill level (theme.packed_heights),
@@ -143,4 +154,8 @@ class DTProfileView:
 
         _set_meal(self._solid_T, [theme.k_to_c(v) for v in profile.solid_T])
         _set_meal(self._solid_hex, [v * 1.0e6 for v in profile.solid_X2])
-        _set_meal(self._solid_moist, [v * 100.0 for v in profile.solid_X1])
+        x3 = snap.dvs["feed_oil"]
+        moisture_wb = [
+            100.0 * x1 / (1.0 + x1 + x2 + x3) for x1, x2 in zip(profile.solid_X1, profile.solid_X2)
+        ]
+        _set_meal(self._solid_moist, moisture_wb)

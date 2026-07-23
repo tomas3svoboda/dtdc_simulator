@@ -189,15 +189,17 @@ Each DT tray has central-shaft **sweep/rake arms** rotating relatively fast.
 Their real job is twofold, and the model captures **both effects**, without
 simulating the mechanics:
 
-1. **Transport toward the discharge gate → sets residence time `τ`.**
-   Faster arms push meal to the gate sooner (shorter `τ`); a narrower
-   `gate_opening` holds it back (longer `τ`, higher bed level). In
-   `Model._stage_tau`:
+1. **Transport toward the configured discharge boundary.**
+   Faster arms shorten the stage turnover lag. Active lower gates/airlocks
+   regulate bed level through boundary position; passive PD swept ports use a
+   fixed configured hydraulic conductance and are not exposed as PLC actuators.
+   In the dynamic inventory balance:
    ```
-   τ  =  base_residence / (rpm / 3) / gate_norm
+   τ_mix = base_residence · arm_geometry_factor / (rpm / 3)
+   ṁ_out = (M/M_max) · (position/50) · capacity
    ```
-   So sweep speed and gate directly set the transport lag and the steady holdup
-   `M = ṁ_in · τ`.
+   This keeps shaft turnover physics independent from the device that meters
+   meal across a specific tray boundary.
 
 2. **Agitation → stronger heat/mass transfer.**
    A mechanically swept bed continuously renews gas–solid contact — a

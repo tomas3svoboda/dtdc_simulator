@@ -198,19 +198,16 @@ def sorption_heat_source_per_layer_w_m3(
         # this session, DECISIONS.md's "DT runaway temperature" entry) drives
         # W2 down to ~8.5e-8 near the DCZ exit (its whole job is stripping
         # the last traces of hexane), where the 1e-9 floor let dH_s reach
-        # ~9.5e9 J/kg -- ~28,000x dH_vap_hexane, versus the ~4-30x the cited
-        # Cardarelli & Crapiste (1996) "rises well above the heat of
-        # vaporization at low coverage" finding (see
+        # ~9.5e9 J/kg -- ~28,000x dH_vap_hexane, beyond the cited
+        # Cardarelli & Crapiste (1996) low-coverage trend (see
         # `test_heat_of_sorption_exceeds_latent_heat_at_low_moisture`)
-        # actually supports. `sorption_C0`/`sorption_C1` remain uncalibrated
-        # [PLACE] (the underlying thesis is unrecoverable, see properties/
-        # soybean.yaml's own note) so there's no "correct" value to floor at;
-        # 2% of the GAB monolayer capacity (`gab.Xm`) is a physically
-        # motivated low-coverage scale (rather than an arbitrary constant)
-        # that keeps dH_s within ~2 orders of magnitude of dH_vap_hexane
-        # (order 90x at this scenario's Xm) instead of 4+ orders, while
-        # leaving both of that test's own checkpoints (W2=0.001, W2=0.1)
-        # unaffected.
+        # supports. The configured C0/C1 are now bounded to the paper's
+        # published soybean caloric anchors, but the power law remains
+        # unvalidated below its lowest 0.001 kg/kg datum. Two percent of the
+        # GAB monolayer capacity (`gab.Xm`) is therefore retained as a
+        # physically motivated extrapolation floor; it keeps dH_s near
+        # 1 MJ/kg rather than allowing a mathematical singularity, while
+        # leaving the measured W2=0.001 checkpoint unaffected.
         W2_floored = max(W2_i, 0.02 * c.gab.Xm)
         dH_s = thermo.heat_of_sorption(W2_floored, c.dH_vap_hexane, c.sorption_C0, c.sorption_C1)
         # eq. A.30 sorption/desorption heat source (q̇_condL added by the caller).
@@ -242,7 +239,7 @@ def sorption_heat_source_per_layer_w_m3(
 # ranges exercised in `tests/test_dt_solver.py`, but at higher `hM` it
 # converges to a noticeably elevated absolute temperature (order 400+ K)
 # rather than staying close to the zone's own boundary temperatures --
-# plausibly an artifact of `hQ`/`hM`/`aV` still being `[DERIVED]`/`[PLACE]`
+# plausibly an artifact of `hQ`/`hM`/`aV` still being `[DERIVED]`
 # placeholders (not fitted to real bed conditions), not of this credit's own
 # definition, but that's a plausibility argument, not a proof. Matching this
 # to the *surface* mass-transfer flux (`SVm2` literally, eq. A.33) instead of

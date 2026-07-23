@@ -3,6 +3,267 @@
 Log of `DECIDE` choices made while building the DTDC simulator, per
 `Specifications/DTDC_Simulator_BuildSpec.md`. Newest entries at the top.
 
+## Jacket-driven falling-rate PREDESOLV and extreme-operation envelope (2026-07-23)
+
+**Physical distinction.** The critical loading `X2_cr` is a particle-mechanism
+transition, not a tray-hardware boundary. Direct steam cannot penetrate the
+sealed PREDESOLV beds; FTRZ is therefore pinned to the top of MN1, the first
+countercurrent tray, for every jacket duty. All PREDESOLV trays are always
+marched before that handoff.
+
+**New falling-rate closure.** Above `X2_cr`, jacket heat produces the existing
+Coletto sensible/constant-rate sequence. Below it, Faner (2019) eqs. 6--7
+provide the receding wet-core diameter and dry-shell heat resistance. The
+fraction `U/h` of delivered jacket heat reaches pore solvent as latent heat;
+the balance heats the matrix. Faner's source was convective superheated
+hexane. Driving the same particle resistance with Coletto's delivered jacket
+heat density is this model's new, explicitly labelled coupling, not a claim
+that either paper published a jacket model.
+
+**Cold handoff.** A zero/weak jacket no longer raises a PHZ feasibility error.
+FTRZ receives the actual cold meal at MN1 and its thickness equation includes
+the sensible duty required to reach hexane boiling. Strong jacket operation
+can remove free solvent, enter the pore-limited regime, and heat the matrix
+above the 68.75 C plateau while a receding wet core remains.
+
+**Extreme-case verification.** With all other COAMO benchmark inputs fixed,
+PREDESOLV equivalent jacket-steam totals of 0, 2, and 4 kg/s all converge and
+start FTRZ in MN1. The PHZ outlets are respectively 49.0 C / X2=0.388,
+69.7 C / X2=0.0765, and 125.7 C / X2=0.0260; FTRZ thicknesses are 5.95,
+1.87, and less than 0.001 mm. In the severe case, stored matrix heat supplies
+the remaining pore evaporation and collapses the steam-driven front toward
+zero thickness. These endpoints intentionally span cold startup through
+severe over-jacketing and are regression-tested. The mechanism is emphasized
+in `paper/main.tex` as an off-design digital-twin contribution relevant to
+ramp-up, ramp-down, shutdown/restart, and product change.
+
+**Operator diagnostics.** The axial profile now records a local mechanism
+(`SENSIBLE`, `CONSTANT_RATE`, `FALLING_RATE`, `STEAM_FLASH`, or
+`DIFFUSION_CONTROLLED`) in addition to the hardware zone. Meal-profile
+moisture is displayed on an explicit wet basis. A failed periodic solve keeps
+the last successful profile and reports its true age separately from the last
+attempt, preventing a stale curve from being labelled freshly resolved.
+
+**Overheated-vapor correction.** The first signed-sensible implementation
+subtracted the complete `m_dot*cp*(Tb-T_PHZ,out)` term from the vapor energy
+balance. For an overheated meal this became a large negative sink, so the same
+stored matrix heat both funded hexane latent heat and was added again to the
+vapor. When the FTRZ collapsed to nanometre-scale cells, the duplicated
+4.2 MW credit drove a mesh-marched vapor spike above 1400 C. The ledgers are
+now separated: cold-meal sensible heat is debited from vapor, whereas
+hot-matrix energy is capped at the remaining latent requirement and acts only
+as an internal wet-core credit. Excess bulk superheat is carried into DCZ.
+The minimum collapsed-zone thickness is divided by `nz`, making its total
+mesh-independent. Regression tests require positive thicknesses, monotone
+vapor temperature, no negative vapor sensible term, and a vapor temperature
+below the hottest physical inlet. The 4 kg/s case now spans 110.27--111.68 C
+in FTRZ vapor while retaining about 125 C in the bulk matrix.
+
+## Release audit: authoritative seed, oil basis, and bounded placeholders (2026-07-23)
+
+**Authoritative initialization.** The GUI scenario had drifted away from the
+COAMO benchmark used by `industry_benchmark.py`: it still initialized the
+generic 56.9 C / 0.08 water / 0.5869 hexane / 0.01 oil feed on a coarse
+10/10/8 mesh. The active scenario and its documentation mirror now use the
+named COAMO dry-solid-basis feed (49 C, X1=0.124, X2=0.388, X3=0.0137) and
+the validation-qualified 20/20/20 mesh. Assembly now starts from a converged
+DT solution rather than showing `SolverStress` at time zero.
+
+**Live oil consistency.** The model accepted `feed_oil` as a GUI/OPC UA
+disturbance but FTRZ and particle constants retained assembly-time X3.
+`OperatingSeed` now carries oil, and every DT solve makes local immutable
+copies of the FTRZ/particle constants with the live X3. A regression test
+proves the live feed value overrides a deliberately stale constant without
+mutating the caller's constants.
+
+**Sorption heat correction.** The former placeholder
+`C0=3e5, C1=-0.5` was outside the published soybean caloric order of
+magnitude. The replacement `C0=1.61e4, C1=-0.4` is a transparent two-point
+fit to Cardarelli & Crapiste's net heat: 22.0 kJ/mol at W2=0.001 and
+3.5 kJ/mol at W2=0.1. It is paper-bounded, not fitted to process outputs.
+
+**Diffusion length and benchmark.** With the COAMO oil basis propagated
+consistently, `particle_radius=0.208 mm` remains within the 0.125-0.25 mm
+industrial-flake half-thickness band and gives 284 ppm at DT exit. The
+strict benchmark passes all ordered gates: 27.81 min total / 20.11 min hot
+inventory residence, 74.68% delivered-steam heat, 72.38 C / 90.25 wt%
+hexane dome, 111.73 C / 19.64%wb / 284 ppm DT meal, -0.0020 kg/s water
+residual, and 11 outer / 66 inner iterations.
+
+**Parameter classification.** Numerical meshes/tolerances are numerical
+verification settings; duties, air flows, gate positions, and weather are
+operating/disturbance seeds; they are not constitutive `[PLACE]` constants.
+The genuine unresolved boundary is the clean vapor admitted below SP1.
+Dryer/cooler base contact time and arm factors are calibrated dynamic
+closures whose extrapolative uncertainty is recorded in
+`PLACE_PARAMETER_AUDIT.md`.
+
+**GUI control model.** Per-tray jacket sliders were removed from the HMI.
+The HMI now exposes only `Predesolv jacket` and `Toast jacket` zone totals;
+the facade atomically preserves the internal tray split and honors actuator
+limits, while per-tray MVs remain available to OPC UA. Feed moisture and
+hexane controls/readouts now use one complete wet-basis denominator including
+water, hexane, and oil.
+
+## PHZ hardware-boundary refactor and industry seed (2026-07-23)
+
+**Trigger and root cause.** Reducing indirect heat below about 3.4 MW did not
+expose a DCZ instability: the integrated solver stopped before entering its
+coupled loop because it required PHZ to reach Faner's `X2_cr=0.20` regardless
+of the physical tray role. Residence time could not affect this algebraic
+heat requirement. It therefore extended jacket-only predesolventizing into
+the countercurrent section and structurally over-attributed heat to the
+jacket.
+
+**Refactor.** PHZ was first capped at the last contiguous PREDESOLV tray.
+The subsequent falling-rate refinement documented above made that cap a
+strict hardware boundary: `X2_cr` now changes the internal jacket-driven
+mechanism and never ends PREDESOLV early. FTRZ receives the actual outlet and
+starts at MN1. FTRZ jacket density is evaluated over its live free-boundary
+length, and FTRZ/DCZ domain and tray reporting support boundaries crossing
+any countercurrent tray.
+
+**Ordered design correction.** The nominal SPARGE loaded depth was increased
+from 0.60 to 0.75 m, still within the 0.60-1.10 m industrial range. This moves
+hot-contact inventory residence from 18.8 to 20.1 min and total DT inventory
+residence from 26.5 to 27.8 min, inside their respective 20-30 min gates.
+
+**Post-refactor seed.** Total indirect duty is 2.50 MW: 2.30 MW equally
+distributed over PD1-PD3 and 0.20 MW over MN1/MN2/SP1 in the retained 1:1:0.4
+ratio. `particle_radius=0.208 mm` remains within the industrial-flake
+half-thickness band, and lower-boundary clean water is 0.25 kg/s. At the
+validation mesh the PHZ removes about 14% of feed solvent, delivered steam
+supplies 74.7% of delivered heat after chimney carry-through, and the solver
+converges in 11 outer / 66 inner iterations. Dome is 72.4 C / 90.3 wt%
+hexane; DT meal is 111.7 C / 19.6 wt%wb / 284 ppm. Water residual is
+-0.0020 kg/s. Every ordered industry benchmark gate passes.
+
+## DCZ explicit component-flow reformulation (2026-07-23)
+
+**Trigger.** After finite-rate FTRZ water transfer, lowering jacket duty exposed a DCZ inner-loop
+failure: temperature and residual hexane stabilized quickly, but moisture/top-water flow entered a
+three-cycle. Raising the cap from 100 to 2000 changed the reported steam share from 67.6% to 71.2%
+while the whole-DT water residual worsened from +0.036 to +0.501 kg/s. Iteration count had become
+an accidental calibration knob.
+
+**Root cause.** DCZ marched only hexane mass fraction `wV2` at a fixed total vapor flow. Water
+condensation/sorption changed the solid moisture and `wV2`, but did not change local total kg/s,
+velocity or vapor heat capacity. The DT handoff then reconstructed a different total flow from the
+solid moisture change. The lagged, mutually-exclusive condensation/isotherm branches added a hard
+active-set switch, producing the observed three-cycle at low jacket heat.
+
+**Reformulation.** DCZ now marches explicit `m_water` and `m_hexane` profiles bottom-to-top.
+Condensation plus finite-rate sorption debit water directly; vapor hexane gain is exactly the
+dry-solid-flow-scaled conserved particle `X2` loss. Local total flow sets the vapor velocity/heat
+capacity. Composition is derived from the component flows, never used to reconstruct them. The
+FTRZ handoff, axial profile, warm-start cache and independent balance diagnostics all consume the
+solved outlet component flows.
+
+**Water active-set stabilization.** Bulk condensation is under-relaxed as an active-set mass and
+is additive with finite-rate isotherm adjustment, matching FTRZ bookkeeping. The same-pass water
+transfer is marched immediately rather than one iteration later. An actively condensing saturated
+cell cannot immediately evaporate its new free condensate against the clamped bound-water
+isotherm. This removes the discontinuous three-cycle without tuning a constitutive coefficient.
+
+**Verification.** Isolated DCZ water closes to machine precision and hexane to ~3.5e-5 kg/s.
+At the 3.6 MW PHZ-only point the validation solve is cap-independent and converges in 44 inner /
+12 outer iterations: delivered steam heat 68.0%, dome 68.5 C / 92.2 wt% hexane, meal 111.7 C /
+20.0%wb / 71 ppm, whole-DT water residual -0.0012 kg/s. The preserved 7.4 MW baseline converges
+in 15/11 with -0.0021 kg/s residual.
+
+**Consequence for calibration.** The previous D8 numerical blocker is resolved, but 70-80%
+delivered steam heat is still not reachable by jacket reduction alone: 3.4 MW and below cannot
+finish the PHZ (`X2` never reaches `X2_cr`), while the lowest feasible tested point, 3.6 MW, gives
+68.0%. The next discussion is therefore the PHZ heat/residence/critical-boundary physics, not DCZ
+iteration tuning.
+
+## Finite-rate FTRZ water transfer (2026-07-22)
+
+**Why.** The industry-gated low-jacket sweep isolated the FTRZ water extension's
+instantaneous jump to `Xe(a_w)` as a model-form hurdle. That closure had no contact time and made
+the FTRZ water response insensitive to the physical flake diffusivity already used in the DCZ.
+
+**Closure.** Each FTRZ cell now relaxes analytically toward its local Luikov equilibrium over its
+own solid residence, `dt_cell = dz/u_L`, with
+`k_int = 15 D_water/r_P^2`, `k_ext = hM*aV`, and
+`k_overall = (1/k_int + 1/k_ext)^-1`. Thus
+`X1_out = X1_in + [1-exp(-k_overall*dt_cell)](Xe-X1_in)`. This introduces no fitted multiplier:
+`D_water`, `r_P`, `hM`, `aV`, density, porosity and live geometry already belong to the physical
+model. Internal diffusion dominates at the current values, as expected from the prior DCZ audit.
+
+**Conservation/bookkeeping.** V-SAT bulk condensation remains the root-solved immediate event;
+finite-rate isotherm sorption is a separate signed flow. The solid receives both exactly once,
+only sorption is post-debited from the already-marched vapor, and its vapor enthalpy transfer is
+included in the independent FTRZ balance diagnostic. Focused tests cover rate bounds,
+diffusivity response, zero-rate bulk condensation, and mass/energy closure.
+
+**Coupling defect exposed and fixed.** The FTRZ/DCZ outer loop formerly checked temperature and
+vapor composition but not component flow. A warm start could therefore be declared converged
+while water kg/s was still materially wrong. Water and hexane flow residuals now participate in
+the convergence gate. The hot-start disturbance seed moved from 7% to 8% dry-basis moisture,
+still centered in its cited 5-10% inlet range; its dry-basis hexane seed was correspondingly
+recomputed from 35% wet-basis to 0.5869. No heat duty or constitutive coefficient was retuned.
+
+**Industry result, not a calibration.** At the preserved 7.4 MW jacket baseline, the validation
+solve converges in 11 outer / 11 DCZ iterations, closes water to +0.0023 kg/s, and gives 47.5%
+delivered steam heat, dome 75.9 C / about 88 wt% hexane, meal 111.7 C / 18.9%wb / 20.5 ppm.
+The FTRZ moisture gain is now only about 0.0034 kg/kg dry solid rather than an equilibrium jump.
+At 3.6 MW concentrated in PHZ, the directional conflict improves (68.8% steam heat, dome 66.4 C /
+93.1 wt% hexane, meal 19.9%wb / 59.8 ppm), but the DCZ hits its 500-iteration cap and the water
+residual is +0.175 kg/s. Those low-duty outputs are therefore blocked, not calibration evidence;
+the next hurdle is DCZ low-duty water coupling/convergence, not another FTRZ coefficient fit.
+
+## Industry benchmark gates: live loaded depth, six-tray design, and delivered steam heat (2026-07-22)
+
+**Why this precedes another calibration.** The former scorecard called the sum of six
+first-order response constants a physical residence time and reported ~6 min. That was the wrong
+quantity: physical residence is dry-solid inventory / dry-solid throughput. At the former
+geometry and 50% fill it was ~22 min. More importantly, `solve_dt()` always used the declared
+full bed depths while the dynamic holdup state represented 50% fill, so the steady PDE and live
+inventory described different equipment.
+
+**Design correction.** Restored Coletto's six-tray DT (3 PREDESOLV, 2 MAIN, 1 SPARGE).
+Coletto's 4 m diameter corresponds to ~11.9 kg/s dry solid (Fig. 1); scaling diameter with
+`sqrt(flow)` to this scenario's 25 kg/s gives ~5.8 m, validating the 6 m industrial shell.
+`StageSpec.bed_height_m` remains maximum holdup depth; `_build_dt_trays()` now multiplies it by
+live `M/M_max`, giving Coletto's loaded 0.3/0.3/0.3/1.0/0.6/0.6 m profile at nominal 50% fill.
+
+**Density-basis correction.** The first audit still over-reported residence 2x: `_stage_M_max`
+used `(1-eps_b)*rho_ps`, while Coletto eq. (2) and DCZ velocity use
+`alpha_ps*(1-eps_b)*rho_ps`. Added the missing particle solid fraction. The inventory and zonal
+transport bases now agree: 26.52 min total and 21.39 min at tray exits >=105 C, within the 20-30
+min industrial range. Offline scorecards derive the same fill from the gate/discharge law;
+runtime re-solves use actual holdup.
+
+**No hidden duty retune.** The old 7.4 MW jacket total was preserved during design restoration:
+5.0 MW PREDESOLV, 2.0 MW MAIN, 0.4 MW SPARGE, merely distributed across the restored trays. A
+validation-grade benchmark mesh/tolerance is now separate from real-time numerics. At that rigor
+the water boundary closes to 0.045 kg/s and the design baseline gives dome 68.0 C / 92.4 wt%
+hexane, meal 111.7 C / 20.0%wb / 20 ppm.
+
+**Validation convergence gate.** The first benchmark used `outer_tol=1e-5` for a single norm
+combining Kelvin and vapor mass fraction; it hit the outer cap even at 300 iterations while the
+DCZ inner loop converged. A tolerance study at the 20/20/20 validation mesh showed `0.05` converges
+in 13 outer passes, while `0.01`/`0.001` stall at 100 with only 0.27 K, 0.012 moisture percentage
+point and 0.15 ppm output difference. The benchmark therefore uses 0.05 K-equivalent tolerance
+and now blocks calibration explicitly if either loop reaches its cap; numerical settings are not
+fitted to plant outputs.
+
+**Delivered heat definition.** The benchmark groups all externally injected water vapor (sparge
++ lower-boundary makeup) as the direct-steam heat source and subtracts the enthalpy of all water
+vapor leaving the top. This excludes chimney carry-through instead of calling every kg/s times
+latent heat "delivered." The current delivered steam share is 50.0%, versus the literature
+70-80% target. Separate direct-vs-clean water attribution is retained as a bound but is not needed
+for this aggregate boundary balance. The corrected design baseline delivers 51.3% by steam.
+
+**First Phase-3 sweep (not committed as calibration).** Keeping measured direct steam fixed,
+3.6 MW jacket duty concentrated in the PHZ reaches 71.2% delivered-steam heat and converges,
+but produces dome 64.7 C / 97.2% hexane, 21.3%wb meal and 47 ppm hexane. The 3.8 MW point reaches
+70.0% but hits the DCZ inner cap. Earlier screening established that DCZ water diffusivity barely
+moves the dome/moisture conflict. That isolates the next hurdle in the instantaneous FTRZ
+water-equilibrium closure rather than justifying a blind coefficient fit; particle radius can be
+revisited later to lift the now-over-stripped residual into its 100-500 ppm band.
+
 ## DT moisture: evaporative-pinning water model + binary-VLE floor + calibration (2026-07-22)
 
 **Trigger.** After the Coletto-faithful DCZ rework, the DT still would not raise the meal
@@ -20,15 +281,23 @@ as cold as `T_boil_hexane`, so the cool descending meal condenses steam toward `
 19 %wb — the moisture-raising the DT exists to do. This is an ADDITION beyond Coletto
 (hexane-only DT); it reuses the existing Luikov/GAB isotherms and `hM`/`aV`.
 
-**Evaporative pinning (extends eq. A.17 for water).** A WET meal surface cannot superheat past
-the water saturation temperature at the local pressure — condensing/evaporating water pins it
-there until it dries out. Eq. A.17 drives `T_L → T_V` once the hexane core is gone (`w_h → 0`),
-but that is the hexane-only closure; with water present the surface sits at
-`min(A.17 temp, T_sat,water)`. This both holds the cool FTRZ near ~100 °C (so `a_w` stays near
-1, clamped to the isotherm's validated 0.799) AND caps the DCZ toasting zone at the sparge
-`T_sat` (~112 °C) instead of the 123 °C runaway that was drying the meal back out. The latent
-heat absorbing the excess is the wet meal's own phase-change buffer (documented simplification,
-same category as the FTRZ's algebraic `T_L`).
+**Water-interface pinning without bulk-temperature replacement.** A wet meal interface cannot
+superheat past the water saturation temperature at the local partial pressure, so the FTRZ water
+closure evaluates `a_w` and finite-rate transfer at the lower of the A.17 bulk temperature and
+the local water dew-point temperature. The bulk FTRZ meal nevertheless remains at
+Coletto's eq. A.17 temperature. These are distinct states: a low water dew point in a hexane-rich
+vapour is a phase threshold, not an energy balance capable of cooling the whole meal matrix.
+Conflating them produced a sub-zero bulk FTRZ temperature at 40.4 kg/s and destabilised the
+FTRZ↔DCZ iteration. The DCZ retains its separately balanced wet-meal phase-change buffer, which
+caps the toasting zone near the sparge `T_sat` (~112 °C) instead of the former 123 °C runaway.
+
+**Accepted-profile boundary (2026-07-23).** `solve_dt` may return its best iterate after exhausting
+the real-time iteration cap for diagnostics, but the engine now publishes a DT result only when
+it is both formally converged and passes finite/composition/temperature/geometry checks. A rejected
+attempt leaves the last accepted tray targets, warm start, and axial profile atomically unchanged;
+`SolverStress` and the attempt timestamp still update. The HMI consequently says “latest solve
+rejected; showing last accepted profile” rather than describing a nonconverged iterate as a
+successful profile.
 
 **Calibration.** The over-wetting first seen (29 %wb, with ~2.8 kg/s water conjured from
 nothing) was NOT the pinning — the scenario ran the sparge at **1.05 kg/s (≈30 kg/t_raw), a
@@ -1037,7 +1306,8 @@ a genuine inefficiency introduced by M2 Phase 4's own energy-balance bug fix.**
    defaults (`1e-5`/`100`/`100`, unchanged), so `tests/test_dt_solver.py` (which calls `solve_dt`
    directly without overriding these) keeps validating against the tight, conservative settings; only
    the real-time engine's own calls get the loosened, speed-tuned values (scenario ships
-   `dt_outer_tol=0.05, dt_outer_max_iter=20`).
+   `dt_outer_tol=0.05, dt_outer_max_iter=20`; the 20-pass cap is superseded
+   by the adaptive-solver decision below).
 
 **Combined measured result** (this session, this machine — hardware-dependent, retime if it matters):
 ~10-14s (tight defaults) → ~3.2s (`assemble_model`, tuned settings) for the scenario's real-time
@@ -1216,7 +1486,9 @@ already solved endogenously by `solve_ftrz_zone`'s own internal fixed point (unc
 only freezes it (from the first outer-loop FTRZ solve) to fix DCZ's own mesh geometry for the rest of
 the Gauss-Seidel loop — re-meshing DCZ's `nz` cells every outer pass over a geometry that barely moves
 (FTRZ is "order cm" against 0.3-1.0 m trays) is unneeded cost, documented as a simplification not an
-oversight.
+oversight. **Superseded 2026-07-23:** extreme cases proved that the boundary
+can move materially; the adaptive-solver decision below remeshes DCZ every
+resolved outer pass.
 
 **Per-tray duty apportionment (bed height as a genuine spatial domain, not one lumped quantity) —
 resolves two gaps left open at M2 Phases 2-3.** Every zone occupying part of a tray's height now
@@ -1782,3 +2054,61 @@ check` staying green after).
 **Added `.gitignore`.** The project has no VCS yet, but `.venv/`,
 `__pycache__/`, `*.egg-info/`, and the `pytest`/`ruff` cache dirs should
 never be committed once one is initialized.
+
+## Configurable transfer hardware and PLC control boundary (2026-07-23)
+
+The former `gate_opening/<stage>` registry incorrectly implied that every
+thermodynamic tray had a separate PLC-operated discharge gate. Equipment
+drawings and the literature instead support stationary heated PD trays swept
+by a common shaft, vapor bypass around the PD beds, controlled discharge
+devices on selected lower deep beds, and rotary airlocks at vapor/air
+boundaries.
+
+The scenario now declares vapor routing on each stage and declares one
+independent `topology.solid_transfers[]` boundary below every stage. PD1-PD3
+use passive swept ports; MN1/MN2 use controlled gates; SP1→DR1 and the final
+product outlet use controlled rotary vapor seals. The numerical discharge
+closure is unchanged at the calibrated seed: every migrated active or passive
+conductance is 50% with capacity factor 1.0. This is deliberately an
+interface/topology refactor, not an unannounced recalibration.
+
+The PLC-facing adapter exposes scenario-derived SISO loop tags under OPC UA as
+`Control/<tag>/{SP,PV,OP,Mode,Units,Status}`. Predesolv and main/toast
+indirect-steam totals use fixed seed-derived allocation weights; the one
+central shaft is one common speed loop. Raw per-stage MVs remain read-only
+under `Diagnostics/InternalMV`, while disturbances live under
+`SimulationInputs`. Controlled transfer devices are currently position loops
+(`ZIC_*`), not falsely labelled level loops: a real `LIC` requires either an
+identified internal controller law or an external PLC writing OP.
+
+## Adaptive nested DT solver and moving FTRZ/DCZ boundary (2026-07-23)
+
+The physical and constitutive equations are unchanged. The refactor is
+strictly numerical and corrects four solver-contract defects found at high
+throughput/high bed level:
+
+1. DCZ convergence now includes its top vapor temperature, top component
+   flows, bottom meal state, and maximum full vapor-profile changes. A
+   cap-limited inner solve is explicitly `converged=False`.
+2. DCZ carries a complete warm state (particle temperature/hexane fields,
+   vapor temperature/component flows, moisture, condensation/latent profiles,
+   lagged rates, adaptive damping, and water active set). Resuming a solve
+   therefore continues the fixed-point iteration without adding fictitious
+   particle residence time.
+3. Every resolved outer pass rebuilds DCZ from the current endogenous FTRZ
+   length and interpolates the warm state onto the moving mesh. The former
+   first-pass frozen geometry is removed.
+4. Temperature, hexane, water, and the outer coupling use separate,
+   residual-responsive damping. Cap-limited DCZ blocks are completed before
+   the outer variables move, so one reported outer iteration is one fully
+   resolved map evaluation. This is pseudo-transient continuation for large
+   PLC/setpoint changes, not a change to the steady equations.
+
+The result-publication gate now rejects a nonconverged DCZ or inconsistent
+moving-boundary geometry. The configured real-time outer cap is raised from
+20 to 150 because the honest high-feed case needs 117 resolved evaluations.
+The former failing benchmark (40.4 kg/s dry feed, 81% DT levels, 2.07 kg/s
+equivalent predesolv jacket steam) now converges with a bounded meal profile
+(about 49.5--111.7 degC), about 22.7% dry-basis exit moisture, and about
+837 ppm dry-basis residual hexane. These are solver-regression values, not a
+new calibration target.

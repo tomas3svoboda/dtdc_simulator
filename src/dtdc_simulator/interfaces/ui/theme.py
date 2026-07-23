@@ -20,6 +20,8 @@ BG = "#F2F2F2"
 BORDER = "#E0E0E0"
 AMBER = "#F2A900"  # DV (disturbance) slider color -- theme's own "caution" hue
 RED = "#E2001A"
+STEAM_BORDER = "#EC4899"  # hot-steam utilities, distinct from ambient-air cyan
+STEAM_SURFACE = "#FDF2F8"
 
 # --- M4 (GUI redesign): HMI ink + surface + status tokens ---------------------
 # The redesign keeps the flat Siemens-petrol/graphite look but adds the extra

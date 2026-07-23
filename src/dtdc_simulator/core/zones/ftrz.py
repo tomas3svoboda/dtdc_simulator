@@ -16,8 +16,9 @@ an assumption): the solid-side profile is entirely algebraic given the vapor
   radius (eq. 3) — algebraically, `w_h = (r_fr/r_P)^3`, so the cube in eq. 3
   cancels exactly against this mass-fraction relation (see
   `wet_core_fraction`);
-- moisture gain equals whatever water the vapor condensed in that cell
-  (mass-conservative).
+- water gain combines root-solved V-SAT bulk condensation with finite-rate
+  surface sorption toward the Luikov equilibrium over each cell's local
+  residence time (mass-conservative).
 
 So only ONE sequential march is needed: the vapor stream, mass + energy,
 tracking the V-SCAL (superheated) -> V-SAT (on the dew curve) transition
@@ -64,6 +65,7 @@ DOCUMENTED GAPS/CHOICES (confirmed with the user, flagged not hidden):
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from scipy.optimize import brentq
@@ -86,6 +88,8 @@ class FTRZConstants:
     rho_ps: float
     X3: float  # oil fraction, kg/kg dry solid
     bed_porosity: float  # eps_b; alpha_L (bed-scale solid volume fraction) = 1 - bed_porosity
+    water_diffusivity: float  # m2/s, water intraparticle diffusivity
+    particle_radius: float  # m, flake diffusion-length scale
     # Empirical critical solvent content (Faner 2019, ~0.20 soybean). None -> use the
     # theoretical pore-saturation eq. 4 (thermo.x2_critical). See DECISIONS.md.
     x2_critical_empirical: float | None = None
@@ -102,6 +106,8 @@ class FTRZConstants:
     # Dry-solid heat capacity (J/kg-K), for the condensation-latent energy coupling
     # (the steam that condenses onto the cool meal is what raises its temperature).
     cp_solid: float = 0.0
+    cp_hexane_liquid: float = 0.0
+    cp_oil: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -126,9 +132,16 @@ class VaporState:
 @dataclass(frozen=True)
 class FTRZCellResult:
     solid: SolidState  # algebraic solid state at this cell's axial position
+    # Water-interface closure temperature.  This may sit at the local water
+    # dew point and is used only by the finite-rate sorption calculation; it is
+    # deliberately separate from the bulk-solid temperature given by A.17.
+    water_surface_T: float
     vapor_out: VaporState  # vapor leaving this cell (toward the top)
     dz_m: float
-    condensed_water_kg_s: float
+    condensed_water_kg_s: float  # net water transferred to solid (bulk + sorption)
+    bulk_condensed_water_kg_s: float  # V-SAT condensation solved in the vapor energy balance
+    sorbed_water_kg_s: float  # finite-rate isotherm transfer; negative means desorption
+    sensible_heat_to_solid_w: float  # cold-meal heat debited from vapor; always >= 0
     is_saturated: bool  # False = V-SCAL, True = V-SAT
 
 
@@ -150,6 +163,41 @@ def solid_temperature(
     return w_h * T_boil_hexane + (1.0 - w_h) * T_V
 
 
+def water_transfer_rate_s(
+    water_diffusivity_m2_s: float,
+    particle_radius_m: float,
+    hM_m_s: float,
+    aV_m2_m3: float,
+) -> float:
+    """Overall first-order FTRZ water-transfer rate.
+
+    The intraparticle term is the Glueckauf linear-driving-force closure
+    ``15 D_water / r_P**2`` already used by the DCZ.  ``hM*aV`` supplies the
+    external bed-film rate.  Treating those mechanisms as resistances in
+    series prevents either one from being silently assumed instantaneous.
+    A non-positive physical input disables transfer rather than dividing by
+    zero.
+    """
+    if (
+        water_diffusivity_m2_s <= 0.0
+        or particle_radius_m <= 0.0
+        or hM_m_s <= 0.0
+        or aV_m2_m3 <= 0.0
+    ):
+        return 0.0
+    k_internal = 15.0 * water_diffusivity_m2_s / particle_radius_m**2
+    k_external = hM_m_s * aV_m2_m3
+    return 1.0 / (1.0 / k_internal + 1.0 / k_external)
+
+
+def relax_moisture(X1: float, X1_equilibrium: float, contact_time_s: float, rate_s: float) -> float:
+    """Analytic LDF relaxation over one cell, bounded by ``X1_equilibrium``."""
+    if contact_time_s <= 0.0 or rate_s <= 0.0:
+        return X1
+    approach = -math.expm1(-rate_s * contact_time_s)
+    return X1 + approach * (X1_equilibrium - X1)
+
+
 def _energy_balance_residual(
     m_cond_kg_s: float,
     m_water_before: float,
@@ -157,6 +205,7 @@ def _energy_balance_residual(
     H_flow_before_w: float,
     q_cell_w: float,
     hexane_enthalpy_in_w: float,
+    sensible_heat_to_solid_w: float,
     c: FTRZConstants,
 ) -> tuple[float, float, float]:
     """Residual of the cell energy balance when pinned to the dew curve
@@ -168,7 +217,13 @@ def _energy_balance_residual(
     H_vbw_after = thermo.vapor_enthalpy_water_basis(Y_V2_after, T_after, c.vapor_enthalpy_ref)
     condensate_enthalpy_out_w = m_cond_kg_s * c.cp_water_liquid * (T_after - c.T_boil_water)
     lhs = m_water_after * H_vbw_after
-    rhs = H_flow_before_w + q_cell_w + hexane_enthalpy_in_w - condensate_enthalpy_out_w
+    rhs = (
+        H_flow_before_w
+        + q_cell_w
+        + hexane_enthalpy_in_w
+        - sensible_heat_to_solid_w
+        - condensate_enthalpy_out_w
+    )
     return lhs - rhs, T_after, Y_V2_after
 
 
@@ -177,6 +232,7 @@ def solve_ftrz_cell(
     hexane_evap_kg_s: float,
     q_cell_w: float,
     c: FTRZConstants,
+    sensible_heat_to_solid_w: float = 0.0,
 ) -> tuple[VaporState, float, bool]:
     """One FTRZ cell, vapor-marching order (bottom to top): hexane mass
     transfer (uniform per cell, eq. A.6-A.7) always occurs; the resulting
@@ -195,7 +251,9 @@ def solve_ftrz_cell(
 
     # V-SCAL candidate: no condensation, water flow unchanged.
     Y_V2_candidate = m_hex_after_mt / vapor_in.m_water_kg_s
-    H_flow_candidate_w = H_flow_before_w + q_cell_w + hexane_enthalpy_in_w
+    H_flow_candidate_w = (
+        H_flow_before_w + q_cell_w + hexane_enthalpy_in_w - sensible_heat_to_solid_w
+    )
     T_candidate = thermo.temperature_from_vapor_enthalpy(
         H_flow_candidate_w / vapor_in.m_water_kg_s, Y_V2_candidate, c.vapor_enthalpy_ref
     )
@@ -219,6 +277,7 @@ def solve_ftrz_cell(
             H_flow_before_w,
             q_cell_w,
             hexane_enthalpy_in_w,
+            sensible_heat_to_solid_w,
             c,
         )[0]
 
@@ -244,6 +303,7 @@ def solve_ftrz_cell(
         H_flow_before_w,
         q_cell_w,
         hexane_enthalpy_in_w,
+        sensible_heat_to_solid_w,
         c,
     )
     m_water_after = vapor_in.m_water_kg_s - m_cond
@@ -264,6 +324,8 @@ def cell_thickness_m(
     A_bed_m2: float,
     alpha_L: float,
     aV_m2_per_m3: float,
+    sensible_heat_w: float = 0.0,
+    minimum_thickness_m: float = 1.0e-12,
 ) -> float:
     """Delta_z (eq. A.18): the cell thickness needed for the condensation
     -release + convective heat fluxes to deliver exactly enough energy to
@@ -279,10 +341,19 @@ def cell_thickness_m(
     balance) divided by the bed cross-sectional area, `J_Q,cs =
     dH_vap_water*condensed_water_kg_s / A_bed` (W/m^2).
     """
+    required_heat_w = hexane_evap_kg_s * dH_vap_hexane + sensible_heat_w
+    # A sufficiently superheated incoming matrix can fund this cell's pore-
+    # solvent evaporation load. The limiting front then collapses toward zero
+    # thickness; retain a tiny positive cell for ordered profile bookkeeping.
+    if required_heat_w <= 0.0:
+        return minimum_thickness_m
+
     J_Q_cv = hQ * (T_V - T_L)
     J_Q_cs = dH_vap_water * condensed_water_kg_s / A_bed_m2
     denominator = A_bed_m2 * alpha_L * aV_m2_per_m3 * (J_Q_cs + J_Q_cv)
-    return hexane_evap_kg_s * dH_vap_hexane / denominator
+    if denominator <= 0.0:
+        raise ValueError("FTRZ heat-transfer driving force must be positive")
+    return required_heat_w / denominator
 
 
 @dataclass(frozen=True)
@@ -305,12 +376,14 @@ def solve_ftrz_zone(
     X2_sup: float,
     m_dry_kg_s: float,
     vapor_in: VaporState,  # zone's own inlet, at the BOTTOM (from the DCZ below)
-    q_Iv_w_m3: float,
+    q_Iv_w_m3: float | Callable[[float], float],
     hQ: float,
+    hM: float,
     aV_m2_per_m3: float,
     diameter_m: float,
     c: FTRZConstants,
     X1_sup: float = 0.0,  # feed moisture (kg/kg dry) descending in -- baseline for the sorption delta
+    T_solid_sup: float | None = None,
     L_FTRZ_initial_guess_m: float = 0.02,
     max_outer_iter: int = 50,
     outer_tol_m: float = 1.0e-6,
@@ -319,7 +392,8 @@ def solve_ftrz_zone(
     the energy balance (eq. A.18), via the fixed-point iteration the paper
     itself describes for the free boundary `L_FTRZ` ("updated after each
     iteration", §A.2.2): guess `L_FTRZ` -> size each cell's duty from the
-    constant `q_Iv_w_m3` and the current guess (`q_Iv_w_m3*A_bed*(L_FTRZ/nz)`)
+    local/length-averaged `q_Iv_w_m3` and the current guess
+    (`q_Iv_w_m3(L_FTRZ)*A_bed*(L_FTRZ/nz)`)
     -> march the vapor bottom-to-top solving each cell (`solve_ftrz_cell` +
     `cell_thickness_m`) -> recompute `L_FTRZ = sum(dz_j)` (eq. A.21) -> repeat
     until it stops moving.
@@ -329,20 +403,44 @@ def solve_ftrz_zone(
 
     X2_inf = thermo.x2_equilibrium(vapor_in.T, c.X3, c.gab, c.oil, c.alpha_pg, c.alpha_ps, c.rho_ps)
     hexane_evap_kg_s = m_dry_kg_s * (X2_sup - X2_inf) / nz
+    T_solid_in = c.T_boil_hexane if T_solid_sup is None else T_solid_sup
+    cp_feed = (
+        c.cp_solid + X1_sup * c.cp_water_liquid + X2_sup * c.cp_hexane_liquid + c.X3 * c.cp_oil
+    )
+    cold_sensible_total_w = m_dry_kg_s * cp_feed * max(c.T_boil_hexane - T_solid_in, 0.0)
+    total_hexane_latent_w = m_dry_kg_s * max(X2_sup - X2_inf, 0.0) * c.dH_vap_hexane
+    # A superheated matrix may conduct stored energy inward to the wet core,
+    # reducing the external heat needed for evaporation. It cannot contribute
+    # more than the latent load present, and it is NOT injected into the vapor
+    # a second time: the evaporated hexane already carries that enthalpy.
+    matrix_credit_total_w = min(
+        m_dry_kg_s * cp_feed * max(T_solid_in - c.T_boil_hexane, 0.0),
+        total_hexane_latent_w,
+    )
+    vapor_sensible_load_cell_w = cold_sensible_total_w / nz
+    front_sensible_adjustment_cell_w = (cold_sensible_total_w - matrix_credit_total_w) / nz
+    matrix_temperature_drop_k = (
+        matrix_credit_total_w / (m_dry_kg_s * cp_feed) if m_dry_kg_s * cp_feed > 0.0 else 0.0
+    )
 
     L_FTRZ = L_FTRZ_initial_guess_m
     cells_bottom_to_top: list[FTRZCellResult] = []
     iterations = 0
     for iterations in range(1, max_outer_iter + 1):
+        q_density_w_m3 = q_Iv_w_m3(L_FTRZ) if callable(q_Iv_w_m3) else q_Iv_w_m3
         q_cell_w = (
-            q_Iv_w_m3 * A_bed_m2 * (L_FTRZ / nz)
+            q_density_w_m3 * A_bed_m2 * (L_FTRZ / nz)
         )  # uniform share per cell of this iteration's guess
 
         cells_bottom_to_top = []
         vapor = vapor_in
         for k in range(nz):
             vapor_out, condensed_kg_s, is_sat = solve_ftrz_cell(
-                vapor, hexane_evap_kg_s, q_cell_w, c
+                vapor,
+                hexane_evap_kg_s,
+                q_cell_w,
+                c,
+                sensible_heat_to_solid_w=vapor_sensible_load_cell_w,
             )
             # The driving force behind this cell's heat/mass transfer (hence
             # T_L, X2_cr, and dz below) reflects the solid as it ENTERS the
@@ -360,7 +458,17 @@ def solve_ftrz_zone(
                 c.rho_ps,
                 empirical=c.x2_critical_empirical,
             )
-            T_L = solid_temperature(X2_entrance, X2_cr, X2_inf, c.T_boil_hexane, vapor_out.T)
+            T_L_front = solid_temperature(X2_entrance, X2_cr, X2_inf, c.T_boil_hexane, vapor_out.T)
+            progress_from_top = (nz - k) / nz
+            if T_solid_in <= c.T_boil_hexane:
+                # Cold meal approaches the receding-front temperature.
+                T_L = T_L_front + (1.0 - progress_from_top) * (T_solid_in - c.T_boil_hexane)
+            else:
+                # A hot matrix cools only by the energy actually credited to
+                # pore evaporation; a vanishing front cannot dump all stored
+                # sensible heat into the vapor.
+                T_matrix = T_solid_in - progress_from_top * matrix_temperature_drop_k
+                T_L = max(T_L_front, T_matrix)
             # Reported/exit state (matching zones/phz.py's "cell holds the
             # state after passing through it" convention): one increment
             # below the entrance value.
@@ -372,17 +480,23 @@ def solve_ftrz_zone(
                 c.vapor_enthalpy_ref.dH_vap_water,
                 hQ,
                 vapor_out.T,
-                T_L,
+                T_L_front,
                 A_bed_m2,
                 alpha_L,
                 aV_m2_per_m3,
+                sensible_heat_w=front_sensible_adjustment_cell_w,
+                minimum_thickness_m=1.0e-9 / nz,
             )
             cells_bottom_to_top.append(
                 FTRZCellResult(
                     solid=SolidState(T=T_L, X1=0.0, X2=X2_here),  # X1 filled in below
+                    water_surface_T=T_L,
                     vapor_out=vapor_out,
                     dz_m=dz,
                     condensed_water_kg_s=condensed_kg_s,
+                    bulk_condensed_water_kg_s=condensed_kg_s,
+                    sorbed_water_kg_s=0.0,
+                    sensible_heat_to_solid_w=vapor_sensible_load_cell_w,
                     is_saturated=is_sat,
                 )
             )
@@ -403,26 +517,26 @@ def solve_ftrz_zone(
     # mechanism is film condensation onto the 68-108 C meal surface, A&G / Kemper /
     # Paraiso; Gianini 2006 measured 19% wb at a_w=0.799 straight from a DT outlet).
     #
-    # EVAPORATIVE PINNING (extends eq. A.17 for water): a WET meal surface cannot
-    # superheat past the water saturation temperature -- condensing/evaporating water
-    # pins it at the vapor's water dew point until it dries out. Eq. A.17 drives T_L
-    # toward T_V once the hexane core is gone (w_h->0), but that is the hexane-only
-    # closure; with water present the surface sits at min(A.17 temp, T_dew,water).
-    # This keeps the cool zone near ~100 C so a_w stays near 1 (clamped to the
-    # isotherm's validated 0.799 -> Xe = 19% wb), the physically-sustained moisture.
+    # WATER-INTERFACE CLOSURE (an extension beyond Coletto's A.17): a wetted
+    # interface cannot superheat past the local water dew point.  Keep this
+    # interfacial temperature separate from the BULK meal temperature: A.17
+    # remains the bulk-solid energy closure, while min(T_bulk, T_dew,water) is
+    # used only to evaluate water activity and finite-rate sorption.
     #
-    # Equilibration (hM*aV) is fast relative to the minutes-long tray residence, so
-    # each cell reaches its Xe; the sorbed water is debited from / released to the
-    # ascending steam (bounded by what the steam carries). cells_bottom_to_top is in
-    # vapor-march order, so walk it in reverse for the solid's top-to-bottom direction.
+    # Sorption is finite-rate.  Internal flake diffusion (15*D_water/r_P**2) and
+    # external film transfer (hM*aV) act as series resistances; each cell only
+    # approaches Xe for its own local inventory/throughput residence time.  The
+    # sorbed water is debited from / released to the ascending steam (bounded by
+    # what the steam carries). cells_bottom_to_top is in vapor-march order, so
+    # walk it in reverse for the solid's top-to-bottom direction.
     cells_top_to_bottom = list(reversed(cells_bottom_to_top))
     n = len(cells_top_to_bottom)
     X1_abs = X1_sup
     sorbed_kg_s = [0.0] * n  # this cell's SORPTION water onto the meal (0 = V-SAT-only fallback)
     net_water_kg_s = [0.0] * n  # net water onto meal (sorption OR V-SAT), for the record
-    T_reported = [0.0] * n
+    water_surface_T = [0.0] * n
     delta_X1 = [0.0] * n
-    water_taken_kg_s = 0.0  # cumulative net water pulled from the ascending steam
+    water_taken_kg_s = 0.0  # cumulative isotherm water pulled from the ascending steam
     # Binary-VLE water-saturation floor: while liquid water is present on the cool meal
     # surface, the vapor in contact stays in equilibrium with it -- its water partial
     # pressure can't fall below the meal's own `a_w*p_sat,water(T_surface)` (the same
@@ -438,38 +552,50 @@ def solve_ftrz_zone(
     m_water_floor = 0.0
     if c.luikov is not None and n > 0 and vapor_in.m_water_kg_s > 0.0:
         top = cells_top_to_bottom[0]
-        T_dew_top = thermo.dew_point_temperature(top.vapor_out.Y_V2, c.antoine_water, P=c.pressure_pa)
+        T_dew_top = thermo.dew_point_temperature(
+            top.vapor_out.Y_V2, c.antoine_water, P=c.pressure_pa
+        )
         T_surf_top = min(top.solid.T, T_dew_top)
         p_sat_w = thermo.antoine_pressure_pa(T_surf_top, c.antoine_water)
-        y_w = min(thermo.LUIKOV_MAX_VALIDATED_UR * p_sat_w / c.pressure_pa, 0.9)  # a_w*p_sat/P, clamped <1
+        y_w = min(
+            thermo.LUIKOV_MAX_VALIDATED_UR * p_sat_w / c.pressure_pa, 0.9
+        )  # a_w*p_sat/P, clamped <1
         if y_w > 0.0:
             n_hex_top = top.vapor_out.m_hex_kg_s / thermo.M_HEXANE
             m_water_floor = min(
                 n_hex_top * y_w / (1.0 - y_w) * thermo.M_WATER, 0.9 * vapor_in.m_water_kg_s
             )
-    vapor_water_budget = max(vapor_in.m_water_kg_s - m_water_floor, 0.0)  # steam from the DCZ, less the VLE floor
+    total_bulk_condensed_kg_s = sum(cell.bulk_condensed_water_kg_s for cell in cells_top_to_bottom)
+    # Bulk V-SAT condensation was already removed during the vapor march.  Only
+    # the remaining vapor above the VLE floor is available to the sorption pass.
+    vapor_water_budget = max(vapor_in.m_water_kg_s - total_bulk_condensed_kg_s - m_water_floor, 0.0)
+    alpha_L = 1.0 - c.bed_porosity
+    dry_solid_velocity_m_s = m_dry_kg_s / (c.alpha_ps * alpha_L * c.rho_ps * A_bed_m2)
+    transfer_rate_s = water_transfer_rate_s(
+        c.water_diffusivity, c.particle_radius, hM, aV_m2_per_m3
+    )
     for i, cell in enumerate(cells_top_to_bottom):
-        T_reported[i] = cell.solid.T
-        net_water_kg_s[i] = cell.condensed_water_kg_s  # V-SAT bulk condensation (usually 0)
+        water_surface_T[i] = cell.solid.T
+        bulk_condensed = cell.bulk_condensed_water_kg_s
+        X1_abs += bulk_condensed / m_dry_kg_s
+        net_water_kg_s[i] = bulk_condensed
         if c.luikov is not None:
             Y_V2 = cell.vapor_out.Y_V2
             T_dew = thermo.dew_point_temperature(Y_V2, c.antoine_water, P=c.pressure_pa)
             T_L_wet = min(cell.solid.T, T_dew)  # evaporative pinning
+            water_surface_T[i] = T_L_wet
             a_w = thermo.water_activity(Y_V2, T_L_wet, c.antoine_water, P=c.pressure_pa)
             a_w = min(max(a_w, 1.0e-9), thermo.LUIKOV_MAX_VALIDATED_UR)
             Xe = thermo.luikov_equilibrium_moisture(a_w, c.luikov)
-            dwater = m_dry_kg_s * (Xe - X1_abs)  # >0 adsorb (from steam), <0 desorb (to steam)
+            contact_time_s = cell.dz_m / dry_solid_velocity_m_s
+            X1_relaxed = relax_moisture(X1_abs, Xe, contact_time_s, transfer_rate_s)
+            dwater = m_dry_kg_s * (X1_relaxed - X1_abs)  # >0 adsorb, <0 desorb
             if dwater > 0.0:
                 dwater = min(dwater, max(vapor_water_budget - water_taken_kg_s, 0.0))
             X1_abs += dwater / m_dry_kg_s
             water_taken_kg_s += dwater
             sorbed_kg_s[i] = dwater
-            net_water_kg_s[i] = dwater  # this cell's net water onto the solid
-            T_reported[i] = T_L_wet
-        else:
-            # No isotherm supplied (e.g. standalone unit tests): fall back to the
-            # original bulk-vapor V-SAT condensate accumulation (already in vapor_out).
-            X1_abs += cell.condensed_water_kg_s / m_dry_kg_s
+            net_water_kg_s[i] += dwater
         delta_X1[i] = X1_abs - X1_sup  # zone reports the moisture GAIN; caller adds feed baseline
 
     # Debit the sorbed water from the ASCENDING steam (mass conservation): the vapor
@@ -488,10 +614,16 @@ def solve_ftrz_zone(
         debited_water = max(v.m_water_kg_s - suffix[i], 0.0)
         finished_cells.append(
             FTRZCellResult(
-                solid=SolidState(T=T_reported[i], X1=delta_X1[i], X2=cell.solid.X2),
+                # Coletto A.17 remains the bulk-meal temperature.  The separate
+                # water interface above must never overwrite this energy state.
+                solid=SolidState(T=cell.solid.T, X1=delta_X1[i], X2=cell.solid.X2),
+                water_surface_T=water_surface_T[i],
                 vapor_out=VaporState(m_water_kg_s=debited_water, m_hex_kg_s=v.m_hex_kg_s, T=v.T),
                 dz_m=cell.dz_m,
                 condensed_water_kg_s=net_water_kg_s[i],
+                bulk_condensed_water_kg_s=cell.bulk_condensed_water_kg_s,
+                sorbed_water_kg_s=sorbed_kg_s[i],
+                sensible_heat_to_solid_w=cell.sensible_heat_to_solid_w,
                 is_saturated=cell.is_saturated,
             )
         )

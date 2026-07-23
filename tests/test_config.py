@@ -14,7 +14,12 @@ def test_load_scenario_ok() -> None:
     cfg = load_scenario(SCENARIO_PATH)
     assert isinstance(cfg, ScenarioConfig)
     assert cfg.material == "soybean"
-    assert cfg.geometry.n_stages == 6
+    assert cfg.geometry.n_stages == 8
+    assert cfg.disturbance_defaults.feed_temperature == pytest.approx(322.15)
+    assert cfg.disturbance_defaults.feed_moisture == pytest.approx(0.124)
+    assert cfg.disturbance_defaults.feed_hexane == pytest.approx(0.388)
+    assert cfg.disturbance_defaults.feed_oil == pytest.approx(0.0137)
+    assert (cfg.model.dt_nz_phz, cfg.model.dt_nz_ftrz, cfg.model.dt_nz_dcz) == (20, 20, 20)
 
 
 def test_scenario_resolves_physical_from_properties_dir() -> None:
@@ -52,5 +57,32 @@ def test_porosity_out_of_range_rejected() -> None:
     cfg = load_scenario(SCENARIO_PATH)
     raw = cfg.model_dump()
     raw["physical"]["bed_porosity"] = 1.5
+    with pytest.raises(Exception):
+        ScenarioConfig.model_validate(raw)
+
+
+def test_topology_has_one_linear_transfer_per_stage() -> None:
+    cfg = load_scenario(SCENARIO_PATH)
+    assert len(cfg.topology.solid_transfers) == len(cfg.geometry.stages)
+    assert [stage.vapor_path.value for stage in cfg.geometry.stages[:3]] == [
+        "BYPASS",
+        "BYPASS",
+        "BYPASS",
+    ]
+    assert not cfg.topology.solid_transfers[0].controlled
+
+
+def test_control_seed_for_passive_transfer_rejected() -> None:
+    cfg = load_scenario(SCENARIO_PATH)
+    raw = cfg.model_dump()
+    raw["operating_defaults"]["transfer_device_position"]["PD1_TO_PD2"] = 50.0
+    with pytest.raises(Exception):
+        ScenarioConfig.model_validate(raw)
+
+
+def test_non_linear_transfer_reference_rejected() -> None:
+    cfg = load_scenario(SCENARIO_PATH)
+    raw = cfg.model_dump()
+    raw["topology"]["solid_transfers"][0]["to_stage"] = "MN1"
     with pytest.raises(Exception):
         ScenarioConfig.model_validate(raw)

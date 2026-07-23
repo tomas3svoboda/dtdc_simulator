@@ -20,6 +20,25 @@ class StageRole(str, Enum):
     COOLER = "COOLER"
 
 
+class VaporPath(str, Enum):
+    """Configured vapor routing through a physical tray section.
+
+    This is deliberately independent of the solids-transfer device below the
+    tray.  In particular, a PREDESOLV tray can pass meal downward through a
+    swept opening while the lower-section vapor bypasses its meal bed.
+    """
+
+    BYPASS = "BYPASS"
+    THROUGH_BED = "THROUGH_BED"
+    STEAM_SOURCE = "STEAM_SOURCE"
+
+
+class SolidTransferDeviceType(str, Enum):
+    PASSIVE_SWEPT_PORT = "PASSIVE_SWEPT_PORT"
+    CONTROLLED_GATE = "CONTROLLED_GATE"
+    ROTARY_AIRLOCK = "ROTARY_AIRLOCK"
+
+
 DT_ROLES = {StageRole.PREDESOLV, StageRole.MAIN, StageRole.SPARGE}
 DC_ROLES = {StageRole.DRYER, StageRole.COOLER}
 
@@ -34,6 +53,31 @@ class StageGeometry(BaseModel):
     # SAME rpm; the per-tray mixing differences come from arm geometry, captured here (not from a
     # per-tray rpm, which a single shaft cannot have). tau_stage = base_residence_s * this / (rpm/3).
     arm_mixing_factor: float = Field(gt=0, default=1.0)
+    vapor_path: VaporPath | None = Field(
+        default=None,
+        description=(
+            "vapor routing independent of solids transfer; omitted values are "
+            "derived from the stage role"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _default_and_validate_vapor_path(self) -> "StageGeometry":
+        expected = {
+            StageRole.PREDESOLV: VaporPath.BYPASS,
+            StageRole.MAIN: VaporPath.THROUGH_BED,
+            StageRole.SPARGE: VaporPath.STEAM_SOURCE,
+            StageRole.DRYER: VaporPath.THROUGH_BED,
+            StageRole.COOLER: VaporPath.THROUGH_BED,
+        }[self.role]
+        if self.vapor_path is None:
+            self.vapor_path = expected
+        elif self.vapor_path is not expected:
+            raise ValueError(
+                f"{self.role.value} stage vapor_path must be {expected.value} "
+                "with the current zonal solver"
+            )
+        return self
 
 
 class Geometry(BaseModel):
@@ -56,6 +100,51 @@ class Geometry(BaseModel):
         if len(ids) != len(set(ids)):
             raise ValueError(f"duplicate stage ids in geometry.stages: {ids}")
         return v
+
+
+class SolidTransferBoundary(BaseModel):
+    """A solids-transfer device below one thermodynamic stage.
+
+    ``from_stage`` identifies the tray whose holdup drives discharge.
+    ``to_stage=None`` means the final product outlet.  The current numerical
+    core is a linear cascade, so the scenario validator requires each boundary
+    to connect to the next declared stage.
+    """
+
+    id: str
+    from_stage: str
+    to_stage: str | None = None
+    device_type: SolidTransferDeviceType
+    controlled: bool = False
+    vapor_seal: bool = False
+    fixed_position_pct: float = Field(default=50.0, ge=0.0, le=100.0)
+    capacity_factor: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="multiplier on the scenario nominal full-tray discharge capacity",
+    )
+
+    @model_validator(mode="after")
+    def _device_semantics(self) -> "SolidTransferBoundary":
+        if self.device_type is SolidTransferDeviceType.PASSIVE_SWEPT_PORT and self.controlled:
+            raise ValueError("PASSIVE_SWEPT_PORT cannot be a controlled actuator")
+        if self.device_type is SolidTransferDeviceType.ROTARY_AIRLOCK:
+            self.vapor_seal = True
+        return self
+
+
+class ProcessTopology(BaseModel):
+    solid_transfers: list[SolidTransferBoundary]
+
+    @field_validator("solid_transfers")
+    @classmethod
+    def _unique_transfer_ids(
+        cls, value: list[SolidTransferBoundary]
+    ) -> list[SolidTransferBoundary]:
+        ids = [boundary.id for boundary in value]
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"duplicate solid-transfer ids: {ids}")
+        return value
 
 
 class GabParams(BaseModel):
@@ -204,8 +293,9 @@ class ModelParams(BaseModel):
     dt_vapor_feed_T: float = Field(gt=0, description="K, [PLACE] as dt_vapor_feed_water_kg_s")
     dc_hexane_mtc: float = Field(
         gt=0,
-        description="[PLACE] DC hexane desorption mass-transfer coefficient (core/dc.py::desorb_hexane); "
-        "hexane removal rate = dc_hexane_mtc * air_flow * (y_surf - y_air)",
+        description="[PAPER-anchored calibration] DC hexane desorption mass-transfer coefficient "
+        "(core/dc.py::desorb_hexane); hexane removal rate = dc_hexane_mtc * air_flow "
+        "* (y_surf - y_air), bounded against EPA AP-42 meal-hexane cascades",
     )
     # SPARGE (direct) steam supply pressure, found this session: this project's own
     # `literature_sources/Svoboda_Case_for_Advanced_Process_Control_VRX-DTDC_Concept.pdf`
@@ -235,13 +325,11 @@ class ModelParams(BaseModel):
     steam_supply_pressure_barg: float = Field(
         gt=0, default=6.9, description="bar gauge, steam supply header (HMI readout)"
     )
-    # DT solve convergence tuning (M3a follow-up, "A2"), kept SEPARATE from
-    # dt_solver.solve_dt()'s own conservative validation-run defaults
-    # (1e-5/100/100, unchanged) -- these real-time settings trade precision
-    # far beyond the model's own placeholder-constant uncertainty for wall
-    # -clock speed. Measured this session: outer_tol=1e-5/cap=100 -> ~10s;
-    # outer_tol=0.05/cap=20 -> ~3s, for a ~0.7 K / ~2 ppm difference in the
-    # converged answer. See DECISIONS.md's M3a follow-up entry.
+    # DT solve convergence tuning. The real-time tolerance remains looser than
+    # validation work, but the iteration cap must accommodate adaptive
+    # continuation through equipment-feasible extreme moves. Inner cap-limited
+    # blocks resume from complete DCZ state and are not counted as resolved
+    # outer evaluations; see DECISIONS.md's 2026-07-23 solver-refactor entry.
     dt_outer_tol: float = Field(
         gt=0,
         description="real-time FTRZ<->DCZ outer-loop convergence tolerance (solve_dt's own "
@@ -262,7 +350,10 @@ class OperatingDefaults(BaseModel):
     indirect_steam: dict[str, float] = Field(default_factory=dict, description="W per DT tray")
     direct_steam: dict[str, float] = Field(default_factory=dict, description="kg/s per SPARGE tray")
     sweep_arm_speed: dict[str, float] = Field(default_factory=dict, description="rpm per stage")
-    gate_opening: dict[str, float] = Field(default_factory=dict, description="0-100% per stage")
+    transfer_device_position: dict[str, float] = Field(
+        default_factory=dict,
+        description="0-100% per controlled solid-transfer boundary",
+    )
     heated_air_temp: float = Field(gt=0, description="K, DRYER")
     heated_air_flow: float = Field(gt=0, description="kg/s, DRYER")
     ambient_air_flow: float = Field(gt=0, description="kg/s, COOLER")
@@ -329,6 +420,7 @@ class ScenarioConfig(BaseModel):
 
     material: str
     geometry: Geometry
+    topology: ProcessTopology
     physical: PhysicalParams
     model: ModelParams
     operating_defaults: OperatingDefaults
@@ -353,9 +445,45 @@ class ScenarioConfig(BaseModel):
         for key in self.operating_defaults.sweep_arm_speed:
             if key not in stage_ids:
                 raise ValueError(f"sweep_arm_speed references unknown stage id: {key}")
-        for key in self.operating_defaults.gate_opening:
-            if key not in stage_ids:
-                raise ValueError(f"gate_opening references unknown stage id: {key}")
+        controlled_transfer_ids = {
+            boundary.id for boundary in self.topology.solid_transfers if boundary.controlled
+        }
+        for key in self.operating_defaults.transfer_device_position:
+            if key not in controlled_transfer_ids:
+                raise ValueError(
+                    "transfer_device_position references unknown/non-controlled "
+                    f"solid-transfer id: {key}"
+                )
+
+        boundaries_by_stage = {
+            boundary.from_stage: boundary for boundary in self.topology.solid_transfers
+        }
+        if len(boundaries_by_stage) != len(self.topology.solid_transfers):
+            raise ValueError("each stage may have only one outgoing solid-transfer boundary")
+        if set(boundaries_by_stage) != stage_ids:
+            missing = sorted(stage_ids - set(boundaries_by_stage))
+            extra = sorted(set(boundaries_by_stage) - stage_ids)
+            raise ValueError(
+                f"solid-transfer topology must define one outlet per stage; "
+                f"missing={missing}, unknown={extra}"
+            )
+        ordered_ids = self.geometry.stage_ids
+        for index, stage_id in enumerate(ordered_ids):
+            boundary = boundaries_by_stage[stage_id]
+            expected_to = ordered_ids[index + 1] if index + 1 < len(ordered_ids) else None
+            if boundary.to_stage != expected_to:
+                raise ValueError(
+                    f"solid-transfer {boundary.id} must connect {stage_id} to "
+                    f"{expected_to!r} in the current linear-cascade core"
+                )
+        unused_positions = controlled_transfer_ids - set(
+            self.operating_defaults.transfer_device_position
+        )
+        if unused_positions:
+            raise ValueError(
+                "controlled solid transfers require operating seed positions: "
+                f"{sorted(unused_positions)}"
+            )
 
         if not dryer_ids and self.geometry.n_stages:
             pass  # DRYER/COOLER are optional at this fidelity; DC section is DECIDE-able

@@ -208,8 +208,15 @@ STOPPED      --reconfigure----->    CONFIGURED     (rebuild allowed; constants e
 | field | unit | notes |
 |---|---|---|
 | `n_stages` | – | total number of modeled stages |
-| `stages[]` | – | ordered list; each: `{id, role, diameter_m, bed_height_m}` |
+| `stages[]` | – | ordered list; each: `{id, role, vapor_path, diameter_m, bed_height_m}` |
 | `role` ∈ | – | `PREDESOLV`, `MAIN`, `SPARGE`, `DRYER`, `COOLER` |
+| `vapor_path` ∈ | – | `BYPASS`, `THROUGH_BED`, `STEAM_SOURCE`; independent of meal transfer |
+
+`Topology.solid_transfers[]` defines one meal-transfer boundary below each
+stage: `{id, from_stage, to_stage, device_type, controlled, vapor_seal,
+fixed_position_pct, capacity_factor}`. Device type is one of
+`PASSIVE_SWEPT_PORT`, `CONTROLLED_GATE`, or `ROTARY_AIRLOCK`. This separates
+the thermodynamic tray, vapor path, and physical PLC actuator.
 
 ### 5.2 Hot inputs (owned by the runtime; NOT part of the frozen Model)
 
@@ -220,7 +227,7 @@ STOPPED      --reconfigure----->    CONFIGURED     (rebuild allowed; constants e
 | `direct_steam[stage]` | per SPARGE/MAIN stage | kg/s or 0–100 % valve | sparge steam → heat + water into meal |
 | `indirect_steam[stage]` | per DT stage | kW or 0–100 % valve | jacket duty Q̇_indirect |
 | `sweep_arm_speed[stage]` | per stage | rpm | central rotating shaft with sweep/rake arms; conveys meal across the tray toward discharge → sets bed turnover & residence time (secondary: surface renewal → hQ/hM) |
-| `gate_opening[stage]` | per stage | 0–100 % | sets inter-stage solid flow / holdup (level) |
+| `transfer_device_position[boundary]` | controlled solid-transfer boundary only | 0–100 % | active gate/airlock position; passive swept ports have no MV |
 | `heated_air_temp` | DRYER | K | drying air inlet temperature |
 | `heated_air_flow` | DRYER | kg/s | drying air rate |
 | `ambient_air_temp` | COOLER | K | cooling air inlet temperature |
@@ -521,8 +528,10 @@ follows:
   ṁ_ds), OR advance the particle-scale `∂/∂t` states across the tick using the residence-time map.
   `DECIDE` which; document the choice. Do **not** present a pure algebraic step response to the APC.
 - **Warm start.** Seed each tick's fixed-point iteration from the previous tick's converged
-  profiles → few iterations, fast enough for real-time. Cap iterations; if not converged within the
-  tick budget, publish the best estimate and flag `Sim/SolverStress`.
+  profiles → few iterations, fast enough for real-time. Cap iterations; if an attempt does not
+  converge within the tick budget or fails physical-admissibility checks, retain the last accepted
+  targets/profile atomically and flag `Sim/SolverStress`. The rejected best iterate remains a
+  solver diagnostic, not a process PV.
 - **Convergence/robustness guards.** Damp the outer fixed-point (under-relaxation), bound the VLLE
   dew-point solve, clamp `rfr∈[0,rP]`, and detect non-convergence without crashing the loop.
 - **Free-run determinism** still holds: same inputs + same warm-start policy ⇒ same result.
@@ -624,20 +633,22 @@ Objects/DTDC/
     Physical/...    (all PhysicalParams as read-only vars for provenance)
     Model/...       (all ModelParams)
     Geometry/...    (stage list, roles, dims)
-  MV/
-    <mv_key>[/<stage>]/
+  Control/
+    <PLC_loop_tag>/
       Mode          (RW enum MANUAL|AUTO)
-      ManualSetpoint(RW, written by UI path — but node is writable; app routes)
-      AutoSetpoint  (RW, intended for APC)
-      EffectiveValue(RO)
-      Min, Max, RateLimit (RO or RW in CONFIGURED)
-  DV/
-    <dv_key>        (RW)
-  PV/               (all RO)
+      SP             (RW; AUTO-side setpoint)
+      PV             (RO)
+      OP             (RW in MANUAL; current actuator output otherwise)
+      Units, Status, Description, Min, Max (RO)
+  SimulationInputs/
+    <dv_key>         (RW; scenario/disturbance injection, not PLC control)
+  Measurements/     (all RO)
     Stage/<i>/{T, X_hex, X_w, VaporTemp}
     KPI/{residual_hexane, meal_moisture,
          steam_consumption, throughput}
-  Sim/
+  Diagnostics/
+    InternalMV/<internal_key>/{Mode, ManualSetpoint, AutoSetpoint, EffectiveValue} (RO)
+  Simulation/
     SpeedFactor     (RW)
     SimTime         (RO)
     ActualSpeed     (RO)
@@ -649,12 +660,14 @@ Objects/DTDC/
 ```
 
 ### 9.2 Behaviors
-- Writes to `AutoSetpoint` only affect the plant when that MV's `Mode == AUTO`.
-- Writes to `ManualSetpoint` only affect the plant when `Mode == MANUAL`.
+- Writes to `SP` feed the bound actuator target when the loop is in `AUTO`.
+- Writes to `OP` feed the bound manual actuator target when the loop is in `MANUAL`.
+- Zone-total and common-shaft loops map atomically to internal per-stage values
+  using fixed scenario allocation weights.
 - Mode changes trigger bumpless transfer (§6).
 - `Constants/*` reject writes unless state ∈ {CONFIGURED, UNCONFIGURED}.
 - Method calls drive the state machine (§4.1) and return success/failure.
-- PV/Sim nodes are refreshed every tick from the facade snapshot.
+- Measurement/Simulation nodes are refreshed every tick from the facade snapshot.
 
 ---
 
@@ -781,6 +794,11 @@ Implement PHZ (§7.3), FTRZ with Receding Front + variable cell thickness (§7.5
 (§7.8) with under-relaxation and warm-start. Acceptance: reproduce Coletto (2022) qualitative
 profiles — hexane falls ~4000 ppm → ~100 ppm across the DCZ; thin FTRZ (order cm); solid/vapor
 temperature and water/hexane profiles match the paper's figures within tolerance.
+The nested solver must report inner convergence explicitly, retain complete
+profile warm state, remesh DCZ when the endogenous FTRZ boundary moves, and
+use safeguarded adaptive damping/continuation for large but equipment-feasible
+input changes. These are numerical requirements and must not alter the M2
+balance or constitutive equations.
 
 **M3 — Real-time wrap + DC + quality + full I/O.**
 Wrap the steady DT solve as the quasi-steady `step()` with transport lag (§7.9); implement the DC

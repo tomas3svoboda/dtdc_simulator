@@ -16,10 +16,11 @@ iteration index `s`, across all `nz` axial cells at once each step:
      field top-to-bottom, using the just-updated TV profile (isotherm is
      T-dependent) and the *previous* iteration's wV2 profile.
   4. Mass balance at bed scale -- integrate bottom-to-top using the
-     just-updated particle surface hexane fractions, producing a new wV2
-     profile.
-  5. Convergence check: max deviation in wpg2 and Tp, across *all* cells and
-     *all* particle layers, against `outer_tol`. Not converged -> repeat.
+     particle's conserved hexane loss and the same-pass water transfer,
+     producing explicit component-flow and derived-composition profiles.
+  5. Convergence check on every exported boundary plus maximum full vapor
+     temperature/component-flow profile changes. Not converged -> repeat from
+     the complete lagged state.
 
 DOCUMENTED RESOLUTION -- bed-scale marching direction and sign (not a
 literal transcription of eq. A.35): the source material states `alphaV *
@@ -97,24 +98,13 @@ already uses (`wpg2` -> `W2(a_h,T)`), just lumped/lagged rather than
 radially resolved (no diffusivity data exists for water in this matrix to
 justify a 12-layer FVM the way hexane gets one).
 
-Two mutually-exclusive regimes per cell, both driven by the SAME water
--activity variable (`thermo.water_activity`, mathematically identical to
-"is this cell below its own dew point," just reframed):
-- `a_w >= 1` (supersaturated): condensation, exactly as before -- step 2's
-  existing per-cell implicit relaxation computes a candidate new vapor
-  temperature from convective/duty/sorption sources; if that candidate falls
-  below the local dew point, cap it there and back-solve (closed-form, the
-  relaxation equation is linear in its source term) the condensed-water mass
-  the SAME equation implies, clamped to the water actually available at that
-  point in the march.
-- `a_w < 1` (subsaturated): bidirectional adsorption/desorption toward the
-  isotherm's own equilibrium `Xe(a_w)`, an implicit relaxation over the
-  cell's own residence `dt` (mirrors the particle-scale marches' own
-  backward-Euler pattern) using `hM*aV` as the equilibration rate -- no
-  water-specific mass-transfer coefficient exists in this project's
-  literature (same gap `hQ`/`hM` had before the sweep-arm-agitation fix), so
-  this reuses `hM`/`aV` as-is, dimensionally already a first-order volumetric
-  rate constant generic to whichever species crosses the same interface.
+Two additive mechanisms use the same water-activity state. Supersaturated
+vapor is pinned to its dew point and the required bulk condensate is
+back-solved from the cell energy balance. The resulting wet solid then makes
+a finite-rate bidirectional adjustment toward `Xe(a_w)` over its local
+residence. The condensation active-set mass is relaxed between iterations;
+an actively condensing saturated cell cannot evaporate its new free
+condensate against the clamped bound-water isotherm.
 
 Both regimes accumulate top-to-bottom (solid flow order) into each cell's
 own `X1_bulk`, starting from what FTRZ handed off (`X1_in`) -- replacing
@@ -126,13 +116,12 @@ range is 15-70 C; DCZ's own operating temperatures currently reach higher.
 The cited paper's own finding that temperature barely affects the isotherm
 in ITS tested range is reassuring but doesn't cover that gap.
 
-DOCUMENTED SIMPLIFICATION: total vapor mass flow (hence `u_V`/`hQ`/`hM`/`aV`)
-stays the fixed, once-computed bed-transport quantity it already was --
-condensation/sorption are tracked for the X1/mass-accounting purposes above
-but do NOT feed back into the transport coefficients, the SAME simplification
-already accepted for FTRZ's own hexane evaporation (a comparatively larger
-relative mass-flow change than DCZ's water condensation, by inspection of
-this scenario's own flows) without incident.
+VARIABLE VAPOR FLOW (2026-07-23): water and hexane are marched as explicit
+component mass flows. Condensation/sorption therefore reduce water kg/s and
+particle transfer increases hexane kg/s cell by cell; local vapor heat
+capacity/velocity use the resulting total flow. `hQ`/`hM`/`aV` remain the
+once-computed bed coefficients supplied by the caller, but the former
+fixed-total-flow composition approximation is removed.
 """
 
 from __future__ import annotations
@@ -204,12 +193,170 @@ def _dominant_mode_extrapolation(
 EXIT_TOL_T = 1.0e-2  # K, bottom-cell bulk temperature stability
 EXIT_TOL_X1 = 1.0e-4  # kg/kg dry solid, bottom-cell moisture stability
 EXIT_TOL_X2 = 1.0e-6  # kg/kg dry solid (~1 ppm), bottom-cell residual-hexane stability
+EXIT_TOL_FLOW = 1.0e-4  # kg/s, top component-flow stability
+PROFILE_TOL_T = 2.0e-2  # K, full vapor-temperature profile fixed-point residual
+PROFILE_TOL_FLOW = 2.0e-3  # kg/s, full internal component-flow profile stability
+
+
+@dataclass(frozen=True)
+class DCZResiduals:
+    """Final fixed-point residuals for every state exported by the DCZ map."""
+
+    solid_out_X2: float = math.inf
+    solid_out_T: float = math.inf
+    solid_out_X1: float = math.inf
+    vapor_top_T: float = math.inf
+    vapor_top_water_flow: float = math.inf
+    vapor_top_hexane_flow: float = math.inf
+    vapor_profile_T_max: float = math.inf
+    vapor_profile_water_flow_max: float = math.inf
+    vapor_profile_hexane_flow_max: float = math.inf
+
+    @property
+    def maximum_scaled(self) -> float:
+        """Largest residual normalized by its physical convergence tolerance."""
+        return max(
+            self.solid_out_X2 / EXIT_TOL_X2,
+            self.solid_out_T / EXIT_TOL_T,
+            self.solid_out_X1 / EXIT_TOL_X1,
+            self.vapor_top_T / PROFILE_TOL_T,
+            self.vapor_top_water_flow / EXIT_TOL_FLOW,
+            self.vapor_top_hexane_flow / EXIT_TOL_FLOW,
+            self.vapor_profile_T_max / PROFILE_TOL_T,
+            self.vapor_profile_water_flow_max / PROFILE_TOL_FLOW,
+            self.vapor_profile_hexane_flow_max / PROFILE_TOL_FLOW,
+        )
+
+
+@dataclass(frozen=True)
+class DCZWarmStart:
+    """Complete lagged state of the nested DCZ fixed-point iteration.
+
+    The physical residence-time marches still start from the zone inlet on
+    every pass.  This object only preserves the iteration's lagged profiles,
+    so reusing it cannot accidentally add residence time.
+    """
+
+    bed_height_m: float
+    particles: tuple[pt.ParticleState, ...]
+    vapor_T: tuple[float, ...]
+    vapor_water_kg_s: tuple[float, ...]
+    vapor_hexane_kg_s: tuple[float, ...]
+    X1: tuple[float, ...]
+    condensed_water_kg_s: tuple[float, ...]
+    water_latent_w_m3: tuple[float, ...]
+    dwpg2_dt: tuple[tuple[float, ...], ...]
+    temperature_relaxation: float = 0.5
+    hexane_relaxation: float = 0.5
+    water_relaxation: float = 0.1
+    water_active_set: tuple[tuple[bool, bool], ...] | None = None
+
+
+@dataclass
+class _AdaptiveRelaxation:
+    """Residual-monotonic scalar damping for one coupled variable family."""
+
+    value: float
+    minimum: float
+    maximum: float
+    previous_norm: float = math.inf
+
+    def observe(self, norm: float, active_set_changed: bool = False) -> None:
+        if not math.isfinite(norm):
+            self.value = max(self.minimum, 0.5 * self.value)
+        elif active_set_changed or norm > 1.05 * self.previous_norm:
+            self.value = max(self.minimum, 0.5 * self.value)
+        elif norm < 0.85 * self.previous_norm:
+            self.value = min(self.maximum, 1.08 * self.value)
+        self.previous_norm = norm
+
+
+def _interp_profile(
+    values: tuple[float, ...], source_height_m: float, target_n: int, target_height_m: float
+) -> list[float]:
+    """Interpolate cell-centred warm data after the moving boundary remeshes DCZ."""
+    source_n = len(values)
+    if source_n == 0:
+        raise ValueError("DCZ warm-start profiles must be nonempty")
+    source_z = (np.arange(source_n, dtype=float) + 0.5) * source_height_m / source_n
+    target_z = (np.arange(target_n, dtype=float) + 0.5) * target_height_m / target_n
+    return [
+        float(v)
+        for v in np.interp(target_z, source_z, np.asarray(values, dtype=float), left=values[0], right=values[-1])
+    ]
+
+
+def _resample_warm_start(
+    warm: DCZWarmStart, target_n: int, target_height_m: float, particle_layers: int
+) -> DCZWarmStart:
+    if len(warm.particles) == 0 or any(
+        len(p.wpg2) != particle_layers or len(p.Tp) != particle_layers for p in warm.particles
+    ):
+        raise ValueError("DCZ warm-start particle shape does not match the configured mesh")
+
+    def particle_component(name: str, layer: int) -> tuple[float, ...]:
+        return tuple(getattr(p, name)[layer] for p in warm.particles)
+
+    wpg_layers = [
+        _interp_profile(particle_component("wpg2", layer), warm.bed_height_m, target_n, target_height_m)
+        for layer in range(particle_layers)
+    ]
+    temp_layers = [
+        _interp_profile(particle_component("Tp", layer), warm.bed_height_m, target_n, target_height_m)
+        for layer in range(particle_layers)
+    ]
+    rate_layers = [
+        _interp_profile(
+            tuple(rates[layer] for rates in warm.dwpg2_dt),
+            warm.bed_height_m,
+            target_n,
+            target_height_m,
+        )
+        for layer in range(particle_layers)
+    ]
+    particles = tuple(
+        pt.ParticleState(
+            wpg2=tuple(wpg_layers[layer][j] for layer in range(particle_layers)),
+            Tp=tuple(temp_layers[layer][j] for layer in range(particle_layers)),
+        )
+        for j in range(target_n)
+    )
+    return DCZWarmStart(
+        bed_height_m=target_height_m,
+        particles=particles,
+        vapor_T=tuple(_interp_profile(warm.vapor_T, warm.bed_height_m, target_n, target_height_m)),
+        vapor_water_kg_s=tuple(
+            _interp_profile(warm.vapor_water_kg_s, warm.bed_height_m, target_n, target_height_m)
+        ),
+        vapor_hexane_kg_s=tuple(
+            _interp_profile(warm.vapor_hexane_kg_s, warm.bed_height_m, target_n, target_height_m)
+        ),
+        X1=tuple(_interp_profile(warm.X1, warm.bed_height_m, target_n, target_height_m)),
+        condensed_water_kg_s=tuple(
+            _interp_profile(
+                warm.condensed_water_kg_s, warm.bed_height_m, target_n, target_height_m
+            )
+        ),
+        water_latent_w_m3=tuple(
+            _interp_profile(warm.water_latent_w_m3, warm.bed_height_m, target_n, target_height_m)
+        ),
+        dwpg2_dt=tuple(
+            tuple(rate_layers[layer][j] for layer in range(particle_layers))
+            for j in range(target_n)
+        ),
+        temperature_relaxation=warm.temperature_relaxation,
+        hexane_relaxation=warm.hexane_relaxation,
+        water_relaxation=warm.water_relaxation,
+        # A remesh changes cell identity, so recompute the active set rather
+        # than interpolating categorical flags.
+        water_active_set=warm.water_active_set if len(warm.particles) == target_n else None,
+    )
 
 
 @dataclass(frozen=True)
 class DCZConstants:
     diameter_m: float
-    bed_height_m: float  # L_DCZ -- fixed geometry, NOT a free boundary (unlike L_FTRZ)
+    bed_height_m: float  # L_DCZ for this solve; caller may remesh as L_FTRZ moves
     hM: float  # m/s, explicit input (Re_epsilon correlation gap, FTRZ precedent)
     hQ: float  # W/(m2 K), explicit input
     aV: float  # m2/m3, specific interfacial area, explicit input
@@ -246,12 +393,21 @@ class DCZCellResult:
     X2_bulk: float  # diagnostic: volumetric-mean adsorbed+absorbed hexane (Fig. 9(a)-style)
     X1_bulk: float  # solid moisture (kg/kg dry solid) -- see module docstring's moisture section
     condensed_water_kg_s: float  # this cell's own condensation rate (diagnostic)
+    vapor_water_kg_s: float  # explicit water flow leaving this cell toward the top
+    vapor_hexane_kg_s: float  # explicit hexane flow leaving this cell toward the top
+
+    @property
+    def vapor_flow_kg_s(self) -> float:
+        return self.vapor_water_kg_s + self.vapor_hexane_kg_s
 
 
 @dataclass(frozen=True)
 class DCZZoneResult:
     cells: tuple[DCZCellResult, ...]  # top-to-bottom, matching phz.py/ftrz.py's convention
     iterations: int
+    converged: bool = True
+    residuals: DCZResiduals = DCZResiduals()
+    warm_start: DCZWarmStart | None = None
 
     @property
     def vapor_out(self) -> VaporState:
@@ -268,6 +424,18 @@ class DCZZoneResult:
     @property
     def total_condensed_kg_s(self) -> float:
         return sum(cell.condensed_water_kg_s for cell in self.cells)
+
+    @property
+    def vapor_water_out_kg_s(self) -> float:
+        return self.cells[0].vapor_water_kg_s
+
+    @property
+    def vapor_hexane_out_kg_s(self) -> float:
+        return self.cells[0].vapor_hexane_kg_s
+
+    @property
+    def vapor_flow_out_kg_s(self) -> float:
+        return self.cells[0].vapor_flow_kg_s
 
 
 def bulk_temperature(cell: DCZCellResult, geometry: pt.ShellGeometry) -> float:
@@ -301,7 +469,9 @@ def solve_dcz_zone(
     outer_max_iter: int = 100,
     outer_tol: float = 1.0e-5,
     outer_relaxation: float = 0.5,
-    residual_log: list[tuple[int, float, float]] | None = None,
+    residual_log: list[tuple[int, float, float, float, float, float]] | None = None,
+    warm_start: DCZWarmStart | None = None,
+    adaptive_damping: bool = True,
 ) -> DCZZoneResult:
     """Solve the DCZ, `nz` axial cells top (FTRZ handoff) to bottom, via the
     Primary Internal Loop above. The particle's own initial condition at
@@ -337,7 +507,6 @@ def solve_dcz_zone(
     if len(q_Iv_profile) != nz:
         raise ValueError(f"q_Iv_w_m3 profile length ({len(q_Iv_profile)}) must equal nz ({nz})")
     u_L = m_dry_kg_s / (c.particle.alpha_ps * c.alpha_L * c.particle.rho_ps * A_bed)
-    u_V = m_vapor_kg_s / (c.rho_V * A_bed)
     dt = dz / u_L
 
     geometry = pt.build_shell_geometry(c.particle.r_P, c.particle.Np)
@@ -347,10 +516,30 @@ def solve_dcz_zone(
         wpg2=tuple(1.0 for _ in range(c.particle.Np)),
         Tp=tuple(T_L_sup for _ in range(c.particle.Np)),
     )
-    particles: list[pt.ParticleState] = [initial_particle for _ in range(nz)]
-    vapor_wV2 = [vapor_inf.wV2 for _ in range(nz)]  # cell j's top-facing value
-    vapor_T = [vapor_inf.T for _ in range(nz)]
-    dwpg2_dt_prev: list[tuple[float, ...]] = [zero_rates for _ in range(nz)]
+    m_water_bottom_kg_s = (1.0 - vapor_inf.wV2) * m_vapor_kg_s
+    m_hex_bottom_kg_s = vapor_inf.wV2 * m_vapor_kg_s
+    if warm_start is None:
+        particles: list[pt.ParticleState] = [initial_particle for _ in range(nz)]
+        vapor_m_water = [m_water_bottom_kg_s for _ in range(nz)]
+        vapor_m_hex = [m_hex_bottom_kg_s for _ in range(nz)]
+        vapor_T = [vapor_inf.T for _ in range(nz)]
+        dwpg2_dt_prev: list[tuple[float, ...]] = [zero_rates for _ in range(nz)]
+        X1_profile = [X1_in for _ in range(nz)]
+        water_latent_w_m3 = [0.0 for _ in range(nz)]
+        condensed_profile_kg_s = [0.0 for _ in range(nz)]
+    else:
+        warm = _resample_warm_start(warm_start, nz, c.bed_height_m, c.particle.Np)
+        particles = list(warm.particles)
+        vapor_m_water = [max(value, 0.0) for value in warm.vapor_water_kg_s]
+        vapor_m_hex = [max(value, 0.0) for value in warm.vapor_hexane_kg_s]
+        vapor_T = list(warm.vapor_T)
+        dwpg2_dt_prev = list(warm.dwpg2_dt)
+        X1_profile = list(warm.X1)
+        water_latent_w_m3 = list(warm.water_latent_w_m3)
+        condensed_profile_kg_s = [max(value, 0.0) for value in warm.condensed_water_kg_s]
+    vapor_wV2 = [
+        vapor_m_hex[j] / max(vapor_m_water[j] + vapor_m_hex[j], 1.0e-12) for j in range(nz)
+    ]
     kappa_w = 15.0 * c.water_diffusivity / c.particle.r_P**2  # 1/s, water's own bed-scale
     # equilibration rate -- the Glueckauf linear-driving-force (LDF) approximation for a
     # diffusing sphere (a standard, well-established result, not invented for this project).
@@ -371,7 +560,6 @@ def solve_dcz_zone(
     # with the convective coefficient in a full two-resistance series model (internal diffusion
     # dominates enough here that the convective term's own contribution is negligible by
     # comparison) -- a leaner, still real-data-grounded fix.
-    X1_profile = [X1_in for _ in range(nz)]  # solid moisture, top (j=0) to bottom (j=nz-1)
     # Water saturation temperature at the local (elevated, sparge) pressure -- the ceiling a
     # WET meal surface can reach: free/loosely-bound water flashes off (evaporative pinning)
     # rather than letting the meal superheat past it. Used both to cap the surface temperature
@@ -379,17 +567,8 @@ def solve_dcz_zone(
     # temperature while the meal stays wet (step 2). A wet meal in near-saturated steam sits at
     # saturation, NOT at the superheated toasting-vapor bulk temperature. (Y_V2=0 -> pure water.)
     T_sat_water = thermo.dew_point_temperature(0.0, c.antoine_water, P=c.pressure_pa)
-    water_latent_w_m3 = [0.0 for _ in range(nz)]  # lagged one iteration, "cold start" zeros
-    # Water REMOVED from (adsorption, >0) or ADDED to (desorption, <0) the vapor phase by the
-    # isotherm relaxation below, kg/(s*m3), same lag category as `water_latent_w_m3` -- without
-    # this, step 4's own vapor mass balance never reflects the isotherm branch's mass transfer at
-    # all, so adsorption could pull an unbounded amount of "moisture" out of a fixed local wV2
-    # without ever depleting it (and desorption could add moisture without ever diluting the
-    # local humidity) -- confirmed this session as the actual root cause of `water_latent_w_m3`
-    # reaching multiples of `q_Iv_profile`'s own magnitude (a genuine mass-conservation gap, not
-    # just a magnitude-tuning issue): the condensation branches already debit `water_remaining_kg_s`
-    # for exactly this reason, but the subsaturated isotherm branch had no equivalent.
-    water_mass_rate_w_m3 = [0.0 for _ in range(nz)]
+    # Sorption latent heat remains one energy iteration lagged; its component
+    # mass is marched in the same pass after step 4.5.
 
     iterations = 0
     # Previous-pass exit KPIs (bottom cell) for the physical convergence test;
@@ -397,6 +576,24 @@ def solve_dcz_zone(
     prev_x2_exit = math.inf
     prev_T_exit = math.inf
     prev_x1_exit = math.inf
+    prev_water_out = math.inf
+    prev_hex_out = math.inf
+    prev_vapor_top_T = math.inf
+    residuals = DCZResiduals()
+    converged = False
+
+    initial_alpha = min(max(outer_relaxation, 1.0e-3), 1.0)
+    temperature_alpha = warm.temperature_relaxation if warm_start is not None else initial_alpha
+    hexane_alpha = warm.hexane_relaxation if warm_start is not None else initial_alpha
+    water_alpha = warm.water_relaxation if warm_start is not None else min(initial_alpha, 0.10)
+    temperature_damping = _AdaptiveRelaxation(temperature_alpha, 0.05, initial_alpha)
+    hexane_damping = _AdaptiveRelaxation(hexane_alpha, 0.05, initial_alpha)
+    # Water is the active-set-limited family.  Start conservatively even if
+    # temperature/hexane can safely use the historical 0.5 Picard step.
+    water_damping = _AdaptiveRelaxation(water_alpha, 0.001, min(initial_alpha, 0.25))
+    previous_water_active_set: tuple[tuple[bool, bool], ...] | None = (
+        warm.water_active_set if warm_start is not None else None
+    )
 
     # Convergence acceleration of the vapor TEMPERATURE profile -- the
     # near-neutral mode (ρ≈0.9998) lives entirely in the energy coupling
@@ -423,6 +620,11 @@ def solve_dcz_zone(
     acc_cooldown = 0
 
     for iterations in range(1, outer_max_iter + 1):
+        old_vapor_T = tuple(vapor_T)
+        old_vapor_m_water = tuple(vapor_m_water)
+        old_vapor_m_hex = tuple(vapor_m_hex)
+        old_X1_profile = tuple(X1_profile)
+        old_condensed_profile = tuple(condensed_profile_kg_s)
         # Accelerator iterate x_k = the vapor TEMPERATURE profile ENTERING this
         # pass. The relaxed iteration body below is the fixed-point map H; its
         # output h_k is captured after step 4.5 and fed to the extrapolation.
@@ -493,9 +695,8 @@ def solve_dcz_zone(
         # Euler is unconditionally stable for this linear relaxation form,
         # mirroring why the particle-scale march is implicit for the same
         # stiffness reason.
-        denom_e = c.alpha_V * u_V * c.rho_V * c.cp_V
         new_vapor_T = [0.0] * nz
-        condensed_kg_s = [0.0] * nz
+        raw_condensed_kg_s = [0.0] * nz
         T_running = vapor_inf.T
         water_remaining_kg_s = (1.0 - vapor_inf.wV2) * m_vapor_kg_s
         for j in range(nz - 1, -1, -1):
@@ -562,9 +763,12 @@ def solve_dcz_zone(
                 m_flash_kg_s = water_remaining_kg_s * c.cp_V * (T_dew_j - T_in) / c.dH_vap_water
                 m_flash_kg_s = min(max(m_flash_kg_s, 0.0), water_remaining_kg_s)
                 water_remaining_kg_s -= m_flash_kg_s
-                condensed_kg_s[j] += m_flash_kg_s
+                raw_condensed_kg_s[j] += m_flash_kg_s
                 T_in = T_dew_j
 
+            local_vapor_flow_kg_s = max(vapor_m_water[j] + vapor_m_hex[j], 1.0e-9)
+            local_u_V = local_vapor_flow_kg_s / (c.rho_V * A_bed)
+            denom_e = c.alpha_V * local_u_V * c.rho_V * c.cp_V
             relax_factor = 1.0 + dz * kappa_e / denom_e
             T_candidate = (T_in + dz * (kappa_e * Tp12 + source) / denom_e) / relax_factor
 
@@ -584,7 +788,7 @@ def solve_dcz_zone(
                 m_cond_kg_s = source_cond_needed_w_m3 * A_bed * dz / c.dH_vap_water
                 m_cond_kg_s = min(max(m_cond_kg_s, 0.0), water_remaining_kg_s)
                 water_remaining_kg_s -= m_cond_kg_s
-                condensed_kg_s[j] += m_cond_kg_s
+                raw_condensed_kg_s[j] += m_cond_kg_s
                 source_cond_actual_w_m3 = m_cond_kg_s * c.dH_vap_water / (A_bed * dz)
                 T_running = (
                     T_in + dz * (kappa_e * Tp12 + source + source_cond_actual_w_m3) / denom_e
@@ -604,7 +808,16 @@ def solve_dcz_zone(
             if X1_profile[j] > _WET_PIN_FLOOR and T_running > T_sat_water:
                 T_running = T_sat_water
             new_vapor_T[j] = T_running
-        vapor_T = [vapor_T[j] + outer_relaxation * (new_vapor_T[j] - vapor_T[j]) for j in range(nz)]
+        alpha_temperature = temperature_damping.value
+        vapor_T = [
+            vapor_T[j] + alpha_temperature * (new_vapor_T[j] - vapor_T[j]) for j in range(nz)
+        ]
+        alpha_water = water_damping.value
+        condensed_profile_kg_s = [
+            condensed_profile_kg_s[j]
+            + alpha_water * (raw_condensed_kg_s[j] - condensed_profile_kg_s[j])
+            for j in range(nz)
+        ]
 
         # 3. mass balance at particle scale (top -> bottom). Same cascade
         # logic as step 1: a fresh wpg2 cascade from the zone entry
@@ -624,59 +837,58 @@ def solve_dcz_zone(
         particles = new_particles_mass
         dwpg2_dt_prev = new_rates
 
-        # 4. mass balance at bed scale (bottom -> top), same implicit
-        # per-cell relaxation as step 2, for the same stiffness reason.
-        # `+ water_mass_rate_w_m3[j]` (lagged, from step 4.5) `+
-        # condensed_kg_s[j]/(A_bed*dz)` (SAME iteration -- step 2 already
-        # computed `condensed_kg_s` above, no lag needed here): `vapor_wV2`
-        # is HEXANE's own mass fraction (see `water_remaining_kg_s = (1-wV2)*
-        # m_vapor_kg_s` above), so water LEAVING the vapor -- via adsorption
-        # OR condensation, same direction for both -- raises hexane's own
-        # share of what remains, i.e. RAISES `wV2` (desorption does the
-        # opposite). Found this session (DECISIONS.md): condensation's own
-        # mass removal was credited into the SOLID's moisture (step 4.5) and
-        # into THIS cell's own energy balance (step 2), but never actually
-        # debited from `vapor_wV2` here -- the exact same class of gap the
-        # isotherm branch had before `water_mass_rate_w_m3` was added, just
-        # for the other (supersaturated) branch. See `water_mass_rate_w_m3`'s
-        # own init comment above for why this class of term matters at all
-        # (mass conservation, not an optional refinement).
-        denom_m = c.alpha_V * u_V * c.rho_V
-        kappa_m = c.hM * c.rho_V * c.aV * c.alpha_L
-        new_vapor_wV2 = [0.0] * nz
-        wV2_running = vapor_inf.wV2
-        for j in range(nz - 1, -1, -1):
-            wpg2_12 = pt.outer_layer_value(particles[j].wpg2)
-            source_m = (
-                kappa_m * wpg2_12
-                + m_ax_net[j]
-                + water_mass_rate_w_m3[j]
-                + condensed_kg_s[j] / (A_bed * dz)
+        # 4. hexane component balance at bed scale (bottom -> top). The
+        # particle cascade is the authoritative interphase ledger: vapor
+        # gains exactly the dry-solid-flow-scaled X2 loss of each cell. This
+        # is the discrete conservative counterpart of A.24's SVm2 source and
+        # avoids evaluating the same interface twice with mismatched closures.
+        x2_particle = [
+            pt.volumetric_mean(
+                tuple(_x2_so(w, t, c.particle) for w, t in zip(cell.wpg2, cell.Tp)),
+                geometry.volumes,
             )
-            wV2_running = (wV2_running + dz * source_m / denom_m) / (1.0 + dz * kappa_m / denom_m)
-            new_vapor_wV2[j] = wV2_running
-        # Clamp to the physical [0,1] domain, same precedent (and same
-        # reason) as `march_particle_mass`'s own `wpg2_clamped`: the linear
-        # relaxation can drift past a boundary -- found this session via
-        # `core/balance.py`'s independent mass-conservation check, on a
-        # strongly-DESORBING illustrative case (a near-hexane-free vapor
-        # inlet, `wV2~0.0001`, diluted further by a large net desorption
-        # flux): reported `wV2` went slightly negative (order 1e-4). This
-        # clamp keeps `wV2` in its physical domain regardless, but is NOT a
-        # full fix -- the same investigation confirmed a materially larger,
-        # separate, and still-UNRESOLVED gap in how much hexane this cascade
-        # (via `kappa_m*wpg2_12`) credits into the vapor at all, traced to
-        # `march_particle_mass`'s own FVM (see that module's docstring and
-        # DECISIONS.md's "DCZ particle hexane mass-conservation gap" entry).
+            for cell in particles
+        ]
+        x2_zone_in = thermo.x2_equilibrium(
+            T_L_sup,
+            c.particle.X3,
+            c.particle.gab,
+            c.particle.oil,
+            c.particle.alpha_pg,
+            c.particle.alpha_ps,
+            c.particle.rho_ps,
+        )
+        hexane_release_kg_s = [
+            m_dry_kg_s * ((x2_zone_in if j == 0 else x2_particle[j - 1]) - x2_particle[j])
+            for j in range(nz)
+        ]
+        new_vapor_m_hex = [0.0] * nz
+        hex_running_kg_s = m_hex_bottom_kg_s
+        for j in range(nz - 1, -1, -1):
+            hex_running_kg_s = max(
+                hex_running_kg_s + hexane_release_kg_s[j] + m_ax_net[j] * A_bed * dz,
+                0.0,
+            )
+            new_vapor_m_hex[j] = hex_running_kg_s
+
+        alpha_hexane = hexane_damping.value
+        vapor_m_hex = [
+            max(
+                vapor_m_hex[j]
+                + alpha_hexane * (new_vapor_m_hex[j] - vapor_m_hex[j]),
+                0.0,
+            )
+            for j in range(nz)
+        ]
         vapor_wV2 = [
-            min(1.0 - 1.0e-9, max(0.0, vapor_wV2[j] + outer_relaxation * (new_vapor_wV2[j] - vapor_wV2[j])))
+            vapor_m_hex[j] / max(vapor_m_water[j] + vapor_m_hex[j], 1.0e-12)
             for j in range(nz)
         ]
 
         # 4.5. solid moisture at bed scale (top -> bottom, matching solid
         # flow direction -- see module docstring's "MOISTURE (H2O) BALANCE").
         # Uses THIS iteration's own just-updated `vapor_wV2`/`vapor_T` (steps
-        # 2/4 above) and `condensed_kg_s` (step 2's own supersaturation
+        # 2/4 above) and `condensed_profile_kg_s` (step 2's relaxed supersaturation
         # branches); produces `water_latent_w_m3`, consumed by step 2 of the
         # NEXT outer iteration (the same one-iteration lag `q_condL`/
         # `m_ax_net` already use) so the isotherm-driven regime's own latent
@@ -711,75 +923,73 @@ def solve_dcz_zone(
         # operating point the sparge is strong enough that the meal reaches ~19% via the
         # isotherm alone and this is slack; it binds only when the sparge is weak.
         water_available_kg_s = (1.0 - vapor_inf.wV2) * m_vapor_kg_s
-        cum_water_to_solid_kg_s = sum(condensed_kg_s)
+        cum_water_to_solid_kg_s = sum(condensed_profile_kg_s)
+        water_limited_cells: list[bool] = []
         for j in range(nz):
-            if condensed_kg_s[j] > 0.0:
-                # a_w >= 1 (supersaturated) this cell -- mass-conservative
-                # credit from the EXACT energy balance step 2 already solved.
-                # `new_water_latent_w_m3[j]`/`new_water_mass_rate_w_m3[j]`
-                # stay 0.0 here: step 2's own `source_cond_actual_w_m3` (line
-                # ~471) already credited this SAME condensed mass's latent
-                # heat into the vapor energy balance THIS iteration, and
-                # `water_remaining_kg_s` already debited it from the vapor
-                # mass balance THIS iteration too -- recomputing either here
-                # would double-count the identical condensation event
-                # (confirmed directly: caused `water_latent_w_m3` to grow to
-                # several times `q_Iv_profile`'s own magnitude and invert the
-                # basic more-duty-=hotter relationship in
-                # `test_model.py::test_more_steam_raises_dt_target_temperature`).
-                X1_new = X1_running + condensed_kg_s[j] / m_dry_kg_s
-                # (condensed mass already pre-counted into cum_water_to_solid_kg_s above)
+            # Bulk condensation is an immediate vapor-energy event. Credit
+            # its relaxed active-set mass first, then let the wet solid make
+            # a finite-rate bidirectional adjustment toward Xe. Keeping the
+            # mechanisms additive removes the discontinuous either/or branch
+            # that produced the low-duty three-cycle.
+            X1_after_condensation = X1_running + condensed_profile_kg_s[j] / m_dry_kg_s
+            Y_V2_j = vapor_wV2[j] / max(1.0 - vapor_wV2[j], 1.0e-12)
+            T_surface = min(vapor_T[j], T_sat_water)
+            a_w = thermo.water_activity(Y_V2_j, T_surface, c.antoine_water, P=c.pressure_pa)
+            a_w = min(max(a_w, 1.0e-9), thermo.LUIKOV_MAX_VALIDATED_UR)
+            Xe = thermo.luikov_equilibrium_moisture(a_w, c.luikov)
+            X1_new = (X1_after_condensation + dt * kappa_w * Xe) / (1.0 + dt * kappa_w)
+            mass_rate_kg_s = m_dry_kg_s * (X1_new - X1_after_condensation)
+            # A cell actively condensing bulk water is saturated; do not let
+            # the clamped bound-water isotherm immediately evaporate that
+            # same free condensate. Positive sorption remains additive.
+            if condensed_profile_kg_s[j] > 1.0e-12 and mass_rate_kg_s < 0.0:
+                mass_rate_kg_s = 0.0
+                X1_new = X1_after_condensation
+            if mass_rate_kg_s > 0.0:
+                headroom_kg_s = max(water_available_kg_s - cum_water_to_solid_kg_s, 0.0)
+                water_limited = mass_rate_kg_s > headroom_kg_s
+                if mass_rate_kg_s > headroom_kg_s:
+                    mass_rate_kg_s = headroom_kg_s
+                    X1_new = X1_after_condensation + mass_rate_kg_s / m_dry_kg_s
             else:
-                # a_w < 1 (subsaturated) -- bidirectional adsorption/
-                # desorption toward the isotherm's own equilibrium, an
-                # implicit relaxation over this cell's own residence `dt`,
-                # the same form the particle-scale marches already use.
-                Y_V2_j = vapor_wV2[j] / (1.0 - vapor_wV2[j])
-                # Evaporative pinning: the WET meal surface sits at the water saturation
-                # temperature (min of the superheated toasting vapor and T_sat), NOT the bulk
-                # vapor temp -- so a_w = y_water*P/P_sat(T_sat) = y_water, holding ~19% in
-                # near-pure steam instead of drying against a 120+ C vapor. Mirrors the FTRZ
-                # T_L pinning (zones/ftrz.py). Once the meal genuinely dries out and the vapor
-                # is hexane-rich, y_water (hence a_w) falls and real drying resumes.
-                T_surface = min(vapor_T[j], T_sat_water)
-                a_w = thermo.water_activity(Y_V2_j, T_surface, c.antoine_water, P=c.pressure_pa)
-                # Clamp to the Gianini paper's OWN highest tested UR (0.799,
-                # its KCl data point), not 1.0 -- DCZ's vapor is nearly pure
-                # steam, so a_w sits close to 1 almost everywhere this zone
-                # operates, exactly the isotherm's own UNTESTED tail (the
-                # fitted curve climbs steeply toward its asymptote A1=0.88 as
-                # a_w->1 with zero supporting data there -- confirmed this
-                # session: evaluating it unclamped gave Xe>0.5, a pure
-                # extrapolation artifact). Beyond this ceiling, additional
-                # moisture only comes from the a_w>=1 condensation branch.
-                a_w = min(max(a_w, 1.0e-9), thermo.LUIKOV_MAX_VALIDATED_UR)
-                Xe = thermo.luikov_equilibrium_moisture(a_w, c.luikov)
-                X1_new = (X1_running + dt * kappa_w * Xe) / (1.0 + dt * kappa_w)
-                mass_rate_kg_s = m_dry_kg_s * (X1_new - X1_running)
-                # ADSORPTION (mass_rate > 0) is capped to the vapor water still
-                # available; DESORPTION (< 0) returns water to the vapor and is
-                # unconstrained (it replenishes the budget).
-                if mass_rate_kg_s > 0.0:
-                    headroom_kg_s = max(water_available_kg_s - cum_water_to_solid_kg_s, 0.0)
-                    if mass_rate_kg_s > headroom_kg_s:
-                        mass_rate_kg_s = headroom_kg_s
-                        X1_new = X1_running + mass_rate_kg_s / m_dry_kg_s
-                cum_water_to_solid_kg_s += mass_rate_kg_s
-                new_water_latent_w_m3[j] = mass_rate_kg_s * c.dH_vap_water / (A_bed * dz)
-                new_water_mass_rate_w_m3[j] = mass_rate_kg_s / (A_bed * dz)
+                water_limited = False
+            water_limited_cells.append(water_limited)
+            cum_water_to_solid_kg_s += mass_rate_kg_s
+            new_water_latent_w_m3[j] = mass_rate_kg_s * c.dH_vap_water / (A_bed * dz)
+            new_water_mass_rate_w_m3[j] = mass_rate_kg_s / (A_bed * dz)
             new_X1_profile[j] = X1_new
             X1_running = X1_new
         X1_profile = [
-            X1_profile[j] + outer_relaxation * (new_X1_profile[j] - X1_profile[j])
+            X1_profile[j] + alpha_water * (new_X1_profile[j] - X1_profile[j])
             for j in range(nz)
         ]
         water_latent_w_m3 = [
-            water_latent_w_m3[j] + outer_relaxation * (new_water_latent_w_m3[j] - water_latent_w_m3[j])
+            water_latent_w_m3[j]
+            + alpha_water * (new_water_latent_w_m3[j] - water_latent_w_m3[j])
             for j in range(nz)
         ]
-        water_mass_rate_w_m3 = [
-            water_mass_rate_w_m3[j]
-            + outer_relaxation * (new_water_mass_rate_w_m3[j] - water_mass_rate_w_m3[j])
+
+        # March this pass's water transfer immediately. This is still a
+        # Picard coupling because activity used the entering component-flow
+        # profile, but mass and solid moisture now describe the same pass.
+        new_vapor_m_water = [0.0] * nz
+        water_running_kg_s = m_water_bottom_kg_s
+        for j in range(nz - 1, -1, -1):
+            water_sink_kg_s = (
+                new_water_mass_rate_w_m3[j] * A_bed * dz + condensed_profile_kg_s[j]
+            )
+            water_running_kg_s = max(water_running_kg_s - water_sink_kg_s, 0.0)
+            new_vapor_m_water[j] = water_running_kg_s
+        vapor_m_water = [
+            max(
+                vapor_m_water[j]
+                + alpha_water * (new_vapor_m_water[j] - vapor_m_water[j]),
+                0.0,
+            )
+            for j in range(nz)
+        ]
+        vapor_wV2 = [
+            vapor_m_hex[j] / max(vapor_m_water[j] + vapor_m_hex[j], 1.0e-12)
             for j in range(nz)
         ]
 
@@ -812,11 +1022,12 @@ def solve_dcz_zone(
         # vapor_wV2 is ALWAYS the plain relaxed step (not accelerated -- init note).
         acc_prev_res = res_vap
 
-        # 5. physical convergence check: the bottom cell's REPORTED exit KPIs
-        # (residual hexane X2_bulk, moisture X1, bulk temperature) stable to
-        # within their physical tolerances between passes. (`outer_tol` is
-        # retained in the signature for backward compatibility but is superseded
-        # by these KPI thresholds -- see EXIT_TOL_* and their comment.)
+        # 5. Honest fixed-point convergence check.  The previous implementation
+        # checked the bottom meal and top component flows but omitted the top
+        # vapor temperature consumed by solve_dt.  A very slow thermal mode
+        # could therefore be labelled converged while that boundary was still
+        # moving by several kelvin.  Check both exported boundaries and maximum
+        # full-profile residuals of all vapor states.
         last = particles[-1]
         x2_exit = pt.volumetric_mean(
             tuple(_x2_so(w, t, c.particle) for w, t in zip(last.wpg2, last.Tp)),
@@ -827,10 +1038,59 @@ def solve_dcz_zone(
         d_x2 = abs(x2_exit - prev_x2_exit)
         d_T = abs(T_exit - prev_T_exit)
         d_x1 = abs(x1_exit - prev_x1_exit)
+        d_water_out = abs(vapor_m_water[0] - prev_water_out)
+        d_hex_out = abs(vapor_m_hex[0] - prev_hex_out)
+        d_vapor_top_T = abs(vapor_T[0] - prev_vapor_top_T)
+        d_vapor_T_profile = max(abs(vapor_T[j] - old_vapor_T[j]) for j in range(nz))
+        d_vapor_water_profile = max(
+            abs(vapor_m_water[j] - old_vapor_m_water[j]) for j in range(nz)
+        )
+        d_vapor_hex_profile = max(
+            abs(vapor_m_hex[j] - old_vapor_m_hex[j]) for j in range(nz)
+        )
+        residuals = DCZResiduals(
+            solid_out_X2=d_x2,
+            solid_out_T=d_T,
+            solid_out_X1=d_x1,
+            vapor_top_T=d_vapor_top_T,
+            vapor_top_water_flow=d_water_out,
+            vapor_top_hexane_flow=d_hex_out,
+            vapor_profile_T_max=d_vapor_T_profile,
+            vapor_profile_water_flow_max=d_vapor_water_profile,
+            vapor_profile_hexane_flow_max=d_vapor_hex_profile,
+        )
         prev_x2_exit, prev_T_exit, prev_x1_exit = x2_exit, T_exit, x1_exit
+        prev_water_out, prev_hex_out = vapor_m_water[0], vapor_m_hex[0]
+        prev_vapor_top_T = vapor_T[0]
         if residual_log is not None:
-            residual_log.append((iterations, d_x2, d_T))
-        if d_x2 <= EXIT_TOL_X2 and d_T <= EXIT_TOL_T and d_x1 <= EXIT_TOL_X1:
+            residual_log.append((iterations, d_x2, d_T, d_x1, d_water_out, d_hex_out))
+
+        water_active_set = tuple(
+            (raw_condensed_kg_s[j] > 1.0e-12, water_limited_cells[j]) for j in range(nz)
+        )
+        active_set_changed = (
+            previous_water_active_set is not None
+            and water_active_set != previous_water_active_set
+        )
+        previous_water_active_set = water_active_set
+        if adaptive_damping:
+            temperature_damping.observe(d_vapor_T_profile)
+            hexane_damping.observe(d_vapor_hex_profile)
+            water_norm = max(
+                d_vapor_water_profile / PROFILE_TOL_FLOW,
+                max(
+                    abs(new_X1_profile[j] - old_X1_profile[j]) / EXIT_TOL_X1
+                    for j in range(nz)
+                ),
+                max(
+                    abs(raw_condensed_kg_s[j] - old_condensed_profile[j]) / PROFILE_TOL_FLOW
+                    for j in range(nz)
+                ),
+            )
+            water_damping.observe(water_norm, active_set_changed)
+
+        if residuals.maximum_scaled <= 1.0:
+            converged = True
             break
 
     cells = []
@@ -842,7 +1102,7 @@ def solve_dcz_zone(
             ),
             geometry.volumes,
         )
-        # X1_profile/condensed_kg_s are already the FINAL outer iteration's
+        # X1_profile/condensed_profile_kg_s are already the FINAL outer iteration's
         # own converged values (step 4.5 above, top-j=0-to-bottom-j=nz-1,
         # same order as this loop) -- no separate recomputation needed here.
         cells.append(
@@ -851,10 +1111,33 @@ def solve_dcz_zone(
                 particle=particles[j],
                 X2_bulk=X2_bulk,
                 X1_bulk=X1_profile[j],
-                condensed_water_kg_s=condensed_kg_s[j],
+                condensed_water_kg_s=condensed_profile_kg_s[j],
+                vapor_water_kg_s=vapor_m_water[j],
+                vapor_hexane_kg_s=vapor_m_hex[j],
             )
         )
-    return DCZZoneResult(cells=tuple(cells), iterations=iterations)
+    warm = DCZWarmStart(
+        bed_height_m=c.bed_height_m,
+        particles=tuple(particles),
+        vapor_T=tuple(vapor_T),
+        vapor_water_kg_s=tuple(vapor_m_water),
+        vapor_hexane_kg_s=tuple(vapor_m_hex),
+        X1=tuple(X1_profile),
+        condensed_water_kg_s=tuple(condensed_profile_kg_s),
+        water_latent_w_m3=tuple(water_latent_w_m3),
+        dwpg2_dt=tuple(dwpg2_dt_prev),
+        temperature_relaxation=temperature_damping.value,
+        hexane_relaxation=hexane_damping.value,
+        water_relaxation=water_damping.value,
+        water_active_set=previous_water_active_set,
+    )
+    return DCZZoneResult(
+        cells=tuple(cells),
+        iterations=iterations,
+        converged=converged,
+        residuals=residuals,
+        warm_start=warm,
+    )
 
 
 def _x2_so(wpg2: float, T: float, pc: pt.ParticleConstants) -> float:

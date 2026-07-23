@@ -8,8 +8,8 @@ already use, not exact literature values (only the paper's plots are
 available to us, not its underlying data).
 
 Absolute temperatures in these tests run measurably above the zone boundary
-values -- a known, documented consequence of `hQ`/`hM`/`aV` still being
-`[DERIVED]`/`[PLACE]` standard-packed-bed placeholders (see `dt_solver.py`'s
+values -- a known, documented consequence of `hQ`/`hM`/`aV` being
+`[DERIVED]` standard-packed-bed closures (see `dt_solver.py`'s
 own module docstring), not yet fitted to real bed conditions. Assertions
 below check monotonic direction, boundedness, and convergence -- not tight
 absolute values.
@@ -47,7 +47,7 @@ VAPOR_REF = thermo.VaporEnthalpyRef(
 PHZ_C = phz_mod.PHZConstants(
     T_boil_hexane=341.9,
     dH_vap_hexane=3.34e5,
-    cp_solid=1800.0,
+    cp_solid=2317.0,
     cp_water_liquid=4186.0,
     cp_hexane_liquid=2260.0,
     cp_oil=2000.0,
@@ -68,6 +68,8 @@ FTRZ_C = ftrz.FTRZConstants(
     rho_ps=1513.0,
     X3=0.0139,
     bed_porosity=0.4,
+    water_diffusivity=3.1e-11,
+    particle_radius=1.0e-3,
 )
 PARTICLE_C = pt.ParticleConstants(
     D_eff=4.0e-10,
@@ -184,11 +186,82 @@ def test_phz_pass_locates_a_boundary_within_the_given_trays() -> None:
     assert result.L_PHZ_m > 0.0
 
 
-def test_phz_pass_raises_if_boundary_never_reached() -> None:
+def test_phz_pass_hands_a_cold_starved_predesolv_exit_to_mn1() -> None:
     starved_trays = [replace(t, Q_indirect_w=1.0) for t in REFERENCE_TRAYS[:1]]
     vapor_hint = phz_mod.VaporState(wV1=0.9999, wV2=0.0001, T=371.0)
-    with pytest.raises(ValueError, match="never reaches X2_cr"):
-        dts._phz_pass(starved_trays, SOLID_FEED, vapor_hint, 5.0, 20, CONSTANTS)
+    result = dts._phz_pass(starved_trays, SOLID_FEED, vapor_hint, 5.0, 20, CONSTANTS)
+    assert result.boundary_tray_index == 0
+    assert result.z_star_m == pytest.approx(starved_trays[0].bed_height_m)
+    assert result.exit_state.T < PHZ_C.T_boil_hexane
+    assert result.exit_state.X2 == pytest.approx(SOLID_FEED.X2)
+
+
+def test_phz_pass_uses_all_predesolv_hardware_for_feed_below_theoretical_x2_cr() -> None:
+    feed = replace(SOLID_FEED, X2=0.38)
+    trays = [replace(t, Q_indirect_w=3.0e5) for t in REFERENCE_TRAYS[:3]]
+    vapor_hint = phz_mod.VaporState(wV1=0.9999, wV2=0.0001, T=371.0)
+    result = dts._phz_pass(trays, feed, vapor_hint, 5.0, 20, CONSTANTS)
+    assert result.L_PHZ_m > 0.0
+    assert result.exit_state.T == pytest.approx(PHZ_C.T_boil_hexane, abs=1.0e-6)
+    assert result.exit_state.X2 < feed.X2
+
+
+def test_phz_caps_at_predesolv_hardware_and_hands_higher_x2_to_ftrz() -> None:
+    empirical = replace(PARTICLE_C, x2_critical_empirical=0.20)
+    constants = replace(CONSTANTS, particle=empirical)
+    trays = [replace(t, Q_indirect_w=2.5e5) for t in REFERENCE_TRAYS[:3]]
+    vapor_hint = phz_mod.VaporState(wV1=0.9999, wV2=0.0001, T=371.0)
+    result = dts._phz_pass(trays, SOLID_FEED, vapor_hint, 5.0, 20, constants)
+    assert result.boundary_tray_index == 2
+    assert result.z_star_m == pytest.approx(trays[-1].bed_height_m)
+    assert result.exit_state.T == pytest.approx(PHZ_C.T_boil_hexane, abs=1.0e-6)
+    assert result.exit_state.X2 > 0.20
+
+
+def test_phz_falling_rate_does_not_move_ftrz_into_predesolv() -> None:
+    phz_c = replace(
+        PHZ_C,
+        particle_radius=PARTICLE_C.r_P,
+        dry_shell_conductivity=PARTICLE_C.k_ps,
+        jacket_temperature=443.15,
+    )
+    empirical = replace(PARTICLE_C, x2_critical_empirical=0.20)
+    constants = replace(CONSTANTS, phz=phz_c, particle=empirical)
+    trays = [replace(t, Q_indirect_w=1.5e6) for t in REFERENCE_TRAYS[:3]]
+    vapor_hint = phz_mod.VaporState(wV1=0.9999, wV2=0.0001, T=371.0)
+    result = dts._phz_pass(trays, SOLID_FEED, vapor_hint, 5.0, 20, constants)
+
+    assert result.boundary_tray_index == 2
+    assert result.z_star_m == pytest.approx(trays[-1].bed_height_m)
+    assert any(
+        cell.regime == "FALLING_RATE"
+        for tray_result in (*result.tray_results, result.boundary_tray_result)
+        for cell in tray_result.cells
+    )
+    assert result.exit_state.T > PHZ_C.T_boil_hexane
+
+
+def test_dcz_domain_accepts_ftrz_crossing_a_tray_sliver() -> None:
+    remaining = [
+        replace(REFERENCE_TRAYS[2], bed_height_m=0.002, Q_indirect_w=2.0e3),
+        REFERENCE_TRAYS[3],
+        REFERENCE_TRAYS[4],
+        REFERENCE_TRAYS[5],
+    ]
+    area = 3.141592653589793 * remaining[0].diameter_m ** 2 / 4.0
+    dcz_c, q_profile = dts._build_dcz_domain(
+        remaining,
+        L_FTRZ_m=0.0035,
+        A_bed_m2=area,
+        hQ=10.0,
+        hM=0.01,
+        aV=100.0,
+        c=CONSTANTS,
+        nz_dcz=8,
+    )
+    assert dcz_c.bed_height_m == pytest.approx(sum(t.bed_height_m for t in remaining) - 0.0035)
+    assert len(q_profile) == 8
+    assert all(q >= 0.0 for q in q_profile)
 
 
 # ------------------------------------------------------------------ full integrated solve
@@ -241,28 +314,24 @@ def test_direct_steam_does_not_invert_sparge_moisture() -> None:
     contribution and re-created the same inversion through a different
     mechanism.
     #
-    This is a NET-direction check, not a strict monotonicity one: the
-    isotherm's own thermostatic feedback (hotter meal holds less bound
-    moisture at equilibrium, a real effect) can still produce small
-    non-monotonic wobbles in the deeply-subsaturated regime below the
-    condensation threshold (confirmed directly on the real scenario this
-    session -- a ~0.15%-relative dip from 0-1.25 kg/s, then a step up once
-    condensation actually triggers around SP1's own operating default of
-    1.5 kg/s). A MODERATE direct_steam rate, well above that threshold, must
-    still leave SP1 wetter than no direct steam at all -- the actual bug
-    this test exists to catch.
+    This is a material-inversion check, not a strict monotonicity one. The
+    fixture already supplies 5 kg/s clean water vapor, so both cases have
+    abundant water and nearly identical activity; redundant excess flow is
+    not expected to change a subsaturated isotherm target materially.
     """
     trays_dry = [replace(t, direct_steam_kg_s=0.0) for t in REFERENCE_TRAYS]
-    trays_wet = [
-        replace(t, direct_steam_kg_s=4.0) if t.id == "SP1" else t for t in REFERENCE_TRAYS
-    ]
+    trays_wet = [replace(t, direct_steam_kg_s=4.0) if t.id == "SP1" else t for t in REFERENCE_TRAYS]
     dry_result = dts.solve_dt(
         trays_dry, SOLID_FEED, VAPOR_FEED_BELOW, CONSTANTS, nz_phz=10, nz_ftrz=10, nz_dcz=8
     )
     wet_result = dts.solve_dt(
         trays_wet, SOLID_FEED, VAPOR_FEED_BELOW, CONSTANTS, nz_phz=10, nz_ftrz=10, nz_dcz=8
     )
-    assert wet_result.tray_summaries[-1].X1 > dry_result.tray_summaries[-1].X1
+    # This fixture already supplies 5 kg/s clean steam, so both cases have
+    # abundant water and nearly identical activity; direct steam changes flow
+    # magnitude, not the isotherm target. Guard against a material inversion
+    # rather than demanding a false flow-rate dependence in a subsaturated bed.
+    assert wet_result.tray_summaries[-1].X1 >= dry_result.tray_summaries[-1].X1 * (1.0 - 0.005)
 
 
 def test_dcz_moisture_balance_present_and_mass_conservative(default_result: dts.DTResult) -> None:
@@ -349,6 +418,43 @@ def test_axial_profile_all_states_physically_bounded(default_result: dts.DTResul
         assert 0.0 <= water_frac <= 1.0
 
 
+def test_publish_validation_rejects_nonconverged_and_cold_bulk_profiles(
+    default_result: dts.DTResult,
+) -> None:
+    dts.validate_dt_result(default_result, SOLID_FEED, CONSTANTS)
+
+    with pytest.raises(ValueError, match="did not converge"):
+        dts.validate_dt_result(
+            replace(default_result, converged=False),
+            SOLID_FEED,
+            CONSTANTS,
+        )
+
+    with pytest.raises(ValueError, match="nonconverged DCZ"):
+        dts.validate_dt_result(
+            replace(default_result, dcz=replace(default_result.dcz, converged=False)),
+            SOLID_FEED,
+            CONSTANTS,
+        )
+
+    assert default_result.L_FTRZ_m == pytest.approx(default_result.ftrz.L_FTRZ_m, abs=1.0e-12)
+    assert default_result.dcz.warm_start is not None
+    assert default_result.L_DCZ_m == pytest.approx(
+        default_result.dcz.warm_start.bed_height_m, abs=1.0e-12
+    )
+
+    invalid_profile = replace(
+        default_result.axial_profile,
+        solid_T=(272.0, *default_result.axial_profile.solid_T[1:]),
+    )
+    with pytest.raises(ValueError, match="bulk-meal temperature"):
+        dts.validate_dt_result(
+            replace(default_result, axial_profile=invalid_profile),
+            SOLID_FEED,
+            CONSTANTS,
+        )
+
+
 # ------------------------------------------------------------------ input validation
 
 
@@ -370,6 +476,31 @@ def test_solve_dt_rejects_empty_tray_list() -> None:
         dts.solve_dt([], SOLID_FEED, VAPOR_FEED_BELOW, CONSTANTS)
 
 
+def test_live_feed_oil_overrides_frozen_zone_oil_without_mutation(
+    default_result: dts.DTResult,
+) -> None:
+    """FTRZ/DCZ equilibrium must use the live feed DV, not assembly-time X3."""
+    stale = replace(
+        CONSTANTS,
+        ftrz=replace(CONSTANTS.ftrz, X3=0.001),
+        particle=replace(CONSTANTS.particle, X3=0.001),
+    )
+
+    result = dts.solve_dt(
+        REFERENCE_TRAYS,
+        SOLID_FEED,
+        VAPOR_FEED_BELOW,
+        stale,
+        nz_phz=10,
+        nz_ftrz=10,
+        nz_dcz=8,
+    )
+
+    assert result.solid_exit_X2 == pytest.approx(default_result.solid_exit_X2)
+    assert stale.ftrz.X3 == 0.001
+    assert stale.particle.X3 == 0.001
+
+
 # ------------------------------------------------------------------ warm start
 
 
@@ -379,11 +510,10 @@ def test_warm_start_from_a_converged_solution_stays_converged() -> None:
     # vapor_in -- that's the fixed point the Gauss-Seidel loop solves for)
     # should re-converge immediately, not drift away.
     cold = _solve(outer_max_iter=200)
-    m_vapor_total = VAPOR_FEED_BELOW.m_water_kg_s + VAPOR_FEED_BELOW.m_hex_kg_s + 1.5
     dcz_top = cold.dcz.vapor_out
     warm_vapor_in = ftrz.VaporState(
-        m_water_kg_s=(1.0 - dcz_top.wV2) * m_vapor_total,
-        m_hex_kg_s=dcz_top.wV2 * m_vapor_total,
+        m_water_kg_s=cold.dcz.vapor_water_out_kg_s,
+        m_hex_kg_s=cold.dcz.vapor_hexane_out_kg_s,
         T=dcz_top.T,
     )
     warm = _solve(

@@ -2,7 +2,7 @@ import pytest
 
 from dtdc_simulator.config.builder import assemble_model
 from dtdc_simulator.config.loader import load_scenario
-from dtdc_simulator.core.model import Inputs
+from dtdc_simulator.core.model import Inputs, StageRole
 
 SCENARIO_PATH = "scenarios/soybean_default.yaml"
 
@@ -27,7 +27,7 @@ def _default_inputs(cfg):
         indirect_steam=dict(od.indirect_steam),
         direct_steam=dict(od.direct_steam),
         sweep_arm_speed=dict(od.sweep_arm_speed),
-        gate_opening=dict(od.gate_opening),
+        transfer_device_position=dict(od.transfer_device_position),
         heated_air_temp=od.heated_air_temp,
         heated_air_flow=od.heated_air_flow,
         ambient_air_temp=dd.ambient_air_temp,
@@ -60,6 +60,7 @@ def test_init_state_matches_seed(loaded) -> None:
     # necessarily x0.X2's last entry, since the scenario's own last STAGE is
     # CL1, a downstream COOLER seeded at the raw feed state, not the DT).
     assert x0.dt_target_X2[-1] < cfg.disturbance_defaults.feed_hexane
+    assert x0.dt_converged
     assert x0.dt_outer_iterations > 0
     assert x0.dt_target_T.shape == x0.dt_target_X1.shape == x0.dt_target_X2.shape
 
@@ -92,13 +93,8 @@ def test_more_steam_raises_dt_target_temperature(loaded) -> None:
     PREDESOLV trays from ~62-67 C to ~104 C while SP1 stays ~100 C). Using
     `max()` captures the real, physically-meaningful response.
 
-    Not asserting `dt_converged` here: the scenario's own real-time tuning
-    (M3a follow-up "A2", `dt_outer_tol=0.05`/`dt_outer_max_iter=20`) is
-    deliberately loose enough that the formal convergence flag often reads
-    False within so few iterations even though the profile itself is already
-    close to its asymptote -- `converged` is a diagnostic for `SolverStress`,
-    not a precondition for the profile being directionally meaningful, which
-    is what this test actually checks.
+    Both solves must also be accepted: directional comparisons may not consume
+    a diagnostic best iterate that failed the publication boundary.
     """
     (model, x0), cfg = loaded
 
@@ -110,7 +106,38 @@ def test_more_steam_raises_dt_target_temperature(loaded) -> None:
     x_cold, _ = model.step(x0, u_cold, 1.0, 1.0)  # t=1.0 >> the tiny resolve interval
     x_hot, _ = model.step(x0, u_hot, 1.0, 1.0)
 
+    assert x_cold.dt_converged
+    assert x_hot.dt_converged
     assert max(x_hot.dt_target_T) > max(x_cold.dt_target_T)
+
+
+def test_high_feed_high_level_case_converges_to_physical_profile(loaded) -> None:
+    """The former 40.4 kg/s failure now resolves through adaptive continuation."""
+    (model, x0), cfg = loaded
+    x = x0.copy()
+    for i, stage in enumerate(model.stages):
+        if stage.role in (StageRole.PREDESOLV, StageRole.MAIN, StageRole.SPARGE):
+            x.M[i] = 0.81 * model._stage_M_max(stage)
+
+    u = _with_fast_resolve(_default_inputs(cfg))
+    u.feed_flow_rate = 40.4
+    pd_ids = [stage.id for stage in model.stages if stage.role is StageRole.PREDESOLV]
+    pd_total_w = 2.07 * cfg.physical.dH_vap_water
+    for stage_id in pd_ids:
+        u.indirect_steam[stage_id] = pd_total_w / len(pd_ids)
+
+    accepted_profile = x.dt_axial_profile
+    x_next, outputs = model.step(x, u, 1.0, 1.0)
+
+    assert x_next.dt_converged
+    assert x_next.dt_last_attempt_sim_time == pytest.approx(1.0)
+    assert x_next.dt_last_solve_sim_time == pytest.approx(1.0)
+    assert x_next.dt_axial_profile is not accepted_profile
+    assert outputs.dt_axial_profile is x_next.dt_axial_profile
+    assert min(outputs.dt_axial_profile.solid_T) >= u.feed_temperature - 1.0
+    assert max(outputs.dt_axial_profile.solid_T) < 450.0
+    assert all(0.0 <= value <= 1.0 for value in outputs.dt_axial_profile.solid_X1)
+    assert all(0.0 <= value <= 1.0 for value in outputs.dt_axial_profile.solid_X2)
 
 
 def test_energy_and_vapor_kpis(loaded) -> None:
@@ -138,6 +165,13 @@ def test_energy_and_vapor_kpis(loaded) -> None:
     # Vapor leaves the DT top (init solve populated the profile), and condenser
     # duty follows from it; exhaust hexane echoes the DRYER air-side value.
     assert y.kpi_outlet_vapor_kg_s > 0.0
+    expected_stage_vapor_flow: dict[str, float] = {}
+    for sid, flow in zip(
+        y.dt_axial_profile.stage_id,
+        y.dt_axial_profile.vapor_flow_kg_s,
+    ):
+        expected_stage_vapor_flow.setdefault(sid, flow)
+    assert y.stage_vapor_flow_kg_s == pytest.approx(expected_stage_vapor_flow)
     for value in (
         y.kpi_outlet_vapor_hexane_kg_s,
         y.kpi_outlet_vapor_water_kg_s,
@@ -148,24 +182,25 @@ def test_energy_and_vapor_kpis(loaded) -> None:
         assert value >= 0.0
 
 
-def test_closed_gate_stops_discharge_and_floods(loaded) -> None:
-    """A shut rotary valve (gate_opening=0) must genuinely STOP that stage's
+def test_closed_controlled_transfer_stops_discharge_and_floods(loaded) -> None:
+    """A shut controlled transfer must genuinely STOP its source stage's
     solid discharge (not merely slow it, as the old M/tau residence model did)
     -- so material accumulates and the tray floods past 100%."""
     (model, x0), cfg = loaded
     u = _default_inputs(cfg)
-    first = model.stages[0].id
-    u.gate_opening = dict(u.gate_opening)
-    u.gate_opening[first] = 0.0
+    transfer = next(item for item in model.solid_transfers if item.controlled)
+    source = transfer.from_stage
+    u.transfer_device_position = dict(u.transfer_device_position)
+    u.transfer_device_position[transfer.id] = 0.0
 
     x, y = x0.copy(), None
     for _ in range(200):
         x, y = model.step(x, u, 0.0, 5.0)
 
-    assert y.stage_solid_out_kg_s[first] == pytest.approx(0.0, abs=1.0e-9)
+    assert y.stage_solid_out_kg_s[source] == pytest.approx(0.0, abs=1.0e-9)
     # Capacity-capped: a full tray sits AT ~100% (surplus is rejected upstream),
     # it doesn't climb unboundedly past it.
-    assert y.stage_level_pct[first] >= 99.5
+    assert y.stage_level_pct[source] >= 99.5
 
 
 def test_backpressure_floods_the_tray_above(loaded) -> None:
@@ -173,11 +208,11 @@ def test_backpressure_floods_the_tray_above(loaded) -> None:
     the surplus is rejected back into the tray ABOVE it, which then floods too
     -- so a shut gate mid-column backs material up toward the feed."""
     (model, x0), cfg = loaded
-    ids = [s.id for s in model.stages]
-    blocked, upstream = ids[2], ids[1]
+    transfer = next(item for item in model.solid_transfers if item.id == "MN2_TO_SP1")
+    blocked, upstream = transfer.from_stage, "MN1"
     u = _default_inputs(cfg)
-    u.gate_opening = dict(u.gate_opening)
-    u.gate_opening[blocked] = 0.0
+    u.transfer_device_position = dict(u.transfer_device_position)
+    u.transfer_device_position[transfer.id] = 0.0
 
     x, y = x0.copy(), None
     for _ in range(400):
@@ -188,26 +223,31 @@ def test_backpressure_floods_the_tray_above(loaded) -> None:
     assert y.stage_level_pct[upstream] >= 99.5  # back-pressure floods the tray above
 
 
-def test_gate_controls_level_uniformly_across_trays(loaded) -> None:
+def test_controlled_transfers_control_level_uniformly(loaded) -> None:
     """Discharge is driven by bed LEVEL, not absolute holdup, so the SAME gate
     opening settles every tray to the SAME level despite a ~7x spread in tray
     capacity (bed depths 0.15 m -> 1.0 m). (With the old `m_out = M*k` law a
     deep tray sat near-empty and a shallow one near-full at the same gate.)"""
     (model, x0), cfg = loaded
     u = _default_inputs(cfg)
-    u.gate_opening = {s.id: 30.0 for s in model.stages}  # same gate on every stage
+    u.transfer_device_position = {
+        transfer.id: 30.0 for transfer in model.solid_transfers if transfer.controlled
+    }
 
     x = x0.copy()
     for _ in range(3000):
         x, y = model.step(x, u, 0.0, 4.0)
 
-    levels = [y.stage_level_pct[s.id] for s in model.stages]
+    controlled_sources = [
+        transfer.from_stage for transfer in model.solid_transfers if transfer.controlled
+    ]
+    levels = [y.stage_level_pct[stage_id] for stage_id in controlled_sources]
     assert max(levels) - min(levels) < 1.0  # uniform, regardless of tray depth
 
 
 def test_narrower_gate_raises_steady_state_bed_level(loaded) -> None:
-    """gate_opening (§5.2: "sets inter-stage solid flow / holdup (level)") was
-    previously read into Inputs and never used anywhere. Confirm it now
+    """Transfer-device position must genuinely affect the bed-holdup balance.
+    Confirm that it now
     genuinely affects the bed-holdup mass balance: a narrower gate should
     back meal up (higher steady-state level) relative to a wider one. Fully
     independent of the DT solve/resolve cadence (bed holdup uses `_stage_tau`
@@ -215,9 +255,9 @@ def test_narrower_gate_raises_steady_state_bed_level(loaded) -> None:
     (model, x0), cfg = loaded
 
     u_narrow = _default_inputs(cfg)
-    u_narrow.gate_opening = {k: 20.0 for k in u_narrow.gate_opening}
+    u_narrow.transfer_device_position = {k: 20.0 for k in u_narrow.transfer_device_position}
     u_wide = _default_inputs(cfg)
-    u_wide.gate_opening = {k: 80.0 for k in u_wide.gate_opening}
+    u_wide.transfer_device_position = {k: 80.0 for k in u_wide.transfer_device_position}
 
     x_narrow, x_wide = x0.copy(), x0.copy()
     for _ in range(500):

@@ -1,3 +1,5 @@
+import pytest
+
 from dtdc_simulator.config.loader import load_scenario
 from dtdc_simulator.config.schema import ClockKind
 from dtdc_simulator.engine.facade import RuntimeFacade
@@ -83,6 +85,16 @@ def test_feed_oil_is_a_live_dv() -> None:
     assert facade.get_snapshot().dvs["feed_oil"] == 0.025
 
 
+def test_snapshot_exposes_distinct_indirect_and_direct_steam_conditions() -> None:
+    facade = _facade_freerun()
+    steam = facade.get_snapshot().steam
+
+    assert steam is not None
+    assert steam.supply_barg == pytest.approx(6.9)
+    assert steam.direct_contact_barg == pytest.approx(3.0)
+    assert steam.supply_T_K > steam.direct_contact_T_K
+
+
 def test_group_manual_setpoint_broadcasts_to_all_stages() -> None:
     """M4: one global 'arm rotation speed' slider drives every per-stage
     sweep_arm_speed MV via set_mv_group_manual_setpoint, leaving per-stage
@@ -96,6 +108,34 @@ def test_group_manual_setpoint_broadcasts_to_all_stages() -> None:
         assert mvs[key].manual_setpoint == 7.0
 
 
+def test_weighted_group_total_preserves_jacket_split() -> None:
+    facade = _facade_freerun()
+    keys = ["indirect_steam/MN1", "indirect_steam/MN2", "indirect_steam/SP1"]
+    before = facade.get_snapshot().mvs
+    ratio = [before[key].manual_setpoint / before[keys[0]].manual_setpoint for key in keys]
+
+    facade.set_mv_weighted_group_manual_total(keys, 4.0e5)
+    after = facade.get_snapshot().mvs
+    values = [after[key].manual_setpoint for key in keys]
+
+    assert sum(values) == pytest.approx(4.0e5)
+    assert [value / values[0] for value in values] == pytest.approx(ratio)
+
+
+def test_weighted_group_total_redistributes_after_saturation() -> None:
+    facade = _facade_freerun()
+    keys = ["indirect_steam/MN1", "indirect_steam/MN2", "indirect_steam/SP1"]
+    before = facade.get_snapshot().mvs
+    total_capacity = sum(before[key].max for key in keys)
+
+    facade.set_mv_weighted_group_manual_total(keys, total_capacity)
+    after = facade.get_snapshot().mvs
+
+    assert sum(after[key].manual_setpoint for key in keys) == pytest.approx(total_capacity)
+    for key in keys:
+        assert after[key].manual_setpoint == pytest.approx(after[key].max)
+
+
 def test_manual_mode_ignores_auto_writes() -> None:
     facade = _facade_freerun()
     facade.run()
@@ -105,3 +145,36 @@ def test_manual_mode_ignores_auto_writes() -> None:
     facade.set_mv_auto_setpoint(key, 99.0)  # must be ignored while MANUAL
     facade.tick()
     assert facade.get_snapshot().mvs[key].effective_value == 25.0
+
+
+def test_plc_catalog_exposes_fixed_zone_allocation_and_real_transfer_devices() -> None:
+    facade = _facade_freerun()
+    snap = facade.get_snapshot()
+
+    assert "FIC_DT_PD_IND_STM" in snap.control_loops
+    assert "FIC_DT_DIRECT_STM" in snap.control_loops
+    assert "SIC_DT_SHAFT" in snap.control_loops
+    assert "ZIC_MN1_TO_MN2" in snap.control_loops
+    assert "ZIC_PD1_TO_PD2" not in snap.control_loops
+
+    facade.set_control_mode("FIC_DT_PD_IND_STM", Mode.AUTO)
+    facade.set_control_setpoint("FIC_DT_PD_IND_STM", 1800.0)  # kW
+    after = facade.get_snapshot()
+    loop = after.control_loops["FIC_DT_PD_IND_STM"]
+    assert loop.mode == "AUTO"
+    assert loop.sp == pytest.approx(1800.0)
+    pd_keys = loop.actuator_keys
+    assert [after.mvs[key].auto_setpoint for key in pd_keys] == pytest.approx(
+        [600_000.0, 600_000.0, 600_000.0]
+    )
+
+
+def test_common_shaft_loop_broadcasts_one_plc_setpoint() -> None:
+    facade = _facade_freerun()
+    facade.set_control_mode("SIC_DT_SHAFT", Mode.AUTO)
+    facade.set_control_setpoint("SIC_DT_SHAFT", 4.25)
+    snap = facade.get_snapshot()
+
+    assert snap.control_loops["SIC_DT_SHAFT"].sp == pytest.approx(4.25)
+    for key in snap.control_loops["SIC_DT_SHAFT"].actuator_keys:
+        assert snap.mvs[key].auto_setpoint == pytest.approx(4.25)

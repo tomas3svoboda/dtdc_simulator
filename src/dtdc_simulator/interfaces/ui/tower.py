@@ -5,7 +5,9 @@ bottom): FEED -> PREDESOLV/MAIN/SPARGE (DT) -> DRYER/COOLER (DC) -> PRODUCT,
 with downward solid-flow arrows between trays and an upward vapor arrow off the
 DT top. Each DT tray is an actual vessel (a bordered box whose fill height
 tracks `stage_level_pct` and whose color tracks temperature) laid out WIDE and
-SHORT: vessel | readouts | its own inline MV sliders side-by-side.
+SHORT. Indirect steam is exposed as two physically meaningful zone totals
+(PREDESOLV and TOAST), not as a fictitious valve on every tray; per-tray duty
+MVs remain available through OPC UA for detailed actuator integration.
 
 The redesign also folds the GLOBAL operator sliders onto the tray they act on
 (BuildSpec §10, "controls at the area of relevance"): feed flow / arm speed /
@@ -21,7 +23,12 @@ from __future__ import annotations
 
 from nicegui import ui
 
-from dtdc_simulator.engine.facade import MVSnapshot, RuntimeFacade, SteamInfo
+from dtdc_simulator.engine.facade import (
+    MVSnapshot,
+    RuntimeFacade,
+    SteamInfo,
+    TransferBoundaryInfo,
+)
 from dtdc_simulator.interfaces.ui import controls, theme
 
 DT_ROLES = ("PREDESOLV", "MAIN", "SPARGE")
@@ -30,8 +37,8 @@ DC_ROLES = ("DRYER", "COOLER")
 # Model caps holdup at tray capacity, so a backed-up tray reads ~100% (not >100).
 _FLOOD_LEVEL_PCT = 99.5
 
-_VESSEL_HEIGHT_PX = 56  # wider + shorter than the old 72px, for a low, wide card
-_VESSEL_WIDTH_PX = 40
+_VESSEL_HEIGHT_PX = 44
+_VESSEL_WIDTH_PX = 34
 
 
 def _vessel(container: ui.element) -> tuple[ui.element, ui.element]:
@@ -108,12 +115,19 @@ class TowerView:
         # Inter-tray solid-flow arrow captions, keyed by the stage whose OUTFLOW
         # they show ("FEED" -> first tray); plus the DT vapor-outlet up-arrow.
         self._flow_arrows: dict[str, ui.label] = {}
+        # Countercurrent vapor captions keyed by the LOWER tray whose top-face
+        # vapor rises across that connector. The bool marks the MN1 bypass.
+        self._vapor_arrows: dict[str, tuple[ui.label, bool]] = {}
         self._vapor_caption: ui.label | None = None
         # Shared "Ambient Air" box arrows -> live air mass flow into DRYER/COOLER.
         self._ambient_arrows: dict[str, ui.label] = {}
+        # Steam utility-box readouts, updated from the effective MVs each tick.
+        self._steam_widgets: dict[str, ui.label] = {}
+        self._steam_mv_keys: dict[str, tuple[str, ...]] = {}
         # Per-DC-stage inlet air flow, captured on the "air in" pass and echoed
         # on the "air out" line so the (conserved) dry-air flow reads on both.
         self._air_flow_by_sid: dict[str, float] = {}
+        self._transfer_by_stage: dict[str, TransferBoundaryInfo] = {}
 
     # ------------------------------------------------------------------ build
     def build(
@@ -123,6 +137,7 @@ class TowerView:
         mvs: dict[str, MVSnapshot],
         dvs: dict[str, float],
         steam: SteamInfo,
+        transfer_boundaries: tuple[TransferBoundaryInfo, ...],
     ) -> None:
         self._stage_order = list(stage_order)
         self._column.clear()
@@ -132,10 +147,19 @@ class TowerView:
         self._fills.clear()
         self._widgets.clear()
         self._flow_arrows.clear()
+        self._vapor_arrows.clear()
         self._ambient_arrows.clear()
+        self._steam_widgets.clear()
+        self._steam_mv_keys.clear()
         self._vapor_caption = None
+        self._transfer_by_stage = {
+            boundary.from_stage: boundary for boundary in transfer_boundaries
+        }
 
         dt_ids = [sid for sid in stage_order if stage_roles.get(sid) in DT_ROLES]
+        pred_ids = [sid for sid in dt_ids if stage_roles.get(sid) == "PREDESOLV"]
+        main_ids = [sid for sid in dt_ids if stage_roles.get(sid) == "MAIN"]
+        sparge_ids = [sid for sid in dt_ids if stage_roles.get(sid) == "SPARGE"]
         dc_ids = [sid for sid in stage_order if stage_roles.get(sid) in DC_ROLES]
 
         with self._column:
@@ -152,10 +176,71 @@ class TowerView:
             if dt_ids:
                 self._add_flow_arrow("FEED")
                 ui.label("Desolventizer / Toaster").classes("hmi-section-title mt-1")
-            for pos, sid in enumerate(dt_ids):
-                self._build_dt_tray(sid, stage_roles[sid], mvs, steam)
-                if pos < len(dt_ids) - 1:
-                    self._add_flow_arrow(sid)
+                # Three physical groups keep each utility beside the equipment
+                # it serves and consume the right-hand column all the way down:
+                # PD trays + PD jacket, MAIN trays + toast jacket, SPARGE +
+                # direct steam. Inter-group connectors stay full-width.
+                if pred_ids:
+                    with ui.row().classes("w-full gap-3 items-stretch no-wrap"):
+                        with ui.column().classes("gap-1 flex-1"):
+                            for pos, sid in enumerate(pred_ids):
+                                self._build_dt_tray(sid, stage_roles[sid], mvs)
+                                if pos < len(pred_ids) - 1:
+                                    self._add_dt_flow_connector(
+                                        sid, vapor_key=None
+                                    )
+                        self._build_indirect_steam_zone_box(
+                            pred_ids,
+                            mvs,
+                            steam,
+                            title="PREDESOLV INDIRECT STEAM",
+                            subtitle="PD1–PD3 jacket circuit",
+                            slider_label="Predesolv steam [kg/s total]",
+                            flow_widget_key="pred_indirect_flow",
+                        )
+
+                if pred_ids and (main_ids or sparge_ids):
+                    next_id = (main_ids or sparge_ids)[0]
+                    self._add_dt_flow_connector(
+                        pred_ids[-1], vapor_key=next_id, bypass=True
+                    )
+
+                if main_ids:
+                    with ui.row().classes("w-full gap-3 items-stretch no-wrap"):
+                        with ui.column().classes("gap-1 flex-1"):
+                            for pos, sid in enumerate(main_ids):
+                                self._build_dt_tray(sid, stage_roles[sid], mvs)
+                                if pos < len(main_ids) - 1:
+                                    self._add_dt_flow_connector(
+                                        sid,
+                                        vapor_key=main_ids[pos + 1],
+                                    )
+                        self._build_indirect_steam_zone_box(
+                            main_ids + sparge_ids,
+                            mvs,
+                            steam,
+                            title="MAIN-TRAY INDIRECT STEAM",
+                            subtitle="MN1–SP1 jacket circuit",
+                            slider_label="Main/toast steam [kg/s total]",
+                            flow_widget_key="toast_indirect_flow",
+                        )
+
+                if main_ids and sparge_ids:
+                    self._add_dt_flow_connector(
+                        main_ids[-1], vapor_key=sparge_ids[0]
+                    )
+
+                if sparge_ids:
+                    with ui.row().classes("w-full gap-3 items-start no-wrap"):
+                        with ui.column().classes("gap-1 flex-1"):
+                            for pos, sid in enumerate(sparge_ids):
+                                self._build_dt_tray(sid, stage_roles[sid], mvs)
+                                if pos < len(sparge_ids) - 1:
+                                    self._add_dt_flow_connector(
+                                        sid,
+                                        vapor_key=sparge_ids[pos + 1],
+                                    )
+                        self._build_direct_steam_box(sparge_ids, mvs, steam)
 
             # DC section: the DRYER/COOLER trays in a sub-column, with a shared
             # AMBIENT AIR box beside them (its weather feeds BOTH contactors).
@@ -163,7 +248,7 @@ class TowerView:
                 if dt_ids:
                     self._add_flow_arrow(dt_ids[-1])
                 ui.label("Dryer / Cooler").classes("hmi-section-title mt-1")
-                with ui.row().classes("w-full gap-3 items-stretch no-wrap"):
+                with ui.row().classes("w-full gap-3 items-start no-wrap"):
                     with ui.column().classes("gap-1 flex-1"):
                         for pos, sid in enumerate(dc_ids):
                             self._build_dc_tray(sid, stage_roles[sid], mvs)
@@ -179,6 +264,34 @@ class TowerView:
         # Builds into the current layout context (the main column, or a DC
         # sub-column), so callers control placement via their own `with` block.
         self._flow_arrows[key] = theme.flow_arrow(down=True)
+
+    def _add_dt_flow_connector(
+        self,
+        solid_key: str,
+        *,
+        vapor_key: str | None,
+        bypass: bool = False,
+    ) -> None:
+        """Paired DT connector: falling meal and countercurrent rising vapor."""
+        with ui.row().classes("w-full items-center justify-center gap-6").style(
+            "margin:-2px 0;"
+        ):
+            with ui.row().classes("items-center gap-1"):
+                ui.label("▼").style(
+                    f"color:{theme.TEAL}; font-size:11px; line-height:1;"
+                )
+                self._flow_arrows[solid_key] = ui.label("").classes("font-mono").style(
+                    f"color:{theme.MUTED}; font-size:10px; line-height:1;"
+                )
+            if vapor_key is not None:
+                with ui.row().classes("items-center gap-1"):
+                    ui.label("▲").style(
+                        f"color:{theme.STEAM_BORDER}; font-size:11px; line-height:1;"
+                    )
+                    caption = ui.label("").classes("font-mono").style(
+                        f"color:{theme.MUTED}; font-size:10px; line-height:1;"
+                    )
+                    self._vapor_arrows[vapor_key] = (caption, bypass)
 
     def _build_feed_card(self, mvs: dict[str, MVSnapshot], dvs: dict[str, float]) -> None:
         with (
@@ -219,19 +332,113 @@ class TowerView:
                                 value=dvs["feed_temperature"], to_si=theme.c_to_k, from_si=theme.k_to_c,
                             )
                         with _cell():
-                            controls.dv_slider(
-                                self._facade, "feed_moisture", "Feed moisture [%]", 5, 25,
-                                value=dvs["feed_moisture"], scale=100.0,
+                            controls.wet_moisture_slider(
+                                self._facade,
+                                x1=dvs["feed_moisture"],
+                                x2=dvs["feed_hexane"],
+                                x3=dvs["feed_oil"],
                             )
                         with _cell():
                             controls.wet_hexane_slider(
-                                self._facade, x2=dvs["feed_hexane"], x1=dvs["feed_moisture"],
+                                self._facade,
+                                x2=dvs["feed_hexane"],
+                                x1=dvs["feed_moisture"],
+                                x3=dvs["feed_oil"],
                             )
                         with _cell():
                             controls.dv_slider(
-                                self._facade, "feed_oil", "Feed oil [%]", 0, 5,
+                                self._facade, "feed_oil", "Feed oil [% dry basis]", 0, 5,
                                 value=dvs["feed_oil"], scale=100.0,
                             )
+
+    def _build_indirect_steam_zone_box(
+        self,
+        stage_ids: list[str],
+        mvs: dict[str, MVSnapshot],
+        steam: SteamInfo,
+        *,
+        title: str,
+        subtitle: str,
+        slider_label: str,
+        flow_widget_key: str,
+    ) -> None:
+        keys = [
+            f"indirect_steam/{sid}"
+            for sid in stage_ids
+            if f"indirect_steam/{sid}" in mvs
+        ]
+        self._steam_mv_keys[flow_widget_key] = tuple(keys)
+        with ui.card().classes("border-l-4 self-stretch").style(
+            f"padding:8px 10px; width:220px; min-height:100%; "
+            f"background:{theme.STEAM_SURFACE}; "
+            f"border-left-color:{theme.STEAM_BORDER};"
+        ):
+            ui.label(title).classes("font-bold text-[11px]")
+            ui.label(subtitle).classes("text-[10px]").style(
+                f"color:{theme.MUTED};"
+            )
+            with ui.column().classes("gap-0"):
+                ui.label(
+                    f"{steam.supply_barg:.1f} barg · "
+                    f"{theme.k_to_c(steam.supply_T_K):.0f} °C sat."
+                ).classes("text-[11px] font-mono")
+                self._steam_widgets[flow_widget_key] = ui.label("").classes(
+                    "text-[11px] font-mono"
+                )
+            with _cell("width:100%;"):
+                controls.indirect_steam_zone_slider(
+                    self._facade,
+                    keys=keys,
+                    mvs=mvs,
+                    label=slider_label,
+                    dH_vap_water=steam.dH_vap_water,
+                )
+            ui.label("fixed configured tray allocation").classes("text-[10px]").style(
+                f"color:{theme.MUTED};"
+            )
+
+    def _build_direct_steam_box(
+        self,
+        sparge_ids: list[str],
+        mvs: dict[str, MVSnapshot],
+        steam: SteamInfo,
+    ) -> None:
+        direct_keys = [
+            f"direct_steam/{sid}"
+            for sid in sparge_ids
+            if f"direct_steam/{sid}" in mvs
+        ]
+        with ui.card().classes("border-l-4").style(
+            f"padding:6px 8px; width:220px; flex:0 0 220px; "
+            f"background:{theme.STEAM_SURFACE}; "
+            f"border-left-color:{theme.STEAM_BORDER};"
+        ):
+            with ui.column().classes("gap-1 w-full"):
+                ui.label("DIRECT STEAM").classes("font-bold text-[11px]")
+                ui.label("sparge steam at meal contact").classes("text-[10px]").style(
+                    f"color:{theme.MUTED};"
+                )
+                ui.label(
+                    f"{steam.direct_contact_barg:.1f} barg · "
+                    f"{theme.k_to_c(steam.direct_contact_T_K):.0f} °C sat."
+                ).classes("text-[11px] font-mono")
+                self._steam_widgets["direct_flow"] = ui.label("").classes(
+                    "text-[11px] font-mono"
+                )
+                if direct_keys:
+                    key = direct_keys[0]
+                    _tray_mv_slider(
+                        _cell("width:100%;"),
+                        self._facade,
+                        key,
+                        mvs[key],
+                        "Direct steam [kg/s total]",
+                        theme.TEAL,
+                        step=0.05,
+                    )
+                ui.label(f"from {steam.supply_barg:.1f} barg header").classes(
+                    "text-[10px]"
+                ).style(f"color:{theme.MUTED};")
 
     def _build_product_card(self) -> None:
         with (
@@ -255,42 +462,45 @@ class TowerView:
         absolute humidity carried in), the cooler's air is it directly. The two
         arrows show the live air mass flow into each (filled by `sync()`)."""
         with ui.card().classes("border-l-4 border-cyan-500").style(
-            "padding: 8px 10px; width: 220px; align-self: stretch;"
+            "padding:6px 8px; width:220px; flex:0 0 220px;"
         ):
-            ui.label("AMBIENT AIR").classes("font-bold text-[11px]")
-            ui.label("weather → both contactors").classes("text-[10px]").style(
-                f"color:{theme.MUTED};"
-            )
-            with _cell("width:100%;"):
-                controls.dv_slider(
-                    self._facade, "ambient_air_temp", "Ambient temp [°C]", -20, 45,
-                    value=dvs["ambient_air_temp"], to_si=theme.c_to_k, from_si=theme.k_to_c,
+            with ui.column().classes("gap-1 w-full"):
+                ui.label("AMBIENT AIR").classes("font-bold text-[11px]")
+                ui.label("weather → both contactors").classes("text-[10px]").style(
+                    f"color:{theme.MUTED};"
                 )
-            with _cell("width:100%;"):
-                controls.dv_slider(
-                    self._facade, "ambient_relative_humidity", "Ambient RH [%]", 0, 100,
-                    value=dvs["ambient_relative_humidity"], scale=100.0,
-                )
-            with ui.column().classes("gap-0 mt-2"):
-                self._ambient_arrows["DRYER"] = ui.label("→ Dryer").classes(
-                    "text-[11px] font-mono"
-                ).style(f"color:{theme.TEAL};")
-                self._ambient_arrows["COOLER"] = ui.label("→ Cooler").classes(
-                    "text-[11px] font-mono"
-                ).style(f"color:{theme.TEAL};")
+                with _cell("width:100%;"):
+                    controls.dv_slider(
+                        self._facade, "ambient_air_temp", "Ambient temp [°C]", -20, 45,
+                        value=dvs["ambient_air_temp"],
+                        to_si=theme.c_to_k,
+                        from_si=theme.k_to_c,
+                    )
+                with _cell("width:100%;"):
+                    controls.dv_slider(
+                        self._facade,
+                        "ambient_relative_humidity",
+                        "Ambient RH [%]",
+                        0,
+                        100,
+                        value=dvs["ambient_relative_humidity"],
+                        scale=100.0,
+                    )
+                with ui.column().classes("gap-0"):
+                    self._ambient_arrows["DRYER"] = ui.label("→ Dryer").classes(
+                        "text-[11px] font-mono"
+                    ).style(f"color:{theme.TEAL};")
+                    self._ambient_arrows["COOLER"] = ui.label("→ Cooler").classes(
+                        "text-[11px] font-mono"
+                    ).style(f"color:{theme.TEAL};")
 
     def _build_dt_tray(
-        self, sid: str, role: str, mvs: dict[str, MVSnapshot], steam: SteamInfo
+        self, sid: str, role: str, mvs: dict[str, MVSnapshot]
     ) -> None:
         style = theme.ROLE_STYLE.get(role, {"border": "border-gray-400", "badge": "grey"})
         widgets: dict[str, object] = {}
-        # Steam supply-header readout (constant) -- the "PARA" header conditions,
-        # same for jacket (indirect) and sparge (direct) steam.
-        steam_str = f"{steam.supply_barg:.1f} barg / {theme.k_to_c(steam.supply_T_K):.0f} °C"
-        # Jacket duty (W) shown as condensing-steam flow (kg/s): m = Q / dH_vap.
-        indirect_scale = 1.0 / steam.dH_vap_water
         with ui.card().classes(f"w-full border-l-4 {style['border']}").style(
-            "padding: 8px;"
+            "padding:8px; flex:0 0 auto;"
         ) as card:
             with ui.row().classes("items-center justify-between w-full"):
                 with ui.row().classes("items-center gap-2"):
@@ -314,33 +524,26 @@ class TowerView:
                     widgets["level_label"] = ui.label("- %").classes(
                         "text-[10px] font-mono text-gray-500"
                     )
-                    with ui.row().classes("gap-1 items-center"):
-                        ui.label("♨ Steam:").classes("text-[10px]").style(f"color:{theme.MUTED};")
-                        ui.label(steam_str).classes("text-[10px] font-mono whitespace-nowrap").style(
-                            f"color:{theme.DARK};"
-                        )
 
                 with ui.row().classes("gap-3 items-end flex-1 no-wrap"):
-                    if role == "SPARGE":
-                        key = f"direct_steam/{sid}"
-                        if key in mvs:
-                            widgets["duty_slider"] = _tray_mv_slider(
-                                _cell(), self._facade, key, mvs[key],
-                                "Direct steam [kg/s]", theme.TEAL, step=0.05,
-                            )
-                    else:
-                        key = f"indirect_steam/{sid}"
-                        if key in mvs:
-                            widgets["duty_slider"] = _tray_mv_slider(
-                                _cell(), self._facade, key, mvs[key],
-                                "Indirect steam [kg/s]", theme.TEAL,
-                                scale=indirect_scale, step=0.01,
-                            )
-                    gate_key = f"gate_opening/{sid}"
-                    if gate_key in mvs:
+                    boundary = self._transfer_by_stage.get(sid)
+                    position_key = (
+                        f"transfer_device_position/{boundary.id}" if boundary else ""
+                    )
+                    if position_key in mvs:
+                        device = (
+                            "Rotary airlock"
+                            if boundary.device_type == "ROTARY_AIRLOCK"
+                            else "Discharge gate"
+                        )
                         widgets["gate_slider"] = _tray_mv_slider(
-                            _cell(), self._facade, gate_key, mvs[gate_key],
-                            "Gate [%] (0 = shut)", theme.TEAL, step=1.0,
+                            _cell(),
+                            self._facade,
+                            position_key,
+                            mvs[position_key],
+                            f"{device} [%]",
+                            theme.TEAL,
+                            step=1.0,
                         )
 
         self._cards[sid] = card
@@ -350,7 +553,7 @@ class TowerView:
         style = theme.ROLE_STYLE.get(role, {"border": "border-gray-400", "badge": "grey"})
         widgets: dict[str, object] = {}
         with ui.card().classes(f"w-full border-l-4 {style['border']}").style(
-            "padding: 8px 10px;"
+            "padding:8px 10px; flex:0 0 auto;"
         ) as card:
             with ui.row().classes("items-center justify-between w-full"):
                 with ui.row().classes("items-center gap-2"):
@@ -393,6 +596,15 @@ class TowerView:
 
                 # ◀ air-side operator inputs, folded onto the contactor.
                 with ui.column().classes("gap-0 flex-1"):
+                    boundary = self._transfer_by_stage.get(sid)
+                    position_key = (
+                        f"transfer_device_position/{boundary.id}" if boundary else ""
+                    )
+                    device = (
+                        "Rotary airlock"
+                        if boundary and boundary.device_type == "ROTARY_AIRLOCK"
+                        else "Discharge gate"
+                    )
                     if role == "DRYER":
                         ui.label("◀ dryer air").classes("text-[10px]").style(f"color:{theme.TEAL};")
                         with ui.row().classes("w-full gap-4 items-end flex-wrap"):
@@ -407,6 +619,16 @@ class TowerView:
                                     self._facade, "heated_air_flow", "Air flow [kg/s]",
                                     value=mvs["heated_air_flow"].effective_value,
                                 )
+                            if position_key in mvs:
+                                widgets["gate_slider"] = _tray_mv_slider(
+                                    _cell(),
+                                    self._facade,
+                                    position_key,
+                                    mvs[position_key],
+                                    f"{device} [%]",
+                                    theme.TEAL,
+                                    step=1.0,
+                                )
                     else:  # COOLER: just its own air flow (ambient weather is the shared box)
                         ui.label("◀ cooler air").classes("text-[10px]").style(f"color:{theme.TEAL};")
                         with ui.row().classes("w-full gap-4 items-end flex-wrap"):
@@ -414,6 +636,16 @@ class TowerView:
                                 controls.mv_slider(
                                     self._facade, "ambient_air_flow", "Air flow [kg/s]",
                                     value=mvs["ambient_air_flow"].effective_value,
+                                )
+                            if position_key in mvs:
+                                widgets["gate_slider"] = _tray_mv_slider(
+                                    _cell(),
+                                    self._facade,
+                                    position_key,
+                                    mvs[position_key],
+                                    f"{device} [%]",
+                                    theme.TEAL,
+                                    step=1.0,
                                 )
         self._cards[sid] = card
         self._widgets[sid] = widgets
@@ -426,7 +658,8 @@ class TowerView:
         # card shows them as TOTAL mass fraction of the wet meal (dry solid + moisture + hexane).
         x1 = snap.dvs["feed_moisture"]
         x2 = snap.dvs["feed_hexane"]
-        wet_denom = 1.0 + x1 + x2
+        x3 = snap.dvs["feed_oil"]
+        wet_denom = 1.0 + x1 + x2 + x3
         feed_hex_pct = x2 / wet_denom * 100.0
         feed_water_pct = x1 / wet_denom * 100.0
 
@@ -449,6 +682,21 @@ class TowerView:
             self._ambient_arrows["COOLER"].text = (
                 f"→ Cooler  {snap.mvs['ambient_air_flow'].effective_value:.0f} kg/s"
             )
+        if self._steam_widgets and snap.steam is not None:
+            direct_kg_s = sum(
+                mv.effective_value
+                for key, mv in snap.mvs.items()
+                if key.startswith("direct_steam/")
+            )
+            for widget_key, keys in self._steam_mv_keys.items():
+                flow = sum(snap.mvs[key].effective_value for key in keys)
+                flow /= snap.steam.dH_vap_water
+                widget = self._steam_widgets.get(widget_key)
+                if widget is not None:
+                    widget.text = f"Absolute flow  {flow:.2f} kg/s"
+            direct_flow = self._steam_widgets.get("direct_flow")
+            if direct_flow is not None:
+                direct_flow.text = f"Absolute flow  {direct_kg_s:.2f} kg/s"
 
         if outputs is None:
             return
@@ -463,6 +711,10 @@ class TowerView:
             if sid == "FEED":
                 continue
             caption.text = f"{outputs.stage_solid_out_kg_s.get(sid, 0.0):.1f} kg/s"
+        for sid, (caption, bypass) in self._vapor_arrows.items():
+            flow = outputs.stage_vapor_flow_kg_s.get(sid, 0.0)
+            qualifier = " bypass → condenser" if bypass else " vapor"
+            caption.text = f"{flow:.2f} kg/s{qualifier}"
 
         for sid in self._stage_order:
             widgets = self._widgets.get(sid)

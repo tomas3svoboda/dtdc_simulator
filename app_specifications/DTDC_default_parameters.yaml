@@ -25,16 +25,32 @@
 material: soybean
 
 # ------------------------------------------------------------------ geometry
-# DT: 2 predesolv (0.30 m, high end of AOCS 150-300 mm) + 1 main/countercurrent (1.0 m) +
-# 1 sparge (1.0 m, AOCS ~1000 mm); 6 m dia. DC: dryer + cooler (4 m dia).
+# DT: Coletto six-tray arrangement, diameter throughput-scaled from 4 m at
+# 11.9 kg/s dry feed to the industrial 6 m shell at 25 kg/s. Depths are
+# maximum holdup capacity; nominal 50% fill reproduces Coletto's loaded
+# 0.3/0.3/0.3/1.0/0.6/0.75 m beds; the sparge inventory closes the
+# >=20 min hot-contact residence gate while remaining in its industrial range.
 geometry:
   stages:
-    - {id: PD1, role: PREDESOLV, diameter_m: 6.0, bed_height_m: 0.30}   # [PAPER] AOCS 150-300 mm (high end)
-    - {id: PD2, role: PREDESOLV, diameter_m: 6.0, bed_height_m: 0.30}   # [PAPER]
-    - {id: MN1, role: MAIN,      diameter_m: 6.0, bed_height_m: 1.00}   # [PAPER] AOCS 1000-1200 mm (FTRZ/DCZ)
-    - {id: SP1, role: SPARGE,    diameter_m: 6.0, bed_height_m: 1.00}   # [PAPER] AOCS ~1000 mm (direct steam)
-    - {id: DR1, role: DRYER,     diameter_m: 4.0, bed_height_m: 0.60}   # [PLACE]
-    - {id: CL1, role: COOLER,    diameter_m: 4.0, bed_height_m: 0.60}   # [PLACE]
+    - {id: PD1, role: PREDESOLV, vapor_path: BYPASS, diameter_m: 6.0, bed_height_m: 0.60}   # 0.3 m loaded
+    - {id: PD2, role: PREDESOLV, vapor_path: BYPASS, diameter_m: 6.0, bed_height_m: 0.60}   # 0.3 m loaded
+    - {id: PD3, role: PREDESOLV, vapor_path: BYPASS, diameter_m: 6.0, bed_height_m: 0.60}   # 0.3 m loaded
+    - {id: MN1, role: MAIN,      vapor_path: THROUGH_BED, diameter_m: 6.0, bed_height_m: 2.00}   # 1.0 m loaded
+    - {id: MN2, role: MAIN,      vapor_path: THROUGH_BED, diameter_m: 6.0, bed_height_m: 1.20}   # 0.6 m loaded
+    - {id: SP1, role: SPARGE,    vapor_path: STEAM_SOURCE, diameter_m: 6.0, bed_height_m: 1.50}   # 0.75 m loaded
+    - {id: DR1, role: DRYER,     diameter_m: 4.0, bed_height_m: 0.60, arm_mixing_factor: 1.07}   # [CALIBRATED CLOSURE]
+    - {id: CL1, role: COOLER,    diameter_m: 4.0, bed_height_m: 0.60, arm_mixing_factor: 0.69}   # [CALIBRATED CLOSURE]
+
+topology:
+  solid_transfers:
+    - {id: PD1_TO_PD2, from_stage: PD1, to_stage: PD2, device_type: PASSIVE_SWEPT_PORT, fixed_position_pct: 50}
+    - {id: PD2_TO_PD3, from_stage: PD2, to_stage: PD3, device_type: PASSIVE_SWEPT_PORT, fixed_position_pct: 50}
+    - {id: PD3_TO_MN1, from_stage: PD3, to_stage: MN1, device_type: PASSIVE_SWEPT_PORT, fixed_position_pct: 50}
+    - {id: MN1_TO_MN2, from_stage: MN1, to_stage: MN2, device_type: CONTROLLED_GATE, controlled: true}
+    - {id: MN2_TO_SP1, from_stage: MN2, to_stage: SP1, device_type: CONTROLLED_GATE, controlled: true}
+    - {id: SP1_TO_DR1, from_stage: SP1, to_stage: DR1, device_type: ROTARY_AIRLOCK, controlled: true, vapor_seal: true}
+    - {id: DR1_TO_CL1, from_stage: DR1, to_stage: CL1, device_type: PASSIVE_SWEPT_PORT, fixed_position_pct: 50}
+    - {id: CL1_PRODUCT, from_stage: CL1, to_stage: null, device_type: ROTARY_AIRLOCK, controlled: true, vapor_seal: true}
 
 # --------------------------------------------------------------- physical params
 # Mirrors properties/soybean.yaml (authoritative).
@@ -52,7 +68,7 @@ physical:
   cp_water_vapor:  1900.0      # J/kgK [STD] steam ~370 K
   cp_hexane_vapor: 1650.0      # J/kgK [STD] n-hexane gas ~340-370 K
   cp_hexane_liquid: 2260.0     # J/kgK [STD] liquid n-hexane
-  cp_oil:          2000.0      # J/kgK [PLACE] soybean oil
+  cp_oil:          2000.0      # J/kgK [STD estimate] soybean oil
   mu_vapor:        1.329e-5    # Pa.s  [PAPER] Coletto supp. Table 1
   k_ps:    0.29                # W/mK  [PAPER] solid thermal conductivity
   k_pg:    0.02371             # W/mK  [PAPER] pore-gas (hexane/water vapor)
@@ -61,10 +77,10 @@ physical:
   particle_porosity: 0.50      # -     [PAPER] eps_p
   alpha_ps:          0.50      # -     [DERIVED] particle solid volume fraction
   alpha_pg:          0.50      # -     [DERIVED] particle pore-gas volume fraction
-  particle_radius:   2.0e-4    # m     [DERIVED] real soy FLAKE diffusion-length (~0.2 mm), not Cardarelli's 2 mm granule
+  particle_radius:   2.08e-4   # m     [DERIVED/calibrated] bounded industrial-flake diffusion length
   oil_fraction:      0.01      # kg/kg [PAPER-ish] residual oil in meal (X3)
-  sorption_C0: 3.0e5           # [PLACE] heat-of-sorption; no printed source
-  sorption_C1: -0.5            # [PLACE]
+  sorption_C0: 1.61e4          # [DERIVED/PAPER-bounded] Cardarelli 1996 caloric anchors
+  sorption_C1: -0.4            # [DERIVED/PAPER-bounded]
   x2_critical: 0.20            # kg/kg  [PAPER] Faner et al. (2019) measured (theoretical eq. 4 ~0.43 is ~2x too high)
   water_diffusivity: 3.1e-11   # m2/s  [PAPER-adjacent, DERATED 20x] Touffet et al. (2026) / 20
   gab_params: {Xm: 5.183e-3, C0: 3.117e-3, dHC_R: 2262.0, K0: 9.172e-2, dHK_R: 729.6}  # [PAPER] Cardarelli & Crapiste (1996)
@@ -79,66 +95,72 @@ model:
   D_eff: 4.0e-10              # m2/s  [PAPER] Cardarelli et al. (2002) Table 1
   D_ax:  1.022e-3             # m2/s  [PAPER] Coletto supp. Table 1
   n_particle_layers: 12      # -     [PAPER] Coletto: 12 spherical FVM shells
-  nz_per_zone: 20            # -     [PLACE] validation-run axial cells per zone per tray
+  nz_per_zone: 20            # -     [NUMERICAL] validation-run axial cells per zone per tray
   D_HW: 1.33e-5              # m2/s  [PAPER] Coletto supp. Table 1
   htc_correlation: {form: faner, c: 0.6949, m: 0.579, n: 0.3333}  # [PAPER] Nu-Re (B.7)
-  outer_relaxation: 0.5      # [PLACE] under-relaxation
-  outer_tol: 1.0e-5          # [PLACE]
-  outer_max_iter: 100        # [PLACE]
-  sweep_arm_transfer_gain: 1.0   # [PLACE] hQ *= 1 + gain*rpm^2 (agitation enhancement; lands DCZ ~380-383 K)
-  base_residence_s: 90.0     # s  [PLACE] nominal per-stage lag at 3 rpm / 50% gate
+  outer_relaxation: 0.5      # [NUMERICAL] under-relaxation
+  outer_tol: 1.0e-5          # [NUMERICAL]
+  outer_max_iter: 100        # [NUMERICAL]
+  sweep_arm_transfer_gain: 0.0   # Coletto-faithful B.7 only; old D1 workaround removed
+  base_residence_s: 90.0     # s  [CALIBRATED DYNAMIC CLOSURE] nominal stage lag
   # real-time DT solve mesh + scheduling (coarser than a validation run)
-  dt_nz_phz: 10              # -  [PLACE]
-  dt_nz_ftrz: 10             # -  [PLACE]
-  dt_nz_dcz: 8               # -  [PLACE]
-  dt_outer_tol: 0.05         # -  [PLACE] real-time FTRZ<->DCZ outer-loop tolerance
-  dt_outer_max_iter: 20      # -  [PLACE]
-  dt_dcz_inner_max_iter: 100 # -  [PLACE]
-  # DT bottom vapor boundary ([PLACE]); trimmed 5.0 -> 3.3 so the (dew-point) dome sits ~72 C
-  dt_vapor_feed_water_kg_s: 3.3   # kg/s  [PLACE]
+  dt_nz_phz: 20              # -  [NUMERICAL] release-benchmark mesh
+  dt_nz_ftrz: 20             # -  [NUMERICAL]
+  dt_nz_dcz: 20              # -  [NUMERICAL]
+  dt_outer_tol: 0.05         # -  [NUMERICAL] real-time FTRZ<->DCZ tolerance
+  dt_outer_max_iter: 150     # -  [NUMERICAL] adaptive outer-loop cap (extreme-case continuation)
+  dt_dcz_inner_max_iter: 100 # -  [NUMERICAL]
+  # DT bottom clean-vapor boundary ([PLACE]); included in the delivered-direct heat ledger
+  dt_vapor_feed_water_kg_s: 0.25  # kg/s  [PLACE]
   dt_vapor_feed_hex_kg_s: 0.0005  # kg/s  [PLACE]
   dt_vapor_feed_T: 371.0          # K     [PLACE]
   dc_hexane_mtc: 1.3e-2           # -     [PAPER-anchored] EPA AP-42 9.11.1 Table 4-4 meal-hexane cascade
   # sparge (direct) steam: 6.9 barG / ~170 C supply header, throttled to ~3 barG / ~144 C at the meal
   direct_steam_pressure_barg: 3.0 # bar g, sparge steam AT THE MEAL (throttled from the header)
+  dt_pressure_drop_barg: 0.5      # bar g, lower-DT operating pressure above dome
   steam_supply_pressure_barg: 6.9 # bar g, steam supply header (~170 C, HMI readout)
 
 # ---------------------------------------------------- operating defaults (HOT seeds)
 operating_defaults:
-  feed_flow_rate: 25.0        # kg/s dry solid  [PLACE]
-  indirect_steam:             # W per DT tray (jacket duty)  [PLACE]
-    PD1: 2.5e6
-    PD2: 2.5e6
-    MN1: 2.0e6
-    SP1: 4.0e5
-  direct_steam:               # kg/s sparge steam  [PLACE]
-    SP1: 1.05
-  sweep_arm_speed: {PD1: 3.0, PD2: 3.0, MN1: 3.0, SP1: 3.0}   # rpm  [PLACE]
-  gate_opening:    {PD1: 50, PD2: 50, MN1: 50, SP1: 50}        # 0-100 % level/discharge gate  [PLACE]
-  heated_air_temp: 360.0      # K = ~87 C  [PLACE] dryer inlet air
-  heated_air_flow: 80.0       # kg/s  [PLACE] DRYER
-  ambient_air_flow: 250.0     # kg/s  [PLACE] COOLER (~10:1 air:solid)
+  feed_flow_rate: 25.0        # kg/s dry solid [BENCHMARK OPERATING SEED]
+  # Post-PHZ-refactor industry seed: 2.30 MW PREDESOLV + 0.20 MW lower jackets.
+  indirect_steam:             # W per DT tray [CALIBRATED OPERATING SEED]
+    PD1: 7.666667e5
+    PD2: 7.666667e5
+    PD3: 7.666666e5
+    MN1: 8.33333e4
+    MN2: 8.33333e4
+    SP1: 3.33334e4
+  direct_steam:               # kg/s sparge steam [INDUSTRIAL OPERATING SEED]
+    SP1: 3.9
+  sweep_arm_speed: {PD1: 3.0, PD2: 3.0, PD3: 3.0, MN1: 3.0, MN2: 3.0, SP1: 3.0, DR1: 3.0, CL1: 3.0}   # rpm
+  transfer_device_position: {MN1_TO_MN2: 50, MN2_TO_SP1: 50, SP1_TO_DR1: 50, CL1_PRODUCT: 50} # 0-100 %
+  heated_air_temp: 348.0      # K = ~75 C [CALIBRATED OPERATING SEED]
+  heated_air_flow: 80.0       # kg/s [CALIBRATED OPERATING SEED] DRYER
+  ambient_air_flow: 250.0     # kg/s [CALIBRATED OPERATING SEED] COOLER
   dt_resolve_interval_s: 120.0 # s SIM time between full solve_dt() re-solves (>=120 floor)
 
 # --------------------------------------------------- disturbance defaults (HOT seeds)
 disturbance_defaults:
-  feed_temperature: 330.0     # K = 56.85 C  [PAPER] meal from extractor ~55-60 C
-  feed_moisture: 0.07         # kg/kg dry solid  [PAPER] ~5-10% incoming
-  feed_hexane:   0.5815       # kg/kg dry solid = 35% hexane by total wet mass  [PAPER-adjacent]
-  feed_oil:      0.01         # kg/kg dry solid (X3)  [PAPER-ish]
-  ambient_air_temp: 298.0     # K  [PLACE] cooler inlet air (weather)
-  ambient_relative_humidity: 0.50  # 0-1  [PLACE]
+  feed_temperature: 322.15    # K = 49 C        [PAPER/COAMO]
+  feed_moisture: 0.124        # kg/kg dry solid [PAPER/COAMO]
+  feed_hexane:   0.388        # kg/kg dry solid [PAPER/COAMO]
+  feed_oil:      0.0137       # kg/kg dry solid [PAPER/COAMO]
+  ambient_air_temp: 298.0     # K [DISTURBANCE SEED] replace with measured weather
+  ambient_relative_humidity: 0.50  # 0-1 [DISTURBANCE SEED]
 
 # ------------------------------------------------------------------ simulation
 sim:
   speed_factor: 20.0          # 20x (brings the ~20-30 min transient to ~60-90 real s; 1.0 for real time)
-  dt_wall_s: 0.2              # [PLACE] wall tick
-  max_control_interval_s: 10.0 # [PLACE] set to <= your APC sample time
+  dt_wall_s: 0.2              # [NUMERICAL/RUNTIME] wall tick
+  max_control_interval_s: 10.0 # [NUMERICAL/RUNTIME] set to <= APC sample time
   clock: realtime             # realtime | freerun
 
 # ------------------------------------------------------------- validation targets
-# Expected steady-state behavior at the tuned base case above (feasibility bands), not inputs:
-#   DT exit (SP1):    ~109 C / ~18% moisture / ~285 ppm residual hexane   (bands 105-110 / 16-21 / 100-500)
-#   DT dome vapor:    ~72 C                                                (band 70-75, lean-steam optimum)
-#   product (CL1):    ~36 C / ~9.7% moisture / ~22 ppm hexane             (<= ambient+10 / <=12.5 / <500)
-#   drying-air hexane: ~23 ppm                                            (<< 1100 ppm, 10% LEL safety limit)
+# Validation-grade post-PHZ-refactor industry benchmark:
+#   residence:        27.8 min total / 20.1 min hot contact
+#   delivered steam:  74.7% after top water-vapor carry-through
+#   PHZ removal:      ~14% of feed solvent
+#   DT exit (SP1):    ~111.7 C / ~19.6% moisture / ~284 ppm residual hexane
+#   DT dome vapor:    ~72.4 C / ~90.3 wt% hexane
+# All ordered design, heat, solver, dome and meal gates pass.

@@ -152,19 +152,16 @@ def ftrz_zone_balance(
     own per-cell logic), applied here only at the zone's own EXTERNAL
     boundary, not to any of FTRZ's internal per-cell state.
     """
-    X2_inf = thermo.x2_equilibrium(
-        vapor_in.T, c.X3, c.gab, c.oil, c.alpha_pg, c.alpha_ps, c.rho_ps
-    )
+    X2_inf = thermo.x2_equilibrium(vapor_in.T, c.X3, c.gab, c.oil, c.alpha_pg, c.alpha_ps, c.rho_ps)
     total_hexane_evap_kg_s = m_dry_kg_s * (X2_sup - X2_inf)
-    hexane_residual = (
-        result.vapor_out.m_hex_kg_s - vapor_in.m_hex_kg_s
-    ) - total_hexane_evap_kg_s
+    hexane_residual = (result.vapor_out.m_hex_kg_s - vapor_in.m_hex_kg_s) - total_hexane_evap_kg_s
 
-    total_condensed_kg_s = sum(cell.condensed_water_kg_s for cell in result.cells)
+    total_water_to_solid_kg_s = sum(cell.condensed_water_kg_s for cell in result.cells)
+    total_sorbed_kg_s = sum(cell.sorbed_water_kg_s for cell in result.cells)
     water_residual = (vapor_in.m_water_kg_s - result.vapor_out.m_water_kg_s) - (
         m_dry_kg_s * result.solid_out.X1
     )
-    # (also implies total_condensed_kg_s == m_dry*X1 when this is ~0; kept as
+    # (also implies total_water_to_solid_kg_s == m_dry*X1 when this is ~0; kept as
     # one combined identity rather than two, since either alone implies the
     # other given how `solve_ftrz_zone` accumulates X1 from condensed mass.)
 
@@ -172,9 +169,20 @@ def ftrz_zone_balance(
     total_duty_w = q_Iv_w_m3 * A_bed_m2 * result.L_FTRZ_m
     total_hexane_enthalpy_in_w = total_hexane_evap_kg_s * c.dH_vap_hexane
     total_condensate_enthalpy_out_w = sum(
-        cell.condensed_water_kg_s * c.cp_water_liquid * (cell.vapor_out.T - c.T_boil_water)
+        cell.bulk_condensed_water_kg_s * c.cp_water_liquid * (cell.vapor_out.T - c.T_boil_water)
         for cell in result.cells
     )
+    # The rate-limited sorption post-pass removes/adds water at unchanged top
+    # vapor temperature.  Its vapor enthalpy is therefore transferred to/from
+    # the wet solid rather than remaining in the dome stream.  Keeping this
+    # term separate from V-SAT liquid condensate mirrors the two distinct
+    # mechanisms recorded by FTRZCellResult.
+    sorption_enthalpy_to_solid_w = total_sorbed_kg_s * (
+        c.vapor_enthalpy_ref.dH_vap_water
+        + c.vapor_enthalpy_ref.cp_water_vapor
+        * (result.vapor_out.T - c.vapor_enthalpy_ref.T_boil_water)
+    )
+    sensible_heat_to_solid_w = sum(cell.sensible_heat_to_solid_w for cell in result.cells)
     H_in_w = vapor_in.m_water_kg_s * thermo.vapor_enthalpy_water_basis(
         vapor_in.Y_V2, vapor_in.T, c.vapor_enthalpy_ref
     )
@@ -182,9 +190,14 @@ def ftrz_zone_balance(
         result.vapor_out.Y_V2, result.vapor_out.T, c.vapor_enthalpy_ref
     )
     energy_residual = H_out_w - (
-        H_in_w + total_duty_w + total_hexane_enthalpy_in_w - total_condensate_enthalpy_out_w
+        H_in_w
+        + total_duty_w
+        + total_hexane_enthalpy_in_w
+        - total_condensate_enthalpy_out_w
+        - sorption_enthalpy_to_solid_w
+        - sensible_heat_to_solid_w
     )
-    _ = total_condensed_kg_s  # documented above; not asserted separately
+    _ = total_water_to_solid_kg_s  # documented above; not asserted separately
 
     return MassEnergyResidual(
         hexane_kg_s=hexane_residual, water_kg_s=water_residual, energy_w=energy_residual
@@ -241,22 +254,16 @@ def dcz_zone_balance(
     the FVM's own accumulation variable), verified via a proper fixed-total
     -time/sub-step convergence test to ~1-2% at production timesteps.
 
-    PRACTICAL CONSEQUENCE for this function's OWN other residuals:
-    `water_kg_s`, as computed here, DERIVES the vapor's own water content
-    from its TOTAL mass via `(1 - wV2)`, so it still inherits SOME of
-    `wV2`'s own remaining (now small) imprecision whenever hexane transfer
-    is non-negligible -- callers should still expect a few-percent-scale
-    residual here, not machine precision, but no longer the order-of
-    -magnitude noise the unresolved FVM gap used to cause. The solid-side
-    `total_water_to_solid_kg_s` (computed independent of `wV2` entirely)
-    remains the most reliable water cross-check when available. `energy_w`
-    carries its own separate, DELIBERATE approximation (plain `dH_vap_
-    hexane` for hexane's sorption heat, not the true isosteric value -- see
-    this module's own top-level docstring) independent of the FVM fix.
+    Water and hexane outlet flows are read directly from the component-flow
+    march; no fixed-total reconstruction from `wV2` remains. `energy_w`
+    retains its separate deliberate approximation (plain `dH_vap_hexane`
+    for hexane's sorption heat, not the true isosteric value).
     """
     A_bed = math.pi / 4.0 * c.diameter_m**2
     dz = c.bed_height_m / nz
-    q_Iv_profile = q_Iv_w_m3 if isinstance(q_Iv_w_m3, tuple) else tuple(q_Iv_w_m3 for _ in range(nz))
+    q_Iv_profile = (
+        q_Iv_w_m3 if isinstance(q_Iv_w_m3, tuple) else tuple(q_Iv_w_m3 for _ in range(nz))
+    )
 
     X2_in = thermo.x2_equilibrium(
         T_L_sup,
@@ -280,12 +287,12 @@ def dcz_zone_balance(
     total_water_to_solid_kg_s = m_dry_kg_s * (X1_out - X1_in)
 
     water_in_bottom_kg_s = (1.0 - vapor_inf.wV2) * m_vapor_kg_s
-    water_out_top_kg_s = (1.0 - result.vapor_out.wV2) * (m_vapor_kg_s - total_water_to_solid_kg_s)
+    water_out_top_kg_s = result.vapor_water_out_kg_s
     water_residual = (water_in_bottom_kg_s - water_out_top_kg_s) - total_water_to_solid_kg_s
 
     hexane_from_solid_kg_s = m_dry_kg_s * (X2_in - X2_out)
     hexane_in_bottom_kg_s = vapor_inf.wV2 * m_vapor_kg_s
-    hexane_out_top_kg_s = result.vapor_out.wV2 * (m_vapor_kg_s - total_water_to_solid_kg_s)
+    hexane_out_top_kg_s = result.vapor_hexane_out_kg_s
     hexane_residual = (hexane_out_top_kg_s - hexane_in_bottom_kg_s) - hexane_from_solid_kg_s
 
     total_duty_w = sum(q * A_bed * dz for q in q_Iv_profile)
@@ -300,7 +307,11 @@ def dcz_zone_balance(
     # omitted there too, not a new gap introduced by this check.
     cp_mix_avg = c.particle.cp_ps + 0.5 * (X1_in + X1_out) * c.particle.cp_water_liquid
     solid_sensible_delta_w = m_dry_kg_s * cp_mix_avg * (T_solid_out - T_L_sup)
-    vapor_sensible_delta_w = m_vapor_kg_s * c.cp_V * (result.vapor_out.T - vapor_inf.T)
+    T_ref = c.vapor_enthalpy_ref.T_boil_water
+    vapor_sensible_delta_w = c.cp_V * (
+        result.vapor_flow_out_kg_s * (result.vapor_out.T - T_ref)
+        - m_vapor_kg_s * (vapor_inf.T - T_ref)
+    )
     latent_heat_water_w = total_water_to_solid_kg_s * c.dH_vap_water
     latent_heat_hexane_w = hexane_from_solid_kg_s * c.particle.dH_vap_hexane
 
@@ -368,9 +379,9 @@ def dc_stage_balance(
 
     water_residual = (air_humidity_out - air_humidity_in) * air_flow_kg_s - m_evap_kg_s
 
-    h_in = dc_mod.solid_stream_enthalpy_w(m_dry_safe, T_in, X1_in, c) + dc_mod.air_stream_enthalpy_w(
-        air_flow_kg_s, air_T, air_humidity_in, c
-    )
+    h_in = dc_mod.solid_stream_enthalpy_w(
+        m_dry_safe, T_in, X1_in, c
+    ) + dc_mod.air_stream_enthalpy_w(air_flow_kg_s, air_T, air_humidity_in, c)
     h_out = dc_mod.solid_stream_enthalpy_w(
         m_dry_safe, _T_eq, X1_eq, c
     ) + dc_mod.air_stream_enthalpy_w(air_flow_kg_s, air_T_out, air_humidity_out, c)

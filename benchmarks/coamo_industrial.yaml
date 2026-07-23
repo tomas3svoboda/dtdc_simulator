@@ -1,0 +1,87 @@
+id: coamo_industrial
+title: COAMO / Kemper industrial DTDC benchmark
+description: >-
+  Ordered calibration gates for the soybean DTDC. Design and residence must be
+  credible before heat-source or constitutive parameters are fitted.
+
+numerics:
+  nz_phz: 20
+  nz_ftrz: 20
+  nz_dcz: 20
+  # One absolute norm spans temperature (K) and vapor mass fraction. 0.05 K
+  # is already far below plant/model uncertainty; 0.01 and 0.001 stall with
+  # <0.27 K / <0.02 %-point / <1 ppm output change.
+  outer_tol: 0.05
+  outer_max_iter: 100
+  dcz_inner_max_iter: 500
+
+sources:
+  - literature_sources/Svoboda_Industrial_DTDC_Model_Calibration_Targets.pdf
+  - literature_sources/Kemper_Solvent_Extraction.pdf
+  - literature_sources/Paraiso_Modeling_Simulation_Soybean_Oil_Meal_Desolventizing_Toasting.pdf
+
+design:
+  dt_stage_count: {low: 6, high: 7}
+  # Coletto: 4 m at 11.9 kg/s dry solid. Diameter scales with sqrt(flow),
+  # giving ~5.8 m at this scenario's 25 kg/s dry-solid throughput.
+  dt_diameter_m: {low: 5.5, high: 6.1}
+  role_counts:
+    PREDESOLV: {low: 2, high: 3}
+    MAIN: {low: 2, high: 3}
+    SPARGE: {low: 1, high: 1}
+  bed_depth_m:
+    PREDESOLV: {low: 0.15, high: 0.30}
+    MAIN: {low: 0.60, high: 1.20}
+    SPARGE: {low: 0.60, high: 1.10}
+  inventory_residence_min: {low: 20.0, high: 30.0}
+  hot_contact_residence_min: {low: 20.0, high: 30.0}
+  hot_contact_temperature_C: 105.0
+
+heat:
+  delivered_direct_fraction: {low: 0.70, high: 0.80, central: 0.75}
+  direct_steam_kg_per_t_raw: {low: 110.0, high: 116.0}
+  # This is deliberately a required accounting quality gate. A nominal
+  # m*latent-heat input split is not an acceptable substitute. All injected
+  # water vapor (sparge + lower-boundary makeup) is grouped as the direct
+  # steam heat source; top water-vapor enthalpy is subtracted as carry-through.
+  require_boundary_enthalpy_ledger: true
+  exclude_top_water_vapor_carrythrough: true
+
+outputs:
+  dome_temperature_C: {low: 70.0, high: 75.0}
+  dome_hexane_wt_pct: {low: 88.0, high: 94.0}
+  meal_temperature_C: {low: 108.0, high: 112.0}
+  meal_moisture_wb_pct: {low: 16.0, high: 21.0}
+  meal_hexane_ppm: {low: 100.0, high: 500.0}
+
+calibration_parameters:
+  # Fit groups in this order. Entries are names in the authoritative scenario
+  # and material YAMLs; DTDC_default_parameters.yaml is only a mirror.
+  operating_and_boundaries:
+    - operating_defaults.indirect_steam
+    - operating_defaults.direct_steam
+  literature_bounded:
+    - physical.particle_radius
+    - physical.water_diffusivity
+    - physical.x2_critical
+    - physical.sorption_C0
+    - physical.sorption_C1
+  genuine_boundary_placeholders:
+    - model.dt_vapor_feed_water_kg_s
+    - model.dt_vapor_feed_hex_kg_s
+    - model.dt_vapor_feed_T
+  calibrated_dynamic_closures:
+    - model.base_residence_s
+    - geometry.stages.DR1.arm_mixing_factor
+    - geometry.stages.CL1.arm_mixing_factor
+    - model.dc_hexane_mtc
+  never_fit_to_plant_outputs:
+    - model.outer_relaxation
+    - model.outer_tol
+    - model.outer_max_iter
+    - model.dt_nz_phz
+    - model.dt_nz_ftrz
+    - model.dt_nz_dcz
+    - model.dt_outer_tol
+    - model.dt_outer_max_iter
+    - model.dt_dcz_inner_max_iter

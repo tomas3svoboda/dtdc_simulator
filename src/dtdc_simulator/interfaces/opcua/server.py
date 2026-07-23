@@ -59,7 +59,8 @@ class OpcUaAdapter:
         self._endpoint = endpoint
         self._server: Server | None = None
         self._idx = 0
-        self._mv_nodes: dict[str, dict[str, Node]] = {}
+        self._control_nodes: dict[str, dict[str, Node]] = {}
+        self._raw_mv_nodes: dict[str, dict[str, Node]] = {}
         self._dv_nodes: dict[str, Node] = {}
         self._pv_stage_nodes: dict[str, dict[str, Node]] = {}
         self._pv_kpi_nodes: dict[str, Node] = {}
@@ -67,9 +68,9 @@ class OpcUaAdapter:
         self._last_global_mode = Mode.MANUAL.value
         self._last_speed_factor: float | None = None
         self._last_dt_resolve_interval_s: float | None = None
-        self._last_mv_mode: dict[str, str] = {}
-        self._last_mv_manual: dict[str, float] = {}
-        self._last_mv_auto: dict[str, float] = {}
+        self._last_control_mode: dict[str, str] = {}
+        self._last_control_sp: dict[str, float] = {}
+        self._last_control_op: dict[str, float] = {}
         self._last_dv: dict[str, float] = {}
 
     async def build(self) -> None:
@@ -82,13 +83,14 @@ class OpcUaAdapter:
 
         dtdc = await server.nodes.objects.add_object(self._idx, "DTDC")
         await self._build_sim_folder(dtdc)
-        await self._build_mv_folder(dtdc)
+        await self._build_control_folder(dtdc)
         await self._build_dv_folder(dtdc)
         await self._build_pv_folder(dtdc)
+        await self._build_diagnostics_folder(dtdc)
 
     async def _build_sim_folder(self, parent: Node) -> None:
         idx = self._idx
-        sim = await parent.add_object(idx, "Sim")
+        sim = await parent.add_object(idx, "Simulation")
         snap = self._facade.get_snapshot()
 
         speed = await sim.add_variable(idx, "SpeedFactor", float(snap.speed_factor))
@@ -157,48 +159,47 @@ class OpcUaAdapter:
         await sim.add_method(idx, "Reset", do_reset, [], [])
         await sim.add_method(idx, "Reconfigure", do_reconfigure, [], [])
 
-    async def _build_mv_folder(self, parent: Node) -> None:
+    async def _build_control_folder(self, parent: Node) -> None:
         idx = self._idx
-        mv_root = await parent.add_object(idx, "MV")
+        control_root = await parent.add_object(idx, "Control")
         snap = self._facade.get_snapshot()
-        group_nodes: dict[str, Node] = {}
-
-        for key, mv in snap.mvs.items():
-            mv_key, _, stage_id = key.partition("/")
-
-            if mv_key not in group_nodes:
-                group_nodes[mv_key] = await mv_root.add_object(idx, mv_key)
-            node_parent = group_nodes[mv_key]
-            if stage_id:
-                node_parent = await node_parent.add_object(idx, stage_id)
-
-            mode_n = await node_parent.add_variable(idx, "Mode", mv.mode.value)
+        for tag, loop in snap.control_loops.items():
+            node_parent = await control_root.add_object(idx, tag)
+            mode_n = await node_parent.add_variable(idx, "Mode", loop.mode)
             await mode_n.set_writable()
-            manual_n = await node_parent.add_variable(
-                idx, "ManualSetpoint", float(mv.manual_setpoint)
+            sp_n = await node_parent.add_variable(idx, "SP", float(loop.sp))
+            await sp_n.set_writable()
+            pv_n = await node_parent.add_variable(idx, "PV", float(loop.pv))
+            op_n = await node_parent.add_variable(idx, "OP", float(loop.op))
+            await op_n.set_writable()
+            units_n = await node_parent.add_variable(
+                idx, "Units", loop.engineering_units
             )
-            await manual_n.set_writable()
-            auto_n = await node_parent.add_variable(idx, "AutoSetpoint", float(mv.auto_setpoint))
-            await auto_n.set_writable()
-            eff_n = await node_parent.add_variable(idx, "EffectiveValue", float(mv.effective_value))
-            min_n = await node_parent.add_variable(idx, "Min", float(mv.min))
-            max_n = await node_parent.add_variable(idx, "Max", float(mv.max))
+            status_n = await node_parent.add_variable(idx, "Status", loop.status)
+            desc_n = await node_parent.add_variable(
+                idx, "Description", loop.description
+            )
+            min_n = await node_parent.add_variable(idx, "Min", float(loop.minimum))
+            max_n = await node_parent.add_variable(idx, "Max", float(loop.maximum))
 
-            self._mv_nodes[key] = {
+            self._control_nodes[tag] = {
                 "Mode": mode_n,
-                "ManualSetpoint": manual_n,
-                "AutoSetpoint": auto_n,
-                "EffectiveValue": eff_n,
+                "SP": sp_n,
+                "PV": pv_n,
+                "OP": op_n,
+                "Units": units_n,
+                "Status": status_n,
+                "Description": desc_n,
                 "Min": min_n,
                 "Max": max_n,
             }
-            self._last_mv_mode[key] = mv.mode.value
-            self._last_mv_manual[key] = float(mv.manual_setpoint)
-            self._last_mv_auto[key] = float(mv.auto_setpoint)
+            self._last_control_mode[tag] = loop.mode
+            self._last_control_sp[tag] = float(loop.sp)
+            self._last_control_op[tag] = float(loop.op)
 
     async def _build_dv_folder(self, parent: Node) -> None:
         idx = self._idx
-        dv_root = await parent.add_object(idx, "DV")
+        dv_root = await parent.add_object(idx, "SimulationInputs")
         snap = self._facade.get_snapshot()
         for key, value in snap.dvs.items():
             n = await dv_root.add_variable(idx, key, float(value))
@@ -208,7 +209,7 @@ class OpcUaAdapter:
 
     async def _build_pv_folder(self, parent: Node) -> None:
         idx = self._idx
-        pv_root = await parent.add_object(idx, "PV")
+        pv_root = await parent.add_object(idx, "Measurements")
         stage_root = await pv_root.add_object(idx, "Stage")
         kpi_root = await pv_root.add_object(idx, "KPI")
 
@@ -232,6 +233,31 @@ class OpcUaAdapter:
 
         for fname, fval in _kpi_values(outputs).items():
             self._pv_kpi_nodes[fname] = await kpi_root.add_variable(idx, fname, float(fval))
+
+    async def _build_diagnostics_folder(self, parent: Node) -> None:
+        """Expose raw model MVs read-only for commissioning/debugging.
+
+        They are intentionally not the PLC integration surface; writable
+        process control lives exclusively under ``Control/<loop-tag>``.
+        """
+        idx = self._idx
+        diagnostics = await parent.add_object(idx, "Diagnostics")
+        raw_root = await diagnostics.add_object(idx, "InternalMV")
+        snap = self._facade.get_snapshot()
+        for key, mv in snap.mvs.items():
+            obj = await raw_root.add_object(idx, key.replace("/", "__"))
+            self._raw_mv_nodes[key] = {
+                "Mode": await obj.add_variable(idx, "Mode", mv.mode.value),
+                "ManualSetpoint": await obj.add_variable(
+                    idx, "ManualSetpoint", float(mv.manual_setpoint)
+                ),
+                "AutoSetpoint": await obj.add_variable(
+                    idx, "AutoSetpoint", float(mv.auto_setpoint)
+                ),
+                "EffectiveValue": await obj.add_variable(
+                    idx, "EffectiveValue", float(mv.effective_value)
+                ),
+            }
 
     async def _pull_writes(self) -> None:
         """Apply a node's value to the facade only if it actually changed since
@@ -257,27 +283,27 @@ class OpcUaAdapter:
             try:
                 facade.set_global_mode(Mode(global_mode_val))
             except ValueError:
-                logger.warning("Sim/GlobalMode: invalid mode %r", global_mode_val)
+                logger.warning("Simulation/GlobalMode: invalid mode %r", global_mode_val)
             self._last_global_mode = global_mode_val
 
-        for key, nodes in self._mv_nodes.items():
+        for tag, nodes in self._control_nodes.items():
             mode_val = await nodes["Mode"].read_value()
-            if mode_val != self._last_mv_mode[key]:
+            if mode_val != self._last_control_mode[tag]:
                 try:
-                    facade.set_mv_mode(key, Mode(mode_val))
+                    facade.set_control_mode(tag, Mode(mode_val))
                 except ValueError:
-                    logger.warning("MV/%s/Mode: invalid mode %r", key, mode_val)
-                self._last_mv_mode[key] = mode_val
+                    logger.warning("Control/%s/Mode: invalid mode %r", tag, mode_val)
+                self._last_control_mode[tag] = mode_val
 
-            manual_val = float(await nodes["ManualSetpoint"].read_value())
-            if manual_val != self._last_mv_manual[key]:
-                facade.set_mv_manual_setpoint(key, manual_val)
-                self._last_mv_manual[key] = manual_val
+            sp_val = float(await nodes["SP"].read_value())
+            if sp_val != self._last_control_sp[tag]:
+                facade.set_control_setpoint(tag, sp_val)
+                self._last_control_sp[tag] = sp_val
 
-            auto_val = float(await nodes["AutoSetpoint"].read_value())
-            if auto_val != self._last_mv_auto[key]:
-                facade.set_mv_auto_setpoint(key, auto_val)
-                self._last_mv_auto[key] = auto_val
+            op_val = float(await nodes["OP"].read_value())
+            if op_val != self._last_control_op[tag]:
+                facade.set_control_output(tag, op_val)
+                self._last_control_op[tag] = op_val
 
         for key, node in self._dv_nodes.items():
             val = float(await node.read_value())
@@ -300,8 +326,19 @@ class OpcUaAdapter:
                 int(snap.outputs.dt_solver_outer_iterations)
             )
 
+        for tag, loop in snap.control_loops.items():
+            nodes = self._control_nodes[tag]
+            await nodes["Mode"].write_value(loop.mode)
+            await nodes["SP"].write_value(float(loop.sp))
+            await nodes["PV"].write_value(float(loop.pv))
+            await nodes["OP"].write_value(float(loop.op))
+            await nodes["Status"].write_value(loop.status)
+            self._last_control_mode[tag] = loop.mode
+            self._last_control_sp[tag] = float(loop.sp)
+            self._last_control_op[tag] = float(loop.op)
+
         for key, mv in snap.mvs.items():
-            nodes = self._mv_nodes[key]
+            nodes = self._raw_mv_nodes[key]
             await nodes["Mode"].write_value(mv.mode.value)
             await nodes["ManualSetpoint"].write_value(float(mv.manual_setpoint))
             await nodes["AutoSetpoint"].write_value(float(mv.auto_setpoint))

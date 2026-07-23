@@ -200,51 +200,72 @@ def test_vapor_out_and_solid_out_x2_properties() -> None:
     assert result.solid_out_X2 == result.cells[-1].X2_bulk
 
 
+def test_explicit_component_flows_close_water_and_hexane_boundaries() -> None:
+    result = _solve(outer_max_iter=500)
+    water_in = (1.0 - VAPOR_INF.wV2) * M_VAPOR_KG_S
+    hexane_in = VAPOR_INF.wV2 * M_VAPOR_KG_S
+    water_to_solid = M_DRY_KG_S * (result.solid_out_X1 - X1_IN)
+    x2_in = thermo.x2_equilibrium(
+        T_L_SUP,
+        PARTICLE_CONSTANTS.X3,
+        PARTICLE_CONSTANTS.gab,
+        PARTICLE_CONSTANTS.oil,
+        PARTICLE_CONSTANTS.alpha_pg,
+        PARTICLE_CONSTANTS.alpha_ps,
+        PARTICLE_CONSTANTS.rho_ps,
+    )
+    hexane_from_solid = M_DRY_KG_S * (x2_in - result.solid_out_X2)
+
+    assert result.iterations < 500
+    assert water_in - result.vapor_water_out_kg_s == pytest.approx(water_to_solid, abs=1.0e-9)
+    assert result.vapor_hexane_out_kg_s - hexane_in == pytest.approx(
+        hexane_from_solid, abs=1.0e-3
+    )
+    for cell in result.cells:
+        assert cell.vapor_water_kg_s >= 0.0
+        assert cell.vapor_hexane_kg_s >= 0.0
+        assert cell.vapor_top.wV2 == pytest.approx(
+            cell.vapor_hexane_kg_s / cell.vapor_flow_kg_s
+        )
+
+
 # ------------------------------------------------------------------ moisture (H2O) balance
 
 
-@pytest.mark.xfail(
-    reason="DCZ Coletto-faithful rework (D1-D6, GROUNDING_MATRIX.md) changed the "
-    "energy balance -> temperature -> water activity, shifting this behaviour. "
-    "Re-baseline after Phase 3/4 calibration.",
-    strict=False,
-)
 def test_subsaturated_moisture_relaxes_toward_isotherm_and_couples_to_temperature() -> None:
-    # This module's own default illustrative case (both boundary temperatures
-    # comfortably above the water dew point at this trace hexane fraction,
-    # ~373 K -- a_w ~= 0.57-0.58 throughout): no condensation anywhere, but
-    # the subsaturated-regime isotherm relaxation is active (this is the
-    # whole point -- a bulk-vapor-only dew-point check would have shown
-    # nothing happening here at all, which was the original bug).
+    # RE-BASELINED (was xfail through the DCZ Coletto-faithful rework). The
+    # DCZ is the sparge RE-WETTING zone: VAPOR_INF here is ~pure steam at
+    # 389 K (a_w high throughout), which puts the meal's own Luikov/GAB water
+    # isotherm target ABOVE any physical inlet moisture -- a sweep this session
+    # confirmed the solid ADSORBS across the whole 0.02-0.60 X1 range (there is
+    # no desorbing inlet at these conditions). So the old premise ("a moist
+    # inlet desorbs DOWN toward the target") is gone: it was an artefact of the
+    # pre-rework, energy-non-conservative cold drift. This matches the
+    # calibrated story in DECISIONS.md -- "more sparge steam correctly RAISES
+    # moisture; the meal reaches ~19 %wb via the isotherm."
     #
-    # The isotherm's own latent heat (found this session, DECISIONS.md's
-    # "DCZ moisture latent heat" entry: adsorption/desorption genuinely
-    # feeds back into vapor temperature, the same way condensation already
-    # did, using plain `dH_vap_water` -- no isosteric-heat data exists for
-    # water in this project's literature, same category of gap as hexane's
-    # own uncalibrated sorption constants) means a dry start and a wet start
-    # are NO LONGER guaranteed to reach the SAME destination -- adsorption
-    # releases heat (raising T, which lowers a_w, which lowers the isotherm's
-    # OWN target), a genuine, physically real feedback loop, not a bug. Check
-    # DIRECTION (dry desorbs down, wet adsorbs up) and that both converge
-    # (don't oscillate), not that they land on an identical number.
-    #
-    # NOTE on `outer_max_iter`: `water_mass_rate_w_m3`'s own mass-conservative
-    # feedback (dcz.py step 4's `+ water_mass_rate_w_m3[j]`, added this
-    # session so isotherm-driven adsorption/desorption actually depletes/
-    # replenishes the vapor's own water content, not just the solid's) closes
-    # a genuinely tighter mass<->energy<->mass loop than before -- confirmed
-    # this needs materially more outer iterations to converge at this
-    # module's own `outer_relaxation=0.5` (were 500/2000, needed ~1050/1910;
-    # doubled with margin below), not a sign of non-convergence.
-    dry_result = _solve(vapor_inf=VAPOR_INF, outer_max_iter=3000)  # X1_IN=0.15, desorbs
-    assert dry_result.iterations < 3000
-    assert dry_result.total_condensed_kg_s == pytest.approx(0.0)
-    for cell in dry_result.cells:
-        assert cell.condensed_water_kg_s == pytest.approx(0.0)
-    assert dry_result.solid_out_X1 < 0.15
+    # What this still guards -- the subsaturated-regime isotherm relaxation and
+    # its temperature coupling:
+    #   (1) DIRECTION -- a solid entering below the isotherm target relaxes UP
+    #       (adsorbs), for both a bone-dry (X1=0.02) and a moist (X1=0.15)
+    #       inlet.
+    #   (2) ORDERING -- the moister inlet stays moister at the outlet: one
+    #       residence pass relaxes TOWARD, but does not collapse ONTO, a single
+    #       equilibrium. The isotherm's own latent heat raises T, which lowers
+    #       a_w and the local target (a genuine feedback, DECISIONS.md's "DCZ
+    #       moisture latent heat"), so the two starts are not driven together.
+    #   (3) COUPLING stays BOUNDED -- that adsorption-heat -> T -> a_w loop
+    #       converges well inside the iteration cap (no runaway/oscillation)
+    #       and leaves every cell temperature physical.
+    # A little SURFACE condensation is allowed even though the BULK vapor is
+    # subsaturated (389 K >> ~373 K dew point): evaporative-pinning evaluates
+    # a_w at the cooler wet-surface saturation temperature, so a fraction of a
+    # percent of the vapour's water can pin/condense at the surface -- physical,
+    # and distinct from the bulk-supersaturation condensation the dedicated
+    # tests below exercise.
+    water_in_kg_s = (1.0 - VAPOR_INF.wV2) * M_VAPOR_KG_S
 
-    wet_result = dcz.solve_dcz_zone(
+    dry_result = dcz.solve_dcz_zone(
         nz=10,
         m_dry_kg_s=M_DRY_KG_S,
         m_vapor_kg_s=M_VAPOR_KG_S,
@@ -252,14 +273,46 @@ def test_subsaturated_moisture_relaxes_toward_isotherm_and_couples_to_temperatur
         vapor_inf=VAPOR_INF,
         q_Iv_w_m3=0.0,
         c=CONSTANTS,
-        X1_in=0.02,  # far BELOW the isotherm target -- should adsorb instead
-        outer_max_iter=4000,
+        X1_in=0.02,  # bone-dry inlet, far below the isotherm target
+        outer_max_iter=3000,
         outer_tol=1.0e-4,
         outer_relaxation=0.5,
     )
-    assert wet_result.iterations < 4000
-    assert wet_result.total_condensed_kg_s == pytest.approx(0.0)
-    assert wet_result.solid_out_X1 > 0.02
+    moist_result = dcz.solve_dcz_zone(
+        nz=10,
+        m_dry_kg_s=M_DRY_KG_S,
+        m_vapor_kg_s=M_VAPOR_KG_S,
+        T_L_sup=T_L_SUP,
+        vapor_inf=VAPOR_INF,
+        q_Iv_w_m3=0.0,
+        c=CONSTANTS,
+        X1_in=0.15,  # moist inlet, still below the (high) isotherm target
+        outer_max_iter=3000,
+        outer_tol=1.0e-4,
+        outer_relaxation=0.5,
+    )
+
+    # (3) the coupled loop converged, comfortably inside the cap
+    assert dry_result.iterations < 3000
+    assert moist_result.iterations < 3000
+
+    # (1) both relax UP toward the isotherm target (adsorb / re-wet)
+    assert dry_result.solid_out_X1 > 0.02
+    assert moist_result.solid_out_X1 > 0.15
+
+    # (2) ordering preserved: the moister inlet stays the moister outlet
+    assert moist_result.solid_out_X1 > dry_result.solid_out_X1
+
+    # (3) temperature coupling stays physical in every cell (no runaway)
+    for res in (dry_result, moist_result):
+        for cell in res.cells:
+            assert 300.0 < cell.vapor_top.T < 400.0
+            assert all(300.0 < tp < 400.0 for tp in cell.particle.Tp)
+
+    # surface condensation, if any, is a small fraction of the vapour's water
+    # (bulk stays subsaturated -- this is NOT the supersaturation regime)
+    for res in (dry_result, moist_result):
+        assert res.total_condensed_kg_s < 0.05 * water_in_kg_s
 
 
 def test_condensation_when_vapor_supersaturated() -> None:
@@ -304,3 +357,26 @@ def test_condensation_when_vapor_supersaturated() -> None:
         assert 0.0 <= cell.X1_bulk <= 1.0
     for cell in result.cells:
         assert cell.condensed_water_kg_s >= 0.0
+
+
+def test_cap_limited_solve_reports_failure_and_can_resume_complete_state() -> None:
+    incomplete = _solve(outer_max_iter=1)
+    assert not incomplete.converged
+    assert incomplete.warm_start is not None
+    assert incomplete.residuals.maximum_scaled > 1.0
+
+    resumed = dcz.solve_dcz_zone(
+        nz=10,
+        m_dry_kg_s=M_DRY_KG_S,
+        m_vapor_kg_s=M_VAPOR_KG_S,
+        T_L_sup=T_L_SUP,
+        vapor_inf=VAPOR_INF,
+        q_Iv_w_m3=0.0,
+        c=CONSTANTS,
+        X1_in=0.15,
+        outer_max_iter=3000,
+        outer_relaxation=0.5,
+        warm_start=incomplete.warm_start,
+    )
+    assert resumed.converged
+    assert resumed.residuals.maximum_scaled <= 1.0

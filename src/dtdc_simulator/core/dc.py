@@ -75,7 +75,9 @@ class DCConstants:
     # --- residual-hexane desorption (mechanistic, shared with the DT/DCZ physics) ---
     gab: thermo.GabParams  # hexane sorption isotherm (Cardarelli 1996) -- SAME as the DCZ uses
     antoine_hexane: thermo.AntoineParams  # hexane saturation pressure (escaping tendency)
-    dc_hexane_mtc: float  # [PLACE] mass-transfer coefficient for hexane desorption into air
+    # Lumped mass-transfer coefficient calibrated within the EPA AP-42
+    # DT->dryer->cooler meal-hexane cascade, not an unconstrained placeholder.
+    dc_hexane_mtc: float
 
 
 def saturation_humidity_ratio(

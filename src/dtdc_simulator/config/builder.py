@@ -16,9 +16,12 @@ from dtdc_simulator.core.model import (
     Model,
     ModelConstants,
     OperatingSeed,
+    SolidTransferDeviceType,
+    SolidTransferSpec,
     StageRole,
     StageSpec,
     State,
+    VaporPath,
 )
 from dtdc_simulator.core.zones import ftrz, phz
 from dtdc_simulator.core.zones import particle as pt
@@ -84,6 +87,12 @@ def _build_dt_solver_constants(
         cp_oil=physical.cp_oil,
         cp_water_vapor=physical.cp_water_vapor,
         cp_hexane_vapor=physical.cp_hexane_vapor,
+        particle_radius=physical.particle_radius,
+        dry_shell_conductivity=physical.k_ps,
+        jacket_temperature=_antoine_boiling_point_k(
+            physical.antoine_water,
+            p_bar=_ATM_PRESSURE_BAR + model.steam_supply_pressure_barg,
+        ),
     )
     ftrz_c = ftrz.FTRZConstants(
         T_boil_hexane=physical.T_boil_hexane,
@@ -106,9 +115,13 @@ def _build_dt_solver_constants(
         rho_ps=physical.rho_ps,
         X3=physical.oil_fraction,
         bed_porosity=physical.bed_porosity,
+        water_diffusivity=physical.water_diffusivity,
+        particle_radius=physical.particle_radius,
         x2_critical_empirical=physical.x2_critical,
         luikov=_thermo_luikov(physical.water_luikov),
         cp_solid=physical.cp_solid,
+        cp_hexane_liquid=physical.cp_hexane_liquid,
+        cp_oil=physical.cp_oil,
         # FTRZ left at atmospheric for now: its V-SAT condensation is an
         # ENTHALPY balance referenced to water's atmospheric bp (T_boil_water),
         # so an elevated dew point needs a matching datum shift -- a separate,
@@ -166,8 +179,22 @@ def assemble_model(config: ScenarioConfig) -> tuple[Model, State]:
             diameter_m=s.diameter_m,
             bed_height_m=s.bed_height_m,
             arm_mixing_factor=s.arm_mixing_factor,
+            vapor_path=VaporPath(s.vapor_path.value),
         )
         for s in config.geometry.stages
+    )
+    solid_transfers = tuple(
+        SolidTransferSpec(
+            id=boundary.id,
+            from_stage=boundary.from_stage,
+            to_stage=boundary.to_stage,
+            device_type=SolidTransferDeviceType(boundary.device_type.value),
+            controlled=boundary.controlled,
+            vapor_seal=boundary.vapor_seal,
+            fixed_position_pct=boundary.fixed_position_pct,
+            capacity_factor=boundary.capacity_factor,
+        )
+        for boundary in config.topology.solid_transfers
     )
     T_boil_water = _antoine_boiling_point_k(config.physical.antoine_water)
     dc_constants = dc.DCConstants(
@@ -203,6 +230,7 @@ def assemble_model(config: ScenarioConfig) -> tuple[Model, State]:
         dt_outer_tol=config.model.dt_outer_tol,
         dt_outer_max_iter=config.model.dt_outer_max_iter,
         dt_dcz_inner_max_iter=config.model.dt_dcz_inner_max_iter,
+        dt_outer_relaxation=config.model.outer_relaxation,
         # Steam supply-header conditions for the HMI readout (saturation temp at
         # the header pressure, via the same antoine_water correlation used elsewhere).
         steam_supply_barg=config.model.steam_supply_pressure_barg,
@@ -213,6 +241,7 @@ def assemble_model(config: ScenarioConfig) -> tuple[Model, State]:
     )
     model = Model(
         stages=stages,
+        solid_transfers=solid_transfers,
         constants=constants,
         base_residence_s=config.model.base_residence_s,
         # Full-tray discharge at gate=50% -> ~2x feed, so the default gate
@@ -225,6 +254,7 @@ def assemble_model(config: ScenarioConfig) -> tuple[Model, State]:
         feed_temperature=config.disturbance_defaults.feed_temperature,
         feed_moisture=config.disturbance_defaults.feed_moisture,
         feed_hexane=config.disturbance_defaults.feed_hexane,
+        feed_oil=config.disturbance_defaults.feed_oil,
         feed_flow_rate=config.operating_defaults.feed_flow_rate,
         indirect_steam=dict(config.operating_defaults.indirect_steam),
         direct_steam=dict(config.operating_defaults.direct_steam),

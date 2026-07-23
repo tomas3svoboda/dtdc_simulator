@@ -1,67 +1,100 @@
-# DTDC steady-state reference (literature)
+# DTDC steady-state literature and industry reference
 
-Companion to `DTDC_Simulator_BuildSpec.md` and `scenarios/soybean_default.yaml`. Grounds this
-project's operating defaults and validation expectations in published/typical soybean DT(DC)
-operating data, separate from the Coletto (2022) zonal-model figures already cited in the
-BuildSpec (those are particle/zone-scale, not whole-tower).
+This document separates whole-tower industry targets from the Coletto (2022)
+zone/particle equations. The authoritative active inputs are
+`scenarios/soybean_default.yaml` plus `properties/soybean.yaml`; the named
+release gates are in `benchmarks/coamo_industrial.yaml`.
 
-Sources: saVRee "Desolventiser Toaster Drier Cooler (DTDC) Explained"
-(https://savree.com/en/encyclopedia/desolventiser-toaster-drier-cooler-dtdc), AOCS "Meal
-Desolventizing, Toasting, Drying and Cooling", and patent-literature figures for wet-flake
-composition entering the DT (US 4332092, US 4496599 families).
+## Evidence layers
 
-## Whole-tower profile (soybean)
+1. Coletto, Bandoni & Blanco (2022), including supplementary material:
+   PHZ/FTRZ/DCZ topology, governing equations, transport properties, and the
+   six-tray laboratory/base arrangement.
+2. Cardarelli & Crapiste (1996), Cardarelli et al. (2002), Faner et al.
+   (2019), and Gianini/Luz papers: soybean sorption, diffusion, critical
+   loading, moisture equilibrium, and dryer kinetics.
+3. Kemper/AOCS/Svoboda and EPA AP-42: industrial tray depths, residence,
+   steam use, dome behavior, and DT-dryer-cooler meal-hexane cascades.
+4. The named COAMO case: feed and plant-scale output ranges used by the
+   release benchmark.
 
-| Point | Temperature | Moisture | Hexane |
-|---|---|---|---|
-| Feed (wet flakes, ex-extractor) | 55-60 °C | 5-10 % | 25-35 % |
-| Pre-desolventizing (jacket side) | steam ~185 °C (10 barg); meal asymptotes toward hexane bp (68.7 °C) | rising | dropping fast |
-| Main/countercurrent exit | ~100 °C | 17-22 % | dropping |
-| Sparge tray (~70% of total desolv. heat) | — | — | — |
-| DT exit (post-sparge) | 105-110 °C | 18-22 % | <500-800 ppm |
-| Dryer exit | cooling begins | ~13 % | further reduced |
-| Cooler exit (final product) | 35-40 °C | ~11-12.5 % (soybean meal trading limit ~12.5%) | <300-500 ppm |
+Exact equation-by-equation disposition is maintained in
+`GROUNDING_MATRIX.md`. Parameter bounds and macro-KPI sensitivity are in
+`PLACE_PARAMETER_AUDIT.md`.
 
-## This scenario's defaults vs. literature
+## Whole-tower reference envelope
 
-`scenarios/soybean_default.yaml`'s `disturbance_defaults` (feed conditions, live-adjustable via
-the UI sliders / OPC UA DVs):
-- `feed_temperature: 330.0` K = 56.85 °C — within the 55-60 °C literature range.
-- `feed_moisture: 0.07` (7%) — within the 5-10% range (previously 0.12/12%, revised down).
-- `feed_hexane: 0.26` (26%) — within the 25-35% range.
+| Point or design quantity | Literature/industry envelope |
+|---|---|
+| Feed wet flakes | roughly 45-60 C, solvent-rich and variable by extractor |
+| PREDESOLV section | conductive/jacket heat; meal approaches the 68.7 C hexane boiling region |
+| PHZ solvent removal | about 10-25%; Coletto base case 14.3% |
+| First countercurrent tray | start of FTRZ after the physical PREDESOLV section |
+| Hot-contact inventory residence | at least 20 min; total DT commonly 20-30 min |
+| Dome | about 70-75 C for lean, efficient steam use |
+| DT exit | about 105-115 C, 16-22%wb moisture, residual hexane below 500-800 ppm |
+| Dryer exit | about 12-14%wb |
+| Cooler/product | near ambient plus 5-10 C, about 11-12.5%wb, below 300-500 ppm hexane |
+| Direct steam | about 100-150 kg/t raw soybean |
+| Delivered direct-steam heat | approximately 70-80% when top water-vapor carry-through is excluded |
 
-UI sliders intentionally span wider than the literature nominal (10-50% hexane, 5-25% moisture,
-40-80 °C feed temp) so upset/off-spec scenarios can be explored, not just the steady operating
-point.
+## Authoritative COAMO seed
 
-## Why the model previously looked "stuck" at high hexane
+All feed composition fields use kg per kg dry solid:
 
-Two separate issues, both since fixed:
+| Input | Value |
+|---|---:|
+| Dry-solid flow | 25.0 kg/s |
+| Feed temperature | 322.15 K (49 C) |
+| Feed moisture, X1 | 0.124 |
+| Feed hexane, X2 | 0.388 |
+| Feed oil, X3 | 0.0137 |
+| Direct steam | 3.9 kg/s (110.45 kg/t raw) |
+| Indirect duty | 2.50 MW total: 2.30 MW PREDESOLV, 0.20 MW TOAST |
 
-**1. It really did take a long time to settle (pacing, not a bug).**
-`core/model.py` (M0 placeholder physics, not yet the Coletto dual-scale zonal model — see its
-module docstring and `DECISIONS.md`) chains a first-order-lag relaxation per stage. `base_residence_s
-= 90 s` (a documented `ModelParams` field, see the scenario YAML) cascaded across 8 stages settles
-over roughly 20-40 *simulated* minutes — in the same ballpark as a real DT's ~20-30 minute
-residence time, so not unreasonable physically. But the scenario's old default `sim.speed_factor =
-1.0` (real time) meant 20-40 *minutes of wall-clock time* to watch it settle — impractical
-interactively. Fix: `sim.speed_factor` default raised to `20.0` (still safely under the
-`speed_factor * dt_wall_s <= max_control_interval_s` undersample constraint: `20*0.2=4.0 <=
-10.0`), so the full transient plays out in ~60-90 real seconds by default. Drop it back to `1.0`
-(or drive the in-app speed slider) for true real-time behavior.
+The same values initialize the GUI and the strict benchmark. Feed cards and
+sliders display water and hexane on a complete wet-meal basis,
+`Xi / (1 + X1 + X2 + X3)`, while the solver stores dry-solid-basis values.
 
-**2. The temperature equilibrium itself *was* wrong — every DT stage was capped at hexane's
-boiling point (68.7 °C) forever, even the heaviest-duty sparge tray.** The original per-stage
-equilibrium formula treated hexane's boiling point as a hard ceiling regardless of how much steam
-duty was applied. Fixed by replacing it with a mechanistic sequential flash/sensible-heat energy
-balance (see `DECISIONS.md`, "DT equilibrium replaced with a mechanistic energy balance") driven
-only by `dH_vap_hexane`/`dH_vap_water`/`T_boil_hexane`/`cp_solid`/`cp_water_liquid`/`cp_oil` and a
-`T_boil_water` solved from the `antoine_water` correlation — no fitted curve or hand-picked
-ceiling. At this scenario's duties, the sparge tray now correctly settles around **~100 °C** once
-fully desolventized, matching the ~105-110 °C literature DT-exit figure above.
+## Current validation result
 
-Separately, `gate_opening` — the MV the BuildSpec §5.2 defines as controlling "inter-stage solid
-flow / holdup (level)" — had no effect anywhere in the placeholder model before this change. A
-real bed-holdup mass balance (`State.M`, `Outputs.stage_level_pct`) was added so gate_opening (and
-sweep_arm_speed) now genuinely set both residence time and bed level, and the UI can show a live
-per-tray level bar.
+Run:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\industry_benchmark.py --strict
+```
+
+Current validation-grade result:
+
+| Audit item | Result |
+|---|---:|
+| Loaded DT depths | 0.30 / 0.30 / 0.30 / 1.00 / 0.60 / 0.75 m |
+| Total / hot inventory residence | 27.81 / 20.11 min |
+| PHZ solvent removal | 13.99% |
+| Delivered steam heat | 74.68% |
+| Water residual | -0.0020 kg/s |
+| Solver | converged, 11 outer / 66 inner iterations |
+| Dome | 72.38 C / 90.25 wt% hexane |
+| DT exit | 111.73 C / 19.64%wb / 284 ppm |
+| Dryer exit | 59.51 C / 12.61%wb / 79 ppm |
+| Cooler/product | 31.15 C / 11.37%wb / 36 ppm |
+
+Every ordered design, residence, heat, balance, solver, dome, and meal gate
+passes. Product values are reported as model predictions; the release gates
+remain intentionally broader than a single calibrated point.
+
+## Interpretation and limitations
+
+The PHZ-to-FTRZ handoff is both literature-consistent and physically
+defensible: PHZ is limited by the actual PREDESOLV hardware, and FTRZ accepts
+the resulting boiling-point state even when its wet core remains above the
+empirical critical loading. Countercurrent vapor then supplies the remaining
+flash/temperature-raising duty.
+
+Not every closure is a verbatim paper equation. Water transfer is a
+documented extension to Coletto's hexane-only formulation; FTRZ V-SCAL
+mixing and the A.18 heat-flux unit reconstruction remain explicit
+model-form uncertainties. The bottom clean-vapor boundary and lumped
+dryer/cooler contact closures require plant identification for predictive
+use away from the benchmark. Numerical tolerances and mesh sizes are
+verification settings and must not be fitted to plant outputs.

@@ -17,10 +17,10 @@
 #   Cardarelli & Crapiste (1996) JAOCS 73(12) 1657-1661         -> GAB isotherm (Table 2, soybean, exact)
 #   Cardarelli, Crapiste & Mattea (2002) J. Food Eng. 52, 127   -> Table 1: rho_solid, porosities, D_eff,
 #                                                                   particle radius (exact)
-# NOTE: the heat-of-sorption constants (sorption_C0/C1) are still cited by Coletto (2022) to an unpublished
-#       PhD thesis (Cardarelli 1998; Faner 2008) not available to us, even after the supplementary material
-#       (whose own nomenclature lists C0/C1 without stating their values). Tagged [PLACE] (order-of-magnitude,
-#       NOT fit to data) until/unless that thesis (or another source stating the fitted numbers) surfaces.
+# NOTE: the exact heat-of-sorption constants (sorption_C0/C1) are cited by Coletto (2022) to theses
+#       not available to us. The values below are instead a transparent two-point fit to Cardarelli &
+#       Crapiste's published soybean caloric bounds; tagged [DERIVED/PAPER-bounded], not claimed as the
+#       unavailable thesis pair and not fitted to plant outputs.
 #       The oil-in-hexane isotherm (A0/B), previously in the same boat, was recovered from the supplementary
 #       material's own parameters table and is now [PAPER] — see DECISIONS.md's M2 Phase 3 entry.
 
@@ -42,7 +42,7 @@ cp_water_liquid: 4186.0      # J/kgK [STD]
 cp_water_vapor:  1900.0      # J/kgK [STD] steam, ~370 K (B.6 CPVip)
 cp_hexane_vapor: 1650.0      # J/kgK [STD] n-hexane gas, ~340-370 K (B.6 CPVip)
 cp_hexane_liquid: 2260.0     # J/kgK [STD] liquid n-hexane, ~25-70 C (B.5 CPL)
-cp_oil:          2000.0      # J/kgK [PLACE] soybean oil
+cp_oil:          2000.0      # J/kgK [STD estimate] soybean oil, low-impact at X3~1%
 mu_vapor:        1.329e-5    # Pa.s  [PAPER] Coletto supp. Table 1, "Vapor viscosity" (Cardarelli, Crapiste & Mattea 2002)
 # thermal conductivities (DCZ particle + bed scale, A.23/A.32) — all [PAPER] Coletto supp. Table 1
 k_ps:    0.29                # W/mK  "Solid thermal conductivity" (American Society of Heating and Engineers 2006)
@@ -53,30 +53,29 @@ bed_porosity:      0.40      # -     [PAPER] eps_b, Cardarelli, Crapiste & Matte
 particle_porosity: 0.50      # -     [PAPER] eps_p, same source ("particle porosity")
 alpha_ps:          0.50      # -     [DERIVED] particle solid volume fraction (=1-eps_p)
 alpha_pg:          0.50      # -     [DERIVED] particle pore-gas volume fraction (=eps_p)
-# particle_radius: real desolventizer meal is thin FLAKES (~0.2-0.4 mm), not Cardarelli's
-# 2 mm granules -- and the DCZ residual hexane is diffusion-TAIL limited (~r_P^2/D_eff), so the
-# characteristic diffusion length is what sets how low the DT can strip. At the 1.0 mm granular
-# radius the DT exits ~12000 ppm (far above the ~500-800 ppm a real predesolventizer achieves)
-# and residence can't fix it (adding a whole toasting tray only moved 12129->10975 ppm; the core
-# hexane diffuses out on an r^2/D timescale). Set to the flake-scale 0.18 mm (-> ~700 ppm DT
-# exit), which also self-consistently speeds water equilibration (kappa_w = 15*D/r_P^2). [DERIVED]
-# from the flake geometry of real soybean meal, replacing Cardarelli's granular-sample value.
-# Value: real soy flakes are ~0.25 mm THICK, and a flake diffuses through its HALF-thickness
-# (~0.125 mm), so a sphere-equivalent radius sits in ~0.125-0.25 mm. 0.20 mm is chosen at the
-# safe end of that band: larger radii under-strip the DT (0.25 mm -> ~3800 ppm exit), which
-# would force the dryer to exceed the 1100 ppm hexane-in-drying-air SAFETY limit to reach a
-# realistic ~100-300 ppm product. 0.20 mm -> ~1800 ppm DT exit, leaving the dryer safe headroom.
-particle_radius:   2.0e-4    # m     [DERIVED] flake diffusion-length scale (safe end of 0.125-0.25mm)
+# particle_radius is a diffusion length, not the radius of Cardarelli's 2 mm
+# laboratory granule. Industrial soybean flakes are roughly 0.25-0.50 mm
+# thick, so their half-thickness gives a 0.125-0.25 mm transport length. The
+# post-PHZ-refactor benchmark sweep selects 0.208 mm inside that physical band:
+# it gives about 284 ppm DT-exit hexane at the consistent COAMO oil basis while
+# retaining the paper's D_eff.
+particle_radius:   2.08e-4   # m     [DERIVED/calibrated] bounded flake diffusion length
 oil_fraction:      0.01      # kg/kg [PAPER-ish] residual oil in meal (X3), ~1% after extraction
-# heat of sorption  dH_s = dH_lv2 + C0 * W2^C1   (A.31)
-sorption_C0: 3.0e5           # [PLACE] no source available (see note above); order-of-magnitude only
-sorption_C1: -0.5            # [PLACE] no source available (see note above); order-of-magnitude only
+# Heat of sorption dH_s = dH_lv2 + C0*W2^C1 (Coletto A.31). The exact
+# soybean C0/C1 pair from Cardarelli's thesis is unavailable, but Cardarelli
+# & Crapiste (1996) publish enough caloric anchors to bound it: soybean net
+# sorption heat is ~22 kJ/mol at W2=0.001 kg/kg and <5 kJ/mol at high loading.
+# C1=-0.4 and C0=1.61e4 J/kg fit 22.0 kJ/mol at W2=0.001 and give 3.5 kJ/mol
+# at W2=0.1. This is a PAPER-bounded fit, not a plant-output calibration.
+sorption_C0: 1.61e4          # J/kg*(kg/kg)^0.4 [DERIVED/PAPER-bounded]
+sorption_C1: -0.4            # -                 [DERIVED/PAPER-bounded]
 # Critical solvent content X_c (constant-rate -> falling-rate / surface -> receding-front transition).
 # Faner, Perez & Crapiste (2019) MEASURED ~0.20 for soybean meal desolventizing with superheated hexane
 # (their Fig. 5 / model fit). The theoretical Coletto eq. 4 (pore LIQUID saturation) gives ~0.43 -- ~2x
-# too high, because capillarity keeps the particle surface wetted well below full pore saturation. Using
-# Faner's measured value; the predesolventizer then does most of the desolventizing (feed -> 0.20 by
-# surface evaporation), which is realistic. Omit / set null to fall back to the theoretical eq. 4.
+# too high, because capillarity keeps the particle surface wetted well below full pore saturation.
+# This remains the FTRZ receding-front threshold, but no longer forces PHZ to extend below the
+# physical PREDESOLV section: FTRZ accepts a hardware-boundary handoff above X_c. Omit / set null
+# to fall back to theoretical eq. 4.
 x2_critical: 0.20            # kg hexane/kg dry solid  [PAPER] Faner et al. (2019), soybean measured value
 # Water's own bed-scale equilibration rate (DCZ moisture, subsaturated regime) -- found this
 # session (DECISIONS.md): reusing hexane's own hM here (a Faner-correlation, hexane-vapor-tuned

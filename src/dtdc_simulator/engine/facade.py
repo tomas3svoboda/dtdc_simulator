@@ -13,6 +13,12 @@ from dtdc_simulator.config.schema import ScenarioConfig
 from dtdc_simulator.config.schema import StageRole as SchemaStageRole
 from dtdc_simulator.core.model import Inputs, Model, Outputs, State
 from dtdc_simulator.engine.clock import Clock, FreeRunClock, RealTimeClock
+from dtdc_simulator.engine.control_interface import (
+    Aggregation,
+    ControlBinding,
+    ControlLoopSnapshot,
+    build_control_catalog,
+)
 from dtdc_simulator.engine.mv import DisturbanceVariable, ManipulatedVariable, Mode
 from dtdc_simulator.engine.state_machine import SimState, StateMachine
 
@@ -23,16 +29,15 @@ DT_SCHEMA_ROLES = {SchemaStageRole.PREDESOLV, SchemaStageRole.MAIN, SchemaStageR
 MV_LIMITS: dict[str, tuple[float, float, float | None]] = {
     "feed_flow_rate": (0.0, 100.0, None),
     "indirect_steam": (0.0, 3.0e6, None),
-    # STOPGAP LOWER BOUND (flag for later, DECISIONS.md): a sparge below ~3 kg/s (~85 kg/t_raw,
-    # already under the ~110-116 kg/t industrial band) drives the DCZ into a regime the coupled
-    # water-sorption<->energy iteration does not converge in -- the meal over-condenses, the dome
-    # vapor water is stripped toward 0% (non-physical), and the solve returns converged=False.
-    # This min keeps the LIVE sim inside the reliable envelope; it is NOT a real fix. The real fix
-    # is to make the DCZ off-design iteration converge (decoupling the water-latent feedback alone
-    # was proven insufficient -- there are other divergence sources), after which this can drop to 0.
+    # Validated model-domain floor, not the nominal operating target: below
+    # ~3 kg/s the FTRZ free-boundary length exceeds the installed countercurrent
+    # bed (and at intermediate points the no-driving-force limit is singular).
+    # The industrial seed is 3.9 kg/s / 110.45 kg/t raw. Keep the GUI inside
+    # the represented hardware domain; a future explicit shutdown/startup
+    # regime would be needed before this can safely reach zero.
     "direct_steam": (3.0, 5.0, None),
     "sweep_arm_speed": (0.0, 10.0, None),
-    "gate_opening": (0.0, 100.0, None),
+    "transfer_device_position": (0.0, 100.0, None),
     "heated_air_temp": (280.0, 450.0, None),
     # Cooling ~25 kg/s of hot meal to ~38 C with ambient air is energy-bound to a high
     # air:solid ratio (~16:1), so the COOLER air-flow ceiling is well above the DRYER's --
@@ -55,13 +60,30 @@ class MVSnapshot:
 
 @dataclass
 class SteamInfo:
-    """Steam supply-header conditions for the HMI readout (analogous to the DC
-    air readout), shown for both jacket + sparge steam. `dH_vap_water` lets the
-    UI show the jacket (indirect) duty as a steam flow rate (kg/s) instead of kW."""
+    """Steam conditions for the HMI utility boxes.
+
+    Indirect steam condenses at the supply-header conditions. Direct steam is
+    throttled to the sparge/meal contact pressure, so its displayed pressure
+    and saturation temperature are deliberately separate from the header.
+    `dH_vap_water` converts indirect heat duty (W) to equivalent condensate
+    flow (kg/s).
+    """
 
     supply_barg: float
     supply_T_K: float
+    direct_contact_barg: float
+    direct_contact_T_K: float
     dH_vap_water: float  # J/kg
+
+
+@dataclass(frozen=True)
+class TransferBoundaryInfo:
+    id: str
+    from_stage: str
+    to_stage: str | None
+    device_type: str
+    controlled: bool
+    vapor_seal: bool
 
 
 @dataclass
@@ -76,7 +98,10 @@ class Snapshot:
     dvs: dict[str, float]
     outputs: Outputs | None
     stage_roles: dict[str, str]
+    stage_vapor_paths: dict[str, str]
     stage_order: list[str]
+    transfer_boundaries: tuple[TransferBoundaryInfo, ...]
+    control_loops: dict[str, ControlLoopSnapshot]
     dt_resolve_interval_s: float  # M3a follow-up ("C")
     steam: SteamInfo | None = None
 
@@ -95,7 +120,10 @@ class RuntimeFacade:
         self._mvs: dict[str, ManipulatedVariable] = {}
         self._dvs: dict[str, DisturbanceVariable] = {}
         self._stage_roles: dict[str, str] = {}
+        self._stage_vapor_paths: dict[str, str] = {}
         self._stage_order: list[str] = []
+        self._transfer_boundaries: tuple[TransferBoundaryInfo, ...] = ()
+        self._control_bindings: dict[str, ControlBinding] = {}
         self._sim_time = 0.0
         self._actual_speed = 0.0
         self._speed_factor = 1.0
@@ -229,12 +257,34 @@ class RuntimeFacade:
             add(f"direct_steam/{sid}", od.direct_steam.get(sid, 0.0), "direct_steam")
         for sid in all_ids:
             add(f"sweep_arm_speed/{sid}", od.sweep_arm_speed.get(sid, 3.0), "sweep_arm_speed")
-        for sid in all_ids:
-            add(f"gate_opening/{sid}", od.gate_opening.get(sid, 50.0), "gate_opening")
+        for boundary in config.topology.solid_transfers:
+            if boundary.controlled:
+                add(
+                    f"transfer_device_position/{boundary.id}",
+                    od.transfer_device_position[boundary.id],
+                    "transfer_device_position",
+                )
 
         self._mvs = mvs
         self._stage_roles = {s.id: s.role.value for s in config.geometry.stages}
+        self._stage_vapor_paths = {
+            s.id: s.vapor_path.value for s in config.geometry.stages
+        }
         self._stage_order = all_ids
+        self._transfer_boundaries = tuple(
+            TransferBoundaryInfo(
+                id=boundary.id,
+                from_stage=boundary.from_stage,
+                to_stage=boundary.to_stage,
+                device_type=boundary.device_type.value,
+                controlled=boundary.controlled,
+                vapor_seal=boundary.vapor_seal,
+            )
+            for boundary in config.topology.solid_transfers
+        )
+        self._control_bindings = {
+            binding.tag: binding for binding in build_control_catalog(config)
+        }
 
         dd = config.disturbance_defaults
         self._dvs = {
@@ -271,6 +321,74 @@ class RuntimeFacade:
             for mv in self._mvs.values():
                 mv.set_mode(mode)
 
+    def control_tags(self) -> list[str]:
+        with self._lock:
+            return list(self._control_bindings)
+
+    def set_control_mode(self, tag: str, mode: Mode) -> None:
+        """Set one PLC loop mode atomically across all bound internal MVs."""
+        with self._lock:
+            binding = self._control_bindings[tag]
+            for key in binding.mv_keys:
+                self._mvs[key].set_mode(mode)
+
+    def _set_control_values_locked(
+        self, binding: ControlBinding, display_value: float, *, auto: bool
+    ) -> None:
+        raw_value = binding.from_display(float(display_value))
+
+        def write(key: str, value: float) -> None:
+            mv = self._mvs[key]
+            if auto:
+                mv.set_auto_setpoint(value)
+            else:
+                mv.set_manual_setpoint(value)
+
+        if binding.aggregation is Aggregation.COMMON:
+            for key in binding.mv_keys:
+                write(key, raw_value)
+            return
+        if binding.aggregation is Aggregation.SINGLE:
+            write(binding.mv_keys[0], raw_value)
+            return
+
+        # TOTAL: fixed scenario allocation, with capacity-aware redistribution.
+        remaining = max(raw_value, 0.0)
+        active = list(range(len(binding.mv_keys)))
+        allocated = [0.0] * len(binding.mv_keys)
+        weights = list(binding.allocation_weights)
+        while active:
+            weight_sum = sum(weights[index] for index in active)
+            if weight_sum <= 0.0:
+                weight_sum = float(len(active))
+                for index in active:
+                    weights[index] = 1.0
+            saturated: list[int] = []
+            for index in active:
+                mv = self._mvs[binding.mv_keys[index]]
+                share = remaining * weights[index] / weight_sum
+                if share > mv.max:
+                    allocated[index] = mv.max
+                    remaining -= mv.max
+                    saturated.append(index)
+            if not saturated:
+                for index in active:
+                    allocated[index] = remaining * weights[index] / weight_sum
+                break
+            active = [index for index in active if index not in saturated]
+        for key, value in zip(binding.mv_keys, allocated):
+            write(key, value)
+
+    def set_control_setpoint(self, tag: str, value: float) -> None:
+        """Write a PLC loop SP (the AUTO-side target)."""
+        with self._lock:
+            self._set_control_values_locked(self._control_bindings[tag], value, auto=True)
+
+    def set_control_output(self, tag: str, value: float) -> None:
+        """Write a PLC loop manual OP."""
+        with self._lock:
+            self._set_control_values_locked(self._control_bindings[tag], value, auto=False)
+
     def set_mv_group_manual_setpoint(self, prefix: str, value: float) -> None:
         """Broadcast one manual setpoint to every MV whose key shares `prefix`
         (the part before the '/', or the whole key for non-per-stage MVs) --
@@ -281,6 +399,66 @@ class RuntimeFacade:
             for key, mv in self._mvs.items():
                 if key.split("/", 1)[0] == prefix:
                     mv.set_manual_setpoint(value)
+
+    def set_mv_weighted_group_manual_total(self, keys: list[str], total: float) -> None:
+        """Set one physical zone total using its configured hydraulic split.
+
+        The HMI exposes one PREDESOLV-jacket and one TOAST-jacket control,
+        while internal per-tray duties remain available for diagnostics.
+        Allocation is atomic, uses the same fixed scenario weights as the
+        PLC-facing loop, and respects every per-tray limit; if a tray saturates,
+        the remainder is redistributed over unsaturated trays.
+        """
+        with self._lock:
+            if not keys:
+                raise ValueError("weighted MV group requires at least one key")
+            unknown = [key for key in keys if key not in self._mvs]
+            if unknown:
+                raise KeyError(f"unknown MV keys in weighted group: {unknown}")
+
+            total = max(float(total), 0.0)
+            capacity = sum(self._mvs[key].max for key in keys)
+            remaining = min(total, capacity)
+            active = list(keys)
+            allocation: dict[str, float] = {}
+            binding = next(
+                (
+                    candidate
+                    for candidate in self._control_bindings.values()
+                    if candidate.aggregation is Aggregation.TOTAL
+                    and candidate.mv_keys == tuple(keys)
+                ),
+                None,
+            )
+            weights = (
+                dict(zip(keys, binding.allocation_weights))
+                if binding is not None
+                else {key: max(self._mvs[key].manual_setpoint, 0.0) for key in keys}
+            )
+            if sum(weights.values()) <= 0.0:
+                weights = {key: 1.0 for key in keys}
+
+            while active:
+                weight_sum = sum(weights[key] for key in active)
+                if weight_sum <= 0.0:
+                    for key in active:
+                        weights[key] = 1.0
+                    weight_sum = float(len(active))
+                saturated: list[str] = []
+                for key in active:
+                    share = remaining * weights[key] / weight_sum
+                    if share > self._mvs[key].max:
+                        allocation[key] = self._mvs[key].max
+                        remaining -= allocation[key]
+                        saturated.append(key)
+                if not saturated:
+                    for key in active:
+                        allocation[key] = remaining * weights[key] / weight_sum
+                    break
+                active = [key for key in active if key not in saturated]
+
+            for key, value in allocation.items():
+                self._mvs[key].set_manual_setpoint(value)
 
     def set_dv(self, key: str, value: float) -> None:
         with self._lock:
@@ -316,7 +494,7 @@ class RuntimeFacade:
         indirect_steam: dict[str, float] = {}
         direct_steam: dict[str, float] = {}
         sweep_arm_speed: dict[str, float] = {}
-        gate_opening: dict[str, float] = {}
+        transfer_device_position: dict[str, float] = {}
 
         for key, mv in self._mvs.items():
             if "/" in key:
@@ -328,8 +506,8 @@ class RuntimeFacade:
                     direct_steam[stage_id] = value
                 elif prefix == "sweep_arm_speed":
                     sweep_arm_speed[stage_id] = value
-                elif prefix == "gate_opening":
-                    gate_opening[stage_id] = value
+                elif prefix == "transfer_device_position":
+                    transfer_device_position[stage_id] = value
 
         return Inputs(
             feed_flow_rate=self._mvs["feed_flow_rate"].tick(dt),
@@ -337,7 +515,7 @@ class RuntimeFacade:
             indirect_steam=indirect_steam,
             direct_steam=direct_steam,
             sweep_arm_speed=sweep_arm_speed,
-            gate_opening=gate_opening,
+            transfer_device_position=transfer_device_position,
             heated_air_temp=self._mvs["heated_air_temp"].tick(dt),
             heated_air_flow=self._mvs["heated_air_flow"].tick(dt),
             ambient_air_temp=self._dvs["ambient_air_temp"].value,
@@ -389,6 +567,45 @@ class RuntimeFacade:
             self._actual_speed = clock.actual_speed
 
     # ------------------------------------------------------------------ reads
+    def _control_snapshots_locked(self) -> dict[str, ControlLoopSnapshot]:
+        loops: dict[str, ControlLoopSnapshot] = {}
+        for tag, binding in self._control_bindings.items():
+            bound = [self._mvs[key] for key in binding.mv_keys]
+
+            def aggregate(attribute: str) -> float:
+                values = [float(getattr(mv, attribute)) for mv in bound]
+                if binding.aggregation is Aggregation.TOTAL:
+                    return sum(values)
+                if binding.aggregation is Aggregation.COMMON:
+                    return sum(values) / len(values)
+                return values[0]
+
+            modes = {mv.mode.value for mv in bound}
+            mode = next(iter(modes)) if len(modes) == 1 else "MIXED"
+            if binding.aggregation is Aggregation.TOTAL:
+                raw_min = sum(mv.min for mv in bound)
+                raw_max = sum(mv.max for mv in bound)
+            elif binding.aggregation is Aggregation.COMMON:
+                raw_min = max(mv.min for mv in bound)
+                raw_max = min(mv.max for mv in bound)
+            else:
+                raw_min, raw_max = bound[0].min, bound[0].max
+
+            loops[tag] = ControlLoopSnapshot(
+                tag=tag,
+                description=binding.description,
+                engineering_units=binding.engineering_units,
+                mode=mode,
+                sp=binding.to_display(aggregate("auto_setpoint")),
+                pv=binding.to_display(aggregate("effective_value")),
+                op=binding.to_display(aggregate("effective_value")),
+                minimum=binding.to_display(raw_min),
+                maximum=binding.to_display(raw_max),
+                status="Good" if len(modes) == 1 else "ConfigurationError",
+                actuator_keys=binding.mv_keys,
+            )
+        return loops
+
     def get_snapshot(self) -> Snapshot:
         with self._lock:
             mvs = {
@@ -407,9 +624,12 @@ class RuntimeFacade:
             steam = None
             if self._model is not None:
                 c = self._model.constants
+                assert self._config is not None
                 steam = SteamInfo(
                     supply_barg=c.steam_supply_barg,
                     supply_T_K=c.steam_supply_T,
+                    direct_contact_barg=self._config.model.direct_steam_pressure_barg,
+                    direct_contact_T_K=c.dt_constants.T_direct_steam,
                     dH_vap_water=c.dH_vap_water,
                 )
             return Snapshot(
@@ -423,7 +643,10 @@ class RuntimeFacade:
                 dvs=dvs,
                 outputs=self._latest_outputs,
                 stage_roles=dict(self._stage_roles),
+                stage_vapor_paths=dict(self._stage_vapor_paths),
                 stage_order=list(self._stage_order),
+                transfer_boundaries=self._transfer_boundaries,
+                control_loops=self._control_snapshots_locked(),
                 dt_resolve_interval_s=self._dt_resolve_interval_s,
                 steam=steam,
             )

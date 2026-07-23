@@ -46,6 +46,18 @@ class StageRole(str, Enum):
     COOLER = "COOLER"
 
 
+class VaporPath(str, Enum):
+    BYPASS = "BYPASS"
+    THROUGH_BED = "THROUGH_BED"
+    STEAM_SOURCE = "STEAM_SOURCE"
+
+
+class SolidTransferDeviceType(str, Enum):
+    PASSIVE_SWEPT_PORT = "PASSIVE_SWEPT_PORT"
+    CONTROLLED_GATE = "CONTROLLED_GATE"
+    ROTARY_AIRLOCK = "ROTARY_AIRLOCK"
+
+
 DT_ROLES = {StageRole.PREDESOLV, StageRole.MAIN, StageRole.SPARGE}
 DC_ROLES = {StageRole.DRYER, StageRole.COOLER}
 
@@ -60,10 +72,25 @@ class StageSpec:
     # central shaft fixes ONE rpm for every tray; this captures the per-tray mixing difference
     # from arm geometry instead. Defaults 1.0 (arm identical to the base tray).
     arm_mixing_factor: float = 1.0
+    vapor_path: VaporPath = VaporPath.THROUGH_BED
 
     @property
     def volume_m3(self) -> float:
         return math.pi / 4.0 * self.diameter_m**2 * self.bed_height_m
+
+
+@dataclass(frozen=True)
+class SolidTransferSpec:
+    """Physical meal-transfer boundary below a thermodynamic stage."""
+
+    id: str
+    from_stage: str
+    to_stage: str | None
+    device_type: SolidTransferDeviceType
+    controlled: bool
+    vapor_seal: bool
+    fixed_position_pct: float = 50.0
+    capacity_factor: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -76,7 +103,7 @@ class ModelConstants:
     cp_water_liquid: float
     cp_oil: float
     oil_fraction: float  # kg oil/kg dry solid (X3)
-    rho_solid: float  # kg/m3, bulk solid-phase density (bed-holdup mass balance)
+    rho_solid: float  # kg/m3, true particle-solid density (bed-holdup mass balance)
     bed_porosity: float  # eps_b, bulk void fraction (bed-holdup mass balance)
     # --- M3a additions ---
     dt_constants: dt_solver.DTSolverConstants
@@ -96,6 +123,7 @@ class ModelConstants:
     dt_outer_tol: float
     dt_outer_max_iter: int
     dt_dcz_inner_max_iter: int
+    dt_outer_relaxation: float = 0.5
     # Steam supply-header conditions for the HMI readout (like the DC air readout),
     # shown for both jacket + sparge steam. Display-only; the physics BCs use
     # dt_constants.T_direct_steam (from direct_steam_pressure_barg) unchanged.
@@ -114,6 +142,7 @@ class OperatingSeed:
     feed_temperature: float
     feed_moisture: float
     feed_hexane: float
+    feed_oil: float
     feed_flow_rate: float
     indirect_steam: dict[str, float] = field(default_factory=dict)
     direct_steam: dict[str, float] = field(default_factory=dict)
@@ -150,9 +179,11 @@ class State:
     dt_target_X1: np.ndarray
     dt_target_X2: np.ndarray
     dt_warm_start_vapor_wV2: float
+    dt_warm_start_vapor_flow_kg_s: float
     dt_warm_start_vapor_T: float
     dt_warm_start_T_L_sup: float
     dt_last_solve_sim_time: float
+    dt_last_attempt_sim_time: float
     dt_converged: bool
     dt_outer_iterations: int
     # M4 (GUI redesign): the full per-cell axial profile from the last periodic
@@ -172,9 +203,11 @@ class State:
             dt_target_X1=self.dt_target_X1.copy(),
             dt_target_X2=self.dt_target_X2.copy(),
             dt_warm_start_vapor_wV2=self.dt_warm_start_vapor_wV2,
+            dt_warm_start_vapor_flow_kg_s=self.dt_warm_start_vapor_flow_kg_s,
             dt_warm_start_vapor_T=self.dt_warm_start_vapor_T,
             dt_warm_start_T_L_sup=self.dt_warm_start_T_L_sup,
             dt_last_solve_sim_time=self.dt_last_solve_sim_time,
+            dt_last_attempt_sim_time=self.dt_last_attempt_sim_time,
             dt_converged=self.dt_converged,
             dt_outer_iterations=self.dt_outer_iterations,
             dt_axial_profile=self.dt_axial_profile,  # frozen/immutable, safe to share
@@ -190,7 +223,9 @@ class Inputs:
     indirect_steam: dict[str, float] = field(default_factory=dict)  # W, per DT stage
     direct_steam: dict[str, float] = field(default_factory=dict)  # kg/s, per SPARGE stage
     sweep_arm_speed: dict[str, float] = field(default_factory=dict)  # rpm, per stage
-    gate_opening: dict[str, float] = field(default_factory=dict)  # 0-100 %, per stage
+    transfer_device_position: dict[str, float] = field(
+        default_factory=dict
+    )  # 0-100 %, per controlled solids-transfer boundary
     heated_air_temp: float = 380.0  # K
     heated_air_flow: float = 0.0  # kg/s
     ambient_air_temp: float = 298.0  # K
@@ -249,13 +284,19 @@ class Outputs:
     stage_X_hex_ppm: dict[str, float]
     stage_X_w_pct: dict[str, float]
     stage_vapor_temp: dict[str, float]
+    # Total vapor leaving the TOP face of each DT tray, moving upward. This is
+    # sampled from the resolved axial profile and drives the HMI's counterflow
+    # arrows; DC trays have no entry.
+    stage_vapor_flow_kg_s: dict[str, float]
     stage_level_pct: dict[str, float]
     # DC (DRYER/COOLER) air-outlet readout -- keyed only by DC-role stage
     # ids (see `Model.outputs`'s own diagnostic re-derivation); no entry for
     # DT-role stages, which have no equivalent air-side state at this fidelity.
     stage_air_T_out: dict[str, float]
     stage_air_humidity_out: dict[str, float]
-    stage_air_hexane_ppm: dict[str, float]  # hexane in the DC exhaust air (mole ppm), vs ~1100 LEL limit
+    stage_air_hexane_ppm: dict[
+        str, float
+    ]  # hexane in the DC exhaust air (mole ppm), vs ~1100 LEL limit
     # M4 (GUI redesign): per-stage solid outflow (kg/s dry) = M/tau, so the HMI
     # can annotate the inter-tray flow arrows with a real number (the same
     # M/tau discharge `step()`'s own holdup balance uses).
@@ -281,6 +322,7 @@ class Outputs:
     mass_inventory: MassInventory
     dt_axial_profile: dt_solver.DTAxialProfile
     dt_last_solve_sim_time: float
+    dt_last_attempt_sim_time: float
 
 
 def _dt_role_stages(stages: tuple[StageSpec, ...]) -> list[StageSpec]:
@@ -288,14 +330,26 @@ def _dt_role_stages(stages: tuple[StageSpec, ...]) -> list[StageSpec]:
 
 
 def _build_dt_trays(
-    dt_stages: list[StageSpec], indirect_steam: dict[str, float], direct_steam: dict[str, float]
+    dt_stages: list[StageSpec],
+    indirect_steam: dict[str, float],
+    direct_steam: dict[str, float],
+    bed_fill_fraction: dict[str, float] | None = None,
 ) -> list[dt_solver.DTTray]:
+    """Build the zonal solver's *loaded* bed geometry.
+
+    ``StageSpec.bed_height_m`` is the tray's maximum retained-bed depth used
+    by the holdup/capacity model. The physical PDE domain is the depth that is
+    actually loaded, so it must shrink/grow with ``M/M_max``. Standalone
+    callers may omit ``bed_fill_fraction`` to request the declared full-bed
+    geometry explicitly.
+    """
+    fills = bed_fill_fraction or {}
     return [
         dt_solver.DTTray(
             id=s.id,
             role=s.role.value,
             diameter_m=s.diameter_m,
-            bed_height_m=s.bed_height_m,
+            bed_height_m=s.bed_height_m * min(max(fills.get(s.id, 1.0), 1.0e-6), 1.0),
             Q_indirect_w=indirect_steam.get(s.id, 0.0),
             direct_steam_kg_s=direct_steam.get(s.id, 0.0),
         )
@@ -318,13 +372,14 @@ def _shaft_rpm(stages: list[StageSpec], sweep_arm_speed: dict[str, float]) -> fl
 def _reconstruct_warm_start_vapor_in(
     x: State, vapor_feed: dt_solver.VaporFeed, trays: list[dt_solver.DTTray]
 ) -> ftrz.VaporState:
-    """Rebuild the FTRZ-facing `ftrz.VaporState` warm start from the cached
-    `(wV2, T)` pair (`DTResult.dcz.vapor_out`'s own shape) plus the current
-    tick's total vapor mass flow — mirrors `dt_solver.solve_dt`'s own
-    internal derivation (`tests/test_dt_solver.py`'s warm-start test uses the
-    identical construction)."""
+    """Rebuild the FTRZ-facing warm start from cached DCZ outlet state.
+
+    Composition, explicit total component flow and temperature are cached;
+    the current bottom flow is only a positive fallback for legacy state.
+    """
     m_dir = trays[-1].direct_steam_kg_s if trays else 0.0
-    m_vapor_total = vapor_feed.m_water_kg_s + vapor_feed.m_hex_kg_s + m_dir
+    bottom_flow = vapor_feed.m_water_kg_s + vapor_feed.m_hex_kg_s + m_dir
+    m_vapor_total = max(x.dt_warm_start_vapor_flow_kg_s, bottom_flow * 1.0e-9)
     wV2 = x.dt_warm_start_vapor_wV2
     return ftrz.VaporState(
         m_water_kg_s=(1.0 - wV2) * m_vapor_total,
@@ -339,6 +394,7 @@ def _apply_dt_result(x_next: State, result: dt_solver.DTResult) -> None:
         x_next.dt_target_X1[j] = summary.X1
         x_next.dt_target_X2[j] = summary.X2
     x_next.dt_warm_start_vapor_wV2 = result.dcz.vapor_out.wV2
+    x_next.dt_warm_start_vapor_flow_kg_s = result.dcz.vapor_flow_out_kg_s
     x_next.dt_warm_start_vapor_T = result.dcz.vapor_out.T
     x_next.dt_warm_start_T_L_sup = result.ftrz.solid_out.T
     x_next.dt_axial_profile = result.axial_profile
@@ -349,6 +405,7 @@ class Model:
     """Immutable assembled model (BuildSpec §4: bound at setup, never mutated)."""
 
     stages: tuple[StageSpec, ...]
+    solid_transfers: tuple[SolidTransferSpec, ...]
     constants: ModelConstants
     base_residence_s: float = 90.0  # nominal per-stage lag time constant at 3 rpm sweep speed
     # Full-tray (level=100%), gate=50% solid discharge, kg/s dry. Set ~2*feed so
@@ -376,13 +433,18 @@ class Model:
         c = self.constants
         dt_stages = _dt_role_stages(self.stages)
         M0 = np.array([0.5 * self._stage_M_max(s) for s in self.stages], dtype=float)
+        initial_fill = {
+            s.id: float(M0[i] / self._stage_M_max(s))
+            for i, s in enumerate(self.stages)
+            if s.role in DT_ROLES
+        }
 
-        trays = _build_dt_trays(dt_stages, seed.indirect_steam, seed.direct_steam)
+        trays = _build_dt_trays(dt_stages, seed.indirect_steam, seed.direct_steam, initial_fill)
         solid_feed = dt_solver.SolidFeed(
             T=seed.feed_temperature,
             X1=seed.feed_moisture,
             X2=seed.feed_hexane,
-            X3=c.oil_fraction,
+            X3=seed.feed_oil,
             m_dry_kg_s=max(seed.feed_flow_rate, 1e-9),
         )
         vapor_feed = dt_solver.VaporFeed(
@@ -401,8 +463,13 @@ class Model:
             outer_tol=c.dt_outer_tol,
             outer_max_iter=c.dt_outer_max_iter,
             dcz_inner_max_iter=c.dt_dcz_inner_max_iter,
+            outer_relaxation=c.dt_outer_relaxation,
             sweep_arm_rpm=_shaft_rpm(self.stages, seed.sweep_arm_speed),
         )
+        # A configured steady-state seed is an accepted process state, not a
+        # diagnostic best iterate. Refuse to initialize the twin from a
+        # nonconverged or physically inadmissible DT result.
+        dt_solver.validate_dt_result(result, solid_feed, c.dt_constants)
         dt_target_T = np.array([s.T for s in result.tray_summaries], dtype=float)
         dt_target_X1 = np.array([s.X1 for s in result.tray_summaries], dtype=float)
         dt_target_X2 = np.array([s.X2 for s in result.tray_summaries], dtype=float)
@@ -438,7 +505,9 @@ class Model:
             # `_dc_equilibrium`). No-op if a DC air flow is 0 (equilibrium returns unchanged).
             if any(s.role in DC_ROLES for s in self.stages):
                 air_humidity = (
-                    dc.saturation_humidity_ratio(seed.ambient_air_temp, c.dc_constants.antoine_water)
+                    dc.saturation_humidity_ratio(
+                        seed.ambient_air_temp, c.dc_constants.antoine_water
+                    )
                     * seed.ambient_relative_humidity
                 )
                 m_dry = max(seed.feed_flow_rate, 1e-9)
@@ -453,7 +522,15 @@ class Model:
                         continue
                     tau = self.base_residence_s * s.arm_mixing_factor / max(shaft_rpm / 3.0, 0.1)
                     eq = dc.air_contact_equilibrium(
-                        dc_T, dc_X1, dc_X2, air_T, air_flow, air_humidity, m_dry, tau, c.dc_constants
+                        dc_T,
+                        dc_X1,
+                        dc_X2,
+                        air_T,
+                        air_flow,
+                        air_humidity,
+                        m_dry,
+                        tau,
+                        c.dc_constants,
                     )
                     T0[i], X10[i], X20[i] = eq[0], eq[1], eq[2]
                     dc_T, dc_X1, dc_X2 = eq[0], eq[1], eq[2]
@@ -468,9 +545,11 @@ class Model:
             dt_target_X1=dt_target_X1,
             dt_target_X2=dt_target_X2,
             dt_warm_start_vapor_wV2=result.dcz.vapor_out.wV2,
+            dt_warm_start_vapor_flow_kg_s=result.dcz.vapor_flow_out_kg_s,
             dt_warm_start_vapor_T=result.dcz.vapor_out.T,
             dt_warm_start_T_L_sup=result.ftrz.solid_out.T,
             dt_last_solve_sim_time=0.0,
+            dt_last_attempt_sim_time=0.0,
             dt_converged=result.converged,
             dt_outer_iterations=result.outer_iterations,
             dt_axial_profile=result.axial_profile,
@@ -479,43 +558,96 @@ class Model:
     def _stage_M_max(self, stage: StageSpec) -> float:
         """Max dry-solid holdup (kg) implied by tray geometry and bulk density."""
         c = self.constants
-        return stage.volume_m3 * c.rho_solid * (1.0 - c.bed_porosity)
+        # Match DCZ eq. (2)'s dry-solid flux basis exactly: bed solid fraction
+        # alpha_L=(1-eps_b), of which alpha_ps is actual dry solid (the rest is
+        # particle pore volume). Omitting alpha_ps made the dynamic inventory
+        # residence exactly 2x the zonal solver residence at alpha_ps=0.5.
+        return (
+            stage.volume_m3
+            * c.rho_solid
+            * (1.0 - c.bed_porosity)
+            * c.dt_constants.particle.alpha_ps
+        )
 
     def _stage_tau(self, stage: StageSpec, u: Inputs) -> float:
         """Solid transport/thermal-lag residence time (s). The DTDC has ONE central
         shaft, so every tray turns at the SAME rpm (`_shaft_rpm`) -- faster shaft ->
         shorter tau on ALL trays. Per-tray residence differences come from the tray's
         own `arm_mixing_factor` (sweep-arm geometry), NOT a per-tray rpm (a single shaft
-        cannot have one). gate_opening no longer enters here: it's a real DISCHARGE
-        throttle now (`_stage_discharge`), so a closed gate genuinely stops outflow and
-        backs material up rather than merely stretching the turnover time."""
+        cannot have one). Solids-device position no longer enters here: it is a real
+        discharge throttle (`_stage_discharge`), so a closed active boundary stops
+        outflow and backs material up rather than stretching the turnover time."""
         rpm = _shaft_rpm(self.stages, u.sweep_arm_speed)
         return self.base_residence_s * stage.arm_mixing_factor / max(rpm / 3.0, 0.1)
 
+    def _transfer_for_stage(self, stage_id: str) -> SolidTransferSpec:
+        for transfer in self.solid_transfers:
+            if transfer.from_stage == stage_id:
+                return transfer
+        raise KeyError(f"no solid-transfer boundary configured below stage {stage_id}")
+
     def _stage_discharge(self, stage: StageSpec, m_hold: float, u: Inputs) -> float:
-        """Solid discharge rate (kg/s dry) from a rotary valve / weir: driven by
-        the bed LEVEL (fill fraction `M/M_max`), NOT absolute holdup, so trays of
-        very different depth behave the SAME way for a given gate. Throttled by
-        `gate_opening` (§5.2: "sets inter-stage solid flow / holdup"):
+        """Level-driven discharge through the configured solids boundary.
 
-            m_out = (M / M_max) * (gate/50) * nominal_discharge_kg_s
+        Active devices read their hot 0-100% input. Passive swept ports use a
+        fixed configured conductance and therefore are not exposed as fictitious
+        PLC actuators. All device types currently share the calibrated closure:
 
-        With `nominal_discharge_kg_s ~ 2*feed`, gate=50% -> ~half-full at nominal
-        feed on EVERY tray, floods (level -> 100%) below ~25% gate everywhere,
-        and gate=0 fully STOPS discharge (accumulate + back-pressure). Level still
-        rises with feed (more throughput -> higher bed), and bigger trays get a
-        proportionally longer residence -- both physical. (Modelling discharge on
-        absolute holdup `M*k` instead made a deep tray sit near-empty and a
-        shallow one near-full at the same gate, since the trays' bed depths span
-        ~7x -- the reason the gate felt like it "did nothing" on the deep MN1.)"""
+            m_out = (M/M_max) * (position/50) * capacity_factor
+                    * nominal_discharge_kg_s
+
+        Separating topology from this closure lets an identified device-specific
+        gate or airlock law replace it later without changing tray thermodynamics.
+        """
         m_max = self._stage_M_max(stage)
         if m_max <= 0.0:
             return 0.0
-        gate = u.gate_opening.get(stage.id, 50.0)
-        return (m_hold / m_max) * (gate / 50.0) * self.nominal_discharge_kg_s
+        transfer = self._transfer_for_stage(stage.id)
+        position = (
+            u.transfer_device_position.get(transfer.id, transfer.fixed_position_pct)
+            if transfer.controlled
+            else transfer.fixed_position_pct
+        )
+        return (
+            (m_hold / m_max)
+            * (position / 50.0)
+            * transfer.capacity_factor
+            * self.nominal_discharge_kg_s
+        )
+
+    def _steady_fill_fractions(self, u: Inputs) -> dict[str, float]:
+        """Expected loaded fractions at steady through-flow for the gate law.
+
+        This is used by offline steady-state benchmarks, where no live
+        ``State.M`` exists. Runtime re-solves use the actual state instead.
+        """
+        fills: dict[str, float] = {}
+        for stage in self.stages:
+            if stage.role not in DT_ROLES:
+                continue
+            transfer = self._transfer_for_stage(stage.id)
+            position = (
+                u.transfer_device_position.get(transfer.id, transfer.fixed_position_pct)
+                if transfer.controlled
+                else transfer.fixed_position_pct
+            )
+            discharge_at_full = (
+                (position / 50.0) * transfer.capacity_factor * self.nominal_discharge_kg_s
+            )
+            if discharge_at_full <= 0.0:
+                fills[stage.id] = 1.0
+            else:
+                fills[stage.id] = min(max(u.feed_flow_rate / discharge_at_full, 1.0e-6), 1.0)
+        return fills
 
     def _dc_equilibrium(
-        self, stage: StageSpec, T_in: float, X1_in: float, X2_in: float, u: Inputs, residence_s: float
+        self,
+        stage: StageSpec,
+        T_in: float,
+        X1_in: float,
+        X2_in: float,
+        u: Inputs,
+        residence_s: float,
     ) -> tuple[float, float, float, float, float, float]:
         """§7.10: real well-mixed air-contacting balance (`core/dc.py`),
         shared by DRYER/COOLER -- only the air-stream arguments differ.
@@ -543,9 +675,10 @@ class Model:
         reusing one shared humidity value for both roles."""
         c = self.constants
         m_dry = max(u.feed_flow_rate, 1e-9)
-        air_humidity = dc.saturation_humidity_ratio(
-            u.ambient_air_temp, c.dc_constants.antoine_water
-        ) * u.ambient_relative_humidity
+        air_humidity = (
+            dc.saturation_humidity_ratio(u.ambient_air_temp, c.dc_constants.antoine_water)
+            * u.ambient_relative_humidity
+        )
         if stage.role is StageRole.DRYER:
             return dc.air_contact_equilibrium(
                 T_in,
@@ -572,14 +705,21 @@ class Model:
             )
         raise ValueError(f"unhandled DC stage role: {stage.role}")
 
-    def _resolve_dt(self, x: State, x_next: State, u: Inputs, dt_stages: list[StageSpec]) -> None:
-        """Runs one `solve_dt` call and caches its per-tray targets onto
-        `x_next` -- called from `step()` only when the periodic resolve
-        interval has elapsed (see module docstring). On failure, keeps the
-        previous targets and flags `dt_converged=False` (§7.9: "publish the
-        best estimate and flag SolverStress", not crash the tick loop)."""
+    def _resolve_dt(self, x: State, x_next: State, u: Inputs, dt_stages: list[StageSpec]) -> bool:
+        """Attempt one periodic DT solve and atomically accept it if trustworthy.
+
+        Nonconverged, physically inadmissible, and exceptional attempts all
+        retain the previous accepted targets, warm start, and axial profile.
+        ``dt_converged`` describes the latest attempt, so SolverStress remains
+        visible without publishing a diagnostic best iterate as process data.
+        """
         c = self.constants
-        trays = _build_dt_trays(dt_stages, u.indirect_steam, u.direct_steam)
+        stage_index = {stage.id: i for i, stage in enumerate(self.stages)}
+        live_fill = {
+            stage.id: float(x.M[stage_index[stage.id]] / max(self._stage_M_max(stage), 1.0e-12))
+            for stage in dt_stages
+        }
+        trays = _build_dt_trays(dt_stages, u.indirect_steam, u.direct_steam, live_fill)
         solid_feed = dt_solver.SolidFeed(
             T=u.feed_temperature,
             X1=u.feed_moisture,
@@ -609,26 +749,33 @@ class Model:
                 outer_tol=c.dt_outer_tol,
                 outer_max_iter=c.dt_outer_max_iter,
                 dcz_inner_max_iter=c.dt_dcz_inner_max_iter,
+                outer_relaxation=c.dt_outer_relaxation,
                 warm_start_vapor_in=warm_vapor_in,
                 warm_start_T_L_sup=warm_T_L_sup,
                 sweep_arm_rpm=_shaft_rpm(self.stages, u.sweep_arm_speed),
             )
-            _apply_dt_result(x_next, result)
-            x_next.dt_converged = result.converged
             x_next.dt_outer_iterations = result.outer_iterations
+            dt_solver.validate_dt_result(result, solid_feed, c.dt_constants)
+            _apply_dt_result(x_next, result)
+            x_next.dt_converged = True
+            return True
         except Exception:
-            # Keep last-good targets; SolverStress (facade layer) picks up
-            # dt_converged=False. Still stamp dt_last_solve_sim_time below so
-            # a persistent failure doesn't retry (and re-fail) every tick.
+            # Keep last accepted targets/profile; SolverStress picks up
+            # dt_converged=False.  The separate last-attempt timestamp prevents
+            # a persistent failure from retrying every tick without falsely
+            # claiming the stale profile was freshly resolved.
             x_next.dt_converged = False
+            return False
 
     def step(self, x: State, u: Inputs, t: float, dt: float) -> tuple[State, Outputs]:
         x_next = x.copy()
         dt_stages = _dt_role_stages(self.stages)
 
-        if t - x.dt_last_solve_sim_time >= u.dt_resolve_interval_s:
-            self._resolve_dt(x, x_next, u, dt_stages)
-            x_next.dt_last_solve_sim_time = t
+        if t - x.dt_last_attempt_sim_time >= u.dt_resolve_interval_s:
+            solved = self._resolve_dt(x, x_next, u, dt_stages)
+            x_next.dt_last_attempt_sim_time = t
+            if solved:
+                x_next.dt_last_solve_sim_time = t
 
         T_in, X1_in, X2_in = u.feed_temperature, u.feed_moisture, u.feed_hexane
         inflow = u.feed_flow_rate  # kg/s dry solid offered to the current stage
@@ -641,7 +788,9 @@ class Model:
                 X2_eq = x_next.dt_target_X2[dt_idx]
                 dt_idx += 1
             else:
-                T_eq, X1_eq, X2_eq, _, _, _ = self._dc_equilibrium(stage, T_in, X1_in, X2_in, u, tau)
+                T_eq, X1_eq, X2_eq, _, _, _ = self._dc_equilibrium(
+                    stage, T_in, X1_in, X2_in, u, tau
+                )
 
             decay = math.exp(-dt / tau)
 
@@ -650,7 +799,7 @@ class Model:
             X2_new = X2_eq + (x.X2[i] - X2_eq) * decay
 
             # Gated discharge + capacity-limited holdup with back-pressure
-            # (BuildSpec §5.2). gate_opening is a real rotary-valve throttle:
+            # (BuildSpec §5.2). The configured transfer device is a real throttle:
             # discharge is driven by bed LEVEL (`_stage_discharge`), and is 0 at a
             # shut gate. Inflow is accepted only up to the tray's remaining
             # capacity; the surplus is REJECTED back into the tray above
@@ -695,10 +844,16 @@ class Model:
         # DC (DRYER/COOLER) stages have no solvent-vapor phase, so they keep the
         # solid temperature as a documented fallback.
         stage_vapor_temp = dict(stage_T)
+        stage_vapor_flow_kg_s: dict[str, float] = {}
         _seen_vapor: set[str] = set()
-        for _sid, _vT in zip(x.dt_axial_profile.stage_id, x.dt_axial_profile.vapor_T):
+        for _sid, _vT, _vflow in zip(
+            x.dt_axial_profile.stage_id,
+            x.dt_axial_profile.vapor_T,
+            x.dt_axial_profile.vapor_flow_kg_s,
+        ):
             if _sid not in _seen_vapor:
                 stage_vapor_temp[_sid] = float(_vT)
+                stage_vapor_flow_kg_s[_sid] = float(_vflow)
                 _seen_vapor.add(_sid)
         # Not clamped to 100: an over-restricted gate can genuinely overfill a
         # tray, and showing >100% is the useful HMI "flood" signal for that.
@@ -717,7 +872,9 @@ class Model:
         # state modeled at this fidelity.
         stage_air_T_out: dict[str, float] = {}
         stage_air_humidity_out: dict[str, float] = {}
-        stage_air_hexane_ppm: dict[str, float] = {}  # mole ppm in the DC air, vs the ~1100 (10% LEL) limit
+        stage_air_hexane_ppm: dict[
+            str, float
+        ] = {}  # mole ppm in the DC air, vs the ~1100 (10% LEL) limit
         T_in_diag, X1_in_diag, X2_in_diag = u.feed_temperature, u.feed_moisture, u.feed_hexane
         for i, stage in enumerate(self.stages):
             if stage.role in DC_ROLES:
@@ -793,6 +950,7 @@ class Model:
             stage_X_hex_ppm=stage_X_hex_ppm,
             stage_X_w_pct=stage_X_w_pct,
             stage_vapor_temp=stage_vapor_temp,
+            stage_vapor_flow_kg_s=stage_vapor_flow_kg_s,
             stage_level_pct=stage_level_pct,
             stage_air_T_out=stage_air_T_out,
             stage_air_humidity_out=stage_air_humidity_out,
@@ -816,4 +974,5 @@ class Model:
             mass_inventory=mass_inventory,
             dt_axial_profile=x.dt_axial_profile,
             dt_last_solve_sim_time=float(x.dt_last_solve_sim_time),
+            dt_last_attempt_sim_time=float(x.dt_last_attempt_sim_time),
         )

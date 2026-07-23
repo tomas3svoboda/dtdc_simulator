@@ -16,8 +16,9 @@ soybean parameters in `properties/soybean.yaml` are tagged `[PAPER]`/`[PLACE]`/
 `[STD]`/`[DERIVED]`; notably the oil-sorption power-law (`A0`, `B`) and the
 heat-of-sorption constants (`sorption_C0`, `sorption_C1`) are cited by Coletto
 (2022) to two unpublished PhD theses (Cardarelli 1998; Faner 2008) not available
-to us — their *functional forms* below are implemented exactly as published, but
-fed with `[PLACE]` order-of-magnitude constants until real data surfaces.
+to us. Their *functional forms* below are implemented exactly as published;
+the soybean C0/C1 values are a documented fit to Cardarelli & Crapiste's
+published caloric bounds, not a claim to reproduce the unavailable thesis pair.
 """
 
 from __future__ import annotations

@@ -110,7 +110,7 @@ def _build_inputs(cfg, coamo_feed: bool) -> Inputs:
         indirect_steam=dict(od.indirect_steam),
         direct_steam=dict(od.direct_steam),
         sweep_arm_speed=dict(od.sweep_arm_speed),
-        gate_opening=dict(od.gate_opening),
+        transfer_device_position=dict(od.transfer_device_position),
         heated_air_temp=od.heated_air_temp,
         heated_air_flow=od.heated_air_flow,
         ambient_air_temp=dd.ambient_air_temp,
@@ -122,10 +122,15 @@ def _build_inputs(cfg, coamo_feed: bool) -> Inputs:
     )
 
 
-def score_dt(model, cfg, u: Inputs) -> tuple[list[Metric], object]:
+def score_dt(model, cfg, u: Inputs, solver_settings: dict | None = None) -> tuple[list[Metric], object]:
     c = model.constants
     dt_stages = _dt_role_stages(model.stages)
-    trays = _build_dt_trays(dt_stages, u.indirect_steam, u.direct_steam)
+    trays = _build_dt_trays(
+        dt_stages,
+        u.indirect_steam,
+        u.direct_steam,
+        model._steady_fill_fractions(u),
+    )
     solid_feed = dt_solver.SolidFeed(
         T=u.feed_temperature, X1=u.feed_moisture, X2=u.feed_hexane, X3=u.feed_oil,
         m_dry_kg_s=max(u.feed_flow_rate, 1e-9),
@@ -134,11 +139,20 @@ def score_dt(model, cfg, u: Inputs) -> tuple[list[Metric], object]:
         m_water_kg_s=c.dt_vapor_feed_water_kg_s, m_hex_kg_s=c.dt_vapor_feed_hex_kg_s,
         T=c.dt_vapor_feed_T,
     )
+    settings = solver_settings or {}
+    nz_phz = int(settings.get("nz_phz", c.dt_nz_phz))
+    nz_ftrz = int(settings.get("nz_ftrz", c.dt_nz_ftrz))
+    nz_dcz = int(settings.get("nz_dcz", c.dt_nz_dcz))
+    outer_tol = float(settings.get("outer_tol", c.dt_outer_tol))
+    outer_max_iter = int(settings.get("outer_max_iter", c.dt_outer_max_iter))
+    dcz_inner_max_iter = int(
+        settings.get("dcz_inner_max_iter", c.dt_dcz_inner_max_iter)
+    )
     r = dt_solver.solve_dt(
         trays, solid_feed, vapor_feed, c.dt_constants,
-        nz_phz=c.dt_nz_phz, nz_ftrz=c.dt_nz_ftrz, nz_dcz=c.dt_nz_dcz,
-        outer_tol=c.dt_outer_tol, outer_max_iter=c.dt_outer_max_iter,
-        dcz_inner_max_iter=c.dt_dcz_inner_max_iter,
+        nz_phz=nz_phz, nz_ftrz=nz_ftrz, nz_dcz=nz_dcz,
+        outer_tol=outer_tol, outer_max_iter=outer_max_iter,
+        dcz_inner_max_iter=dcz_inner_max_iter,
         sweep_arm_rpm=_shaft_rpm(model.stages, u.sweep_arm_speed),
     )
     ap = r.axial_profile
@@ -166,11 +180,11 @@ def score_dt(model, cfg, u: Inputs) -> tuple[list[Metric], object]:
         # INNER DCZ primary loop silently hits its cap (the core rigor issue).
         # Only a PASS if BOTH are true.
         Metric("DT solver fully converged",
-               1.0 if (r.converged and r.dcz.iterations < c.dt_dcz_inner_max_iter) else 0.0,
+               1.0 if (r.converged and r.dcz.iterations < dcz_inner_max_iter) else 0.0,
                "bool", 1.0, 1.0,
                note=f"outer={r.outer_iterations} ({'ok' if r.converged else 'CAP'}), "
-                    f"dcz_inner={r.dcz.iterations}/{c.dt_dcz_inner_max_iter} "
-                    f"({'ok' if r.dcz.iterations < c.dt_dcz_inner_max_iter else 'CAP'})"),
+                    f"dcz_inner={r.dcz.iterations}/{dcz_inner_max_iter} "
+                    f"({'ok' if r.dcz.iterations < dcz_inner_max_iter else 'CAP'})"),
     ]
     return metrics, r
 
@@ -202,6 +216,12 @@ def score_dc(model, u: Inputs, dt_meal) -> list[Metric]:
 
 
 def _residence_context(model, u: Inputs) -> str:
+    """Report relaxation constants, not physical inventory residence.
+
+    Physical residence is holdup/throughput and is audited by
+    ``scripts/industry_benchmark.py``. The old wording incorrectly called the
+    sum of response-lag constants the DT's solid residence time.
+    """
     lines = []
     total_dt = 0.0
     for stage in model.stages:
@@ -211,7 +231,8 @@ def _residence_context(model, u: Inputs) -> str:
             total_dt += tau
         lines.append(f"    {stage.id:<8} {role:<10} tau={tau/60:5.1f} min  bed={stage.bed_height_m:.2f} m")
     raw_soy_th = u.feed_flow_rate / DRY_MEAL_PER_RAW_SOY * 3.6
-    lines.append(f"    DT total solid residence ~ {total_dt/60:.1f} min (Crown patent: >=20 min at 105-110 C)")
+    lines.append(f"    DT total relaxation tau = {total_dt/60:.1f} min (not inventory residence)")
+    lines.append("    physical inventory/flow residence: run scripts/industry_benchmark.py")
     lines.append(f"    feed dry meal = {u.feed_flow_rate:.2f} kg/s  (~{raw_soy_th:.0f} t/h raw soybean basis)")
     return "\n".join(lines)
 

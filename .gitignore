@@ -11,13 +11,5 @@ literature_sources/
 # Local Claude Code session config (machine-specific tool permissions).
 .claude/
 
-# LaTeX build artifacts (paper/)
-paper/*.aux
-paper/*.bbl
-paper/*.blg
-paper/*.log
-paper/*.out
-paper/*.toc
-paper/*.fls
-paper/*.fdb_latexmk
-paper/main.pdf
+# LaTeX manuscript + build artifacts (paper/) — keep local only, not in the repo.
+paper/

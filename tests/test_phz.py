@@ -6,6 +6,8 @@ ww=0.09, whex=0.29, wo=0.0085, wds=0.6115, 58 C inlet; 400 kW indirect steam
 per pre-desolventizing tray, each 0.3 m bed height, 4.0 m diameter.
 """
 
+from dataclasses import replace
+
 import pytest
 
 from dtdc_simulator.core.zones import phz
@@ -20,7 +22,7 @@ T_FEED_K = 58.0 + 273.15
 CONSTANTS = phz.PHZConstants(
     T_boil_hexane=341.9,
     dH_vap_hexane=3.34e5,
-    cp_solid=1800.0,
+    cp_solid=2317.0,
     cp_water_liquid=4186.0,
     cp_hexane_liquid=2260.0,
     cp_oil=2000.0,
@@ -161,6 +163,66 @@ def test_vapor_water_conserved_hexane_increases() -> None:
     assert result.vapor_out.wV2 > VAPOR_IN.wV2  # gained hexane -> higher hexane fraction
 
 
+def test_falling_rate_partitions_jacket_heat_between_pore_solvent_and_matrix() -> None:
+    """Faner's dry shell reduces evaporation per joule and permits T > Tb."""
+    c = replace(
+        CONSTANTS,
+        particle_radius=2.08e-4,
+        dry_shell_conductivity=0.29,
+        jacket_temperature=443.15,
+    )
+    solid_in = phz.SolidState(T=c.T_boil_hexane, X2=0.15)
+    q_cell_w = 4.0e5
+    result = phz.solve_phz_cell(
+        solid_in,
+        VAPOR_IN,
+        q_cell_w,
+        DRY_SOLID_FLOW_KG_S,
+        5.0,
+        X1_FEED,
+        X3_FEED,
+        c,
+        X2_critical=0.20,
+        X2_equilibrium=0.01,
+        h_external_w_m2_k=300.0,
+    )
+    all_latent_x2 = max(
+        solid_in.X2 - q_cell_w / (DRY_SOLID_FLOW_KG_S * c.dH_vap_hexane),
+        0.01,
+    )
+
+    assert result.regime == "FALLING_RATE"
+    assert 0.0 < result.wet_core_fraction < 1.0
+    assert result.solid_out.T > c.T_boil_hexane
+    assert result.solid_out.X2 > all_latent_x2
+
+
+def test_zero_jacket_duty_preserves_cold_predesolv_state() -> None:
+    c = replace(
+        CONSTANTS,
+        particle_radius=2.08e-4,
+        dry_shell_conductivity=0.29,
+        jacket_temperature=443.15,
+    )
+    solid_in = phz.SolidState(T=T_FEED_K, X2=X2_FEED)
+    result = phz.solve_phz_cell(
+        solid_in,
+        VAPOR_IN,
+        0.0,
+        DRY_SOLID_FLOW_KG_S,
+        5.0,
+        X1_FEED,
+        X3_FEED,
+        c,
+        X2_critical=0.20,
+        X2_equilibrium=0.01,
+        h_external_w_m2_k=0.0,
+    )
+
+    assert result.solid_out == solid_in
+    assert result.hexane_evaporated_kg_s == 0.0
+
+
 # ------------------------------------------------------------------ full 3-tray zone
 
 
@@ -189,5 +251,5 @@ def test_zone_reduces_hexane_over_the_full_predesolv_section() -> None:
     # Solid temperature rises monotonically tray-to-tray (Fig. 7(a)).
     tray_out_temps = [r.solid_out.T for r in results]
     assert tray_out_temps == sorted(tray_out_temps)
-    # 58 C inlet should approach, but per eq. A.1a never exceed, hexane's bp.
+    # The legacy/no-falling-parameters closure remains boiling-point pinned.
     assert T_FEED_K < tray_out_temps[-1] <= CONSTANTS.T_boil_hexane + 1e-6
