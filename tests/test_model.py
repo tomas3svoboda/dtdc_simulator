@@ -1,8 +1,13 @@
+import math
+import random
+
+import numpy as np
 import pytest
 
 from dtdc_simulator.config.builder import assemble_model
 from dtdc_simulator.config.loader import load_scenario
 from dtdc_simulator.core.model import Inputs, StageRole
+from dtdc_simulator.core.zones import particle_jit
 
 SCENARIO_PATH = "scenarios/soybean_default.yaml"
 
@@ -47,6 +52,52 @@ def _with_fast_resolve(u: Inputs) -> Inputs:
     (many-tick) loop to cross the real resolve cadence."""
     u.dt_resolve_interval_s = 1.0e-6
     return u
+
+
+def _assert_dynamic_physics(model, previous, current, outputs, u, dt: float) -> None:
+    """Per-tick safety and dry-mass checks shared by transient trajectories."""
+    for values in (current.M, current.T, current.X1, current.X2, current.solid_out):
+        assert np.all(np.isfinite(values))
+    assert np.all(current.M >= -1.0e-9)
+    assert np.all(current.solid_out >= -1.0e-9)
+    assert np.all((current.X1 >= 0.0) & (current.X1 <= 1.0))
+    assert np.all((current.X2 >= 0.0) & (current.X2 <= 1.0))
+    assert np.all((current.T >= 230.0) & (current.T <= 500.0))
+
+    # Internal transfers cancel in the plant-wide dry-solid balance. The only
+    # possible deficit is feed rejected at the top capacity boundary.
+    accumulation = float(np.sum(current.M) - np.sum(previous.M)) / dt
+    accounted_feed = accumulation + float(current.solid_out[-1])
+    assert accounted_feed >= -1.0e-7
+    assert accounted_feed <= u.feed_flow_rate + 1.0e-7
+
+    profile = outputs.dt_axial_profile
+    for values in (
+        profile.z_m,
+        profile.solid_T,
+        profile.solid_X1,
+        profile.solid_X2,
+        profile.vapor_T,
+        profile.vapor_flow_kg_s,
+        profile.vapor_hexane_frac,
+        profile.vapor_water_frac,
+    ):
+        assert all(math.isfinite(float(value)) for value in values)
+    assert all(value >= 0.0 for value in profile.vapor_flow_kg_s)
+    assert all(0.0 <= value <= 1.0 for value in profile.solid_X1)
+    assert all(0.0 <= value <= 1.0 for value in profile.solid_X2)
+    assert all(0.0 <= value <= 1.0 for value in profile.vapor_hexane_frac)
+    assert all(0.0 <= value <= 1.0 for value in profile.vapor_water_frac)
+
+
+def _run_dynamic_ticks(model, x, u, start: int, stop: int):
+    outputs = None
+    for t in range(start, stop + 1):
+        previous = x
+        x, outputs = model.step(x, u, float(t), 1.0)
+        _assert_dynamic_physics(model, previous, x, outputs, u, 1.0)
+    assert outputs is not None
+    return x, outputs
 
 
 def test_init_state_matches_seed(loaded) -> None:
@@ -114,6 +165,135 @@ def test_high_feed_step_resolves_at_actual_dt_boundary_flow(loaded) -> None:
     )
     assert outputs.dt_micro_throughflow_kg_s < u.feed_flow_rate
     assert x_next.dt_last_solve_sim_time == pytest.approx(1.0)
+
+
+def test_full_high_feed_step_and_reversal_remain_dynamically_resolved(loaded) -> None:
+    (model, x0), cfg = loaded
+    u = _default_inputs(cfg)
+    u.dt_resolve_interval_s = 120.0
+    u.feed_flow_rate = 32.3
+
+    x, outputs = _run_dynamic_ticks(model, x0.copy(), u, 1, 120)
+    assert x.dt_converged
+    assert x.dt_last_solve_sim_time == pytest.approx(120.0)
+    assert outputs.dt_micro_throughflow_kg_s < u.feed_flow_rate
+
+    u.feed_flow_rate = 25.0
+    x, outputs = _run_dynamic_ticks(model, x, u, 121, 240)
+    assert x.dt_converged
+    assert x.dt_last_solve_sim_time == pytest.approx(240.0)
+    # After a downward step the accumulated bed can temporarily discharge
+    # faster than the newly offered feed.
+    assert outputs.dt_micro_throughflow_kg_s >= 25.0
+
+
+def test_rapid_slider_changes_publish_only_latest_operating_point(loaded) -> None:
+    (model, x0), cfg = loaded
+    u = _default_inputs(cfg)
+    u.dt_resolve_interval_s = 120.0
+    x = x0.copy()
+    original_attempt = x.dt_last_attempt_sim_time
+
+    for t in range(1, 121):
+        if t == 30:
+            u.feed_flow_rate = 29.0
+            u.feed_temperature += 5.0
+        elif t == 60:
+            u.feed_flow_rate = 23.0
+            u.feed_moisture = 0.10
+        elif t == 90:
+            u.feed_flow_rate = 27.0
+            u.feed_hexane = 0.34
+        previous = x
+        x, outputs = model.step(x, u, float(t), 1.0)
+        _assert_dynamic_physics(model, previous, x, outputs, u, 1.0)
+        if t < 120:
+            assert x.dt_last_attempt_sim_time == original_attempt
+
+    assert x.dt_last_attempt_sim_time == pytest.approx(120.0)
+    assert x.dt_converged
+    assert x.dt_last_solve_sim_time == pytest.approx(120.0)
+
+
+def test_infeasible_steam_step_keeps_profile_atomic_then_recovers(loaded) -> None:
+    (model, x0), cfg = loaded
+    u = _default_inputs(cfg)
+    u.dt_resolve_interval_s = 120.0
+    u.indirect_steam = {key: value * 0.55 for key, value in u.indirect_steam.items()}
+    u.direct_steam = {key: value * 0.65 for key, value in u.direct_steam.items()}
+    accepted_profile = x0.dt_axial_profile
+
+    x, _ = _run_dynamic_ticks(model, x0.copy(), u, 1, 120)
+    assert not x.dt_converged
+    assert x.dt_axial_profile is accepted_profile
+    assert x.dt_last_solve_sim_time == pytest.approx(0.0)
+
+    defaults = _default_inputs(cfg)
+    u.indirect_steam = defaults.indirect_steam
+    u.direct_steam = defaults.direct_steam
+    x, _ = _run_dynamic_ticks(model, x, u, 121, 240)
+    assert x.dt_converged
+    assert x.dt_axial_profile is not accepted_profile
+    assert x.dt_last_solve_sim_time == pytest.approx(240.0)
+
+
+def test_empty_start_and_fixed_seed_disturbances_preserve_tick_invariants(loaded) -> None:
+    (model, x0), cfg = loaded
+    u = _default_inputs(cfg)
+    u.dt_resolve_interval_s = 120.0
+    x = x0.copy()
+    x.M[:] = 0.0
+    x.solid_out[:] = 0.0
+
+    x, _ = _run_dynamic_ticks(model, x, u, 1, 120)
+    assert np.sum(x.M) > 0.0
+
+    rng = random.Random(20260724)
+    for block in range(4):
+        u.feed_flow_rate = rng.uniform(22.0, 30.0)
+        u.feed_temperature = rng.uniform(318.15, 338.15)
+        u.feed_moisture = rng.uniform(0.09, 0.15)
+        u.feed_hexane = rng.uniform(0.28, 0.38)
+        indirect_factor = rng.uniform(0.85, 1.15)
+        direct_factor = rng.uniform(0.9, 1.1)
+        defaults = _default_inputs(cfg)
+        u.indirect_steam = {
+            key: value * indirect_factor for key, value in defaults.indirect_steam.items()
+        }
+        u.direct_steam = {
+            key: value * direct_factor for key, value in defaults.direct_steam.items()
+        }
+        start = 121 + block * 120
+        x, _ = _run_dynamic_ticks(model, x, u, start, start + 119)
+
+    u = _default_inputs(cfg)
+    u.dt_resolve_interval_s = 120.0
+    x, _ = _run_dynamic_ticks(model, x, u, 601, 720)
+    assert x.dt_converged
+
+
+def test_dynamic_micro_coupling_matches_python_fallback(loaded, monkeypatch) -> None:
+    (model, x0), cfg = loaded
+    pd_indices = [
+        i for i, stage in enumerate(model.stages) if stage.role is StageRole.PREDESOLV
+    ]
+    x_jit = x0.copy()
+    x_python = x0.copy()
+    x_jit.solid_out[pd_indices[-1]] = 25.3
+    x_python.solid_out[pd_indices[-1]] = 25.3
+    u_jit = _with_fast_resolve(_default_inputs(cfg))
+    u_python = _with_fast_resolve(_default_inputs(cfg))
+    u_jit.feed_flow_rate = u_python.feed_flow_rate = 32.3
+
+    x_jit, _ = model.step(x_jit, u_jit, 1.0, 1.0)
+    monkeypatch.setattr(particle_jit, "JIT_DISABLED", True)
+    x_python, _ = model.step(x_python, u_python, 1.0, 1.0)
+
+    assert x_jit.dt_converged and x_python.dt_converged
+    assert x_jit.dt_outer_iterations == x_python.dt_outer_iterations
+    assert x_jit.dt_target_T == pytest.approx(x_python.dt_target_T, rel=1.0e-12, abs=1.0e-10)
+    assert x_jit.dt_target_X1 == pytest.approx(x_python.dt_target_X1, rel=1.0e-12, abs=1.0e-12)
+    assert x_jit.dt_target_X2 == pytest.approx(x_python.dt_target_X2, rel=1.0e-12, abs=1.0e-12)
 
 
 def test_more_steam_raises_dt_target_temperature(loaded) -> None:

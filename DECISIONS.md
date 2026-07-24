@@ -3,6 +3,22 @@
 Log of `DECIDE` choices made while building the DTDC simulator, per
 `Specifications/DTDC_Simulator_BuildSpec.md`. Newest entries at the top.
 
+## Stateful dynamic-trajectory qualification suite (2026-07-24)
+
+Routine regression now exercises the real macro integrator and real DT solver
+through complete timestamped trajectories, not only isolated steady closures.
+A shared per-tick oracle checks finite/bounded inventories, temperatures and
+compositions; nonnegative flows; plant-wide dry-solid accounting (allowing
+only explicit top-capacity rejection); and finite, bounded axial profiles.
+
+The deterministic suite includes 25→32.3→25 kg/s reversal, several slider
+changes before one scheduled resolve, physically infeasible low-steam
+rejection followed by atomic recovery, empty-vessel filling, a fixed-seed
+four-block combined-disturbance sequence, and full dynamic JIT/Python fallback
+equivalence. Existing tests retain gate flooding/backpressure, zone active-set,
+handover, mesh, and steady extreme coverage. The complete suite is 247 tests
+and takes about two minutes on the development machine.
+
 ## Runtime DT micro solve uses PHZ/FTRZ boundary throughflow (2026-07-24)
 
 The macro model is dynamic, but its periodic micro solve requires one conserved
