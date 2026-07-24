@@ -304,6 +304,7 @@ class Outputs:
     # can annotate the inter-tray flow arrows with a real number (the same
     # M/tau discharge `step()`'s own holdup balance uses).
     stage_solid_out_kg_s: dict[str, float]
+    dt_micro_throughflow_kg_s: float
     kpi_residual_hexane_ppm: float
     kpi_meal_moisture_pct: float
     kpi_steam_consumption_kg_per_t: float
@@ -648,6 +649,24 @@ class Model:
                 fills[stage.id] = min(max(u.feed_flow_rate / discharge_at_full, 1.0e-6), 1.0)
         return fills
 
+    def _dt_micro_throughflow(self, x: State, u: Inputs) -> float:
+        """Dry-solid flow crossing the macro PHZ/FTRZ role boundary.
+
+        The quasi-steady zonal solve still requires one conserved dry flow.
+        During inventory transients the offered feed is not that flow: use the
+        last PREDESOLV tray's actual gated discharge, which is the material
+        rate entering the FTRZ. Before the first macro tick has populated
+        ``solid_out``, retain the configured feed as the initialization
+        fallback.
+        """
+        boundary_indices = [
+            i for i, stage in enumerate(self.stages) if stage.role is StageRole.PREDESOLV
+        ]
+        if not boundary_indices:
+            return max(u.feed_flow_rate, 1.0e-9)
+        boundary_flow = float(x.solid_out[boundary_indices[-1]])
+        return boundary_flow if boundary_flow > 1.0e-9 else max(u.feed_flow_rate, 1.0e-9)
+
     def _dc_equilibrium(
         self,
         stage: StageSpec,
@@ -733,7 +752,7 @@ class Model:
             X1=u.feed_moisture,
             X2=u.feed_hexane,
             X3=u.feed_oil,  # M4: live DV, not the frozen c.oil_fraction (see Inputs.feed_oil)
-            m_dry_kg_s=max(u.feed_flow_rate, 1e-9),
+            m_dry_kg_s=self._dt_micro_throughflow(x, u),
         )
         vapor_feed = dt_solver.VaporFeed(
             m_water_kg_s=c.dt_vapor_feed_water_kg_s,
@@ -983,6 +1002,7 @@ class Model:
             stage_air_humidity_out=stage_air_humidity_out,
             stage_air_hexane_ppm=stage_air_hexane_ppm,
             stage_solid_out_kg_s=stage_solid_out_kg_s,
+            dt_micro_throughflow_kg_s=self._dt_micro_throughflow(x, u),
             kpi_residual_hexane_ppm=float(x.X2[-1] * 1.0e6),
             kpi_meal_moisture_pct=float(x.X1[-1] * 100.0),
             kpi_steam_consumption_kg_per_t=steam_kg_per_t,

@@ -79,6 +79,43 @@ def test_step_is_deterministic(loaded) -> None:
     assert y1.kpi_residual_hexane_ppm == y2.kpi_residual_hexane_ppm
 
 
+def test_dt_micro_throughflow_uses_predesolv_boundary_discharge(loaded) -> None:
+    (model, x0), cfg = loaded
+    u = _default_inputs(cfg)
+    x = x0.copy()
+    pd_indices = [
+        i for i, stage in enumerate(model.stages) if stage.role is StageRole.PREDESOLV
+    ]
+
+    # Initialization fallback before the macro flow field has populated.
+    assert model._dt_micro_throughflow(x, u) == pytest.approx(u.feed_flow_rate)
+
+    x.solid_out[pd_indices[-1]] = 23.75
+    assert model._dt_micro_throughflow(x, u) == pytest.approx(23.75)
+
+
+def test_high_feed_step_resolves_at_actual_dt_boundary_flow(loaded) -> None:
+    """Accumulating feed must not be treated as throughflow in the micro solve."""
+    (model, x0), cfg = loaded
+    u = _with_fast_resolve(_default_inputs(cfg))
+    u.feed_flow_rate = 32.3
+    x = x0.copy()
+    pd_indices = [
+        i for i, stage in enumerate(model.stages) if stage.role is StageRole.PREDESOLV
+    ]
+    x.solid_out[pd_indices[-1]] = 25.3
+
+    x_next, outputs = model.step(x, u, 1.0, 1.0)
+
+    assert x_next.dt_converged
+    assert outputs.dt_solver_converged
+    assert outputs.dt_micro_throughflow_kg_s == pytest.approx(
+        model._dt_micro_throughflow(x_next, u)
+    )
+    assert outputs.dt_micro_throughflow_kg_s < u.feed_flow_rate
+    assert x_next.dt_last_solve_sim_time == pytest.approx(1.0)
+
+
 def test_more_steam_raises_dt_target_temperature(loaded) -> None:
     """Direct, cheap test of the DT-role target mechanism itself (one
     solve_dt call per trajectory, not a long tick loop): halved vs doubled

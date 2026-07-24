@@ -3,6 +3,47 @@
 Log of `DECIDE` choices made while building the DTDC simulator, per
 `Specifications/DTDC_Simulator_BuildSpec.md`. Newest entries at the top.
 
+## Runtime DT micro solve uses PHZ/FTRZ boundary throughflow (2026-07-24)
+
+The macro model is dynamic, but its periodic micro solve requires one conserved
+dry-solid flow. It formerly used the offered feed rate even during inventory
+accumulation. A reproduced 25→32.3 kg/s step showed the mismatch at 120 s:
+32.3 kg/s offered, while the PREDESOLV discharges were
+28.94→26.32→25.31 kg/s and the DT bottom discharged 25.00 kg/s. Asking the
+partially loaded FTRZ to process 32.3 kg/s caused physical root rejections until
+720 s.
+
+Runtime `_resolve_dt` now uses the last PREDESOLV tray's actual net gated
+discharge: the dry-solid stream crossing the macro PHZ/FTRZ role boundary.
+The existing micro solve retains one conserved flow throughout, avoiding an
+invented dry-mass discontinuity; macro accumulation remains exclusively in the
+tray inventory balances. Before `solid_out` is initialized, configured feed is
+the fallback. At steady state boundary flow equals feed exactly.
+
+The same 32.3 kg/s transient now accepts its first 120 s solve in ~1.3 s wall
+time at a measured 25.31 kg/s boundary flow and follows the rising flow at
+later resolves. The HMI feed card exposes this micro boundary flow separately
+from offered feed. Full regression and physical publication validation remain
+mandatory because this is a macro/micro coupling correction, not a numerical
+accelerator.
+
+## FTRZ infeasibility retry optimization rejected (2026-07-24)
+
+A manual 25→32.3 kg/s feed step was reproduced with live bed holdup. DT
+attempts at 120–600 s simulation time correctly rejected because the
+then-loaded geometry had no positive FTRZ duty/thickness root; increasing
+inventory changed loaded depth and duty density until the first admissible
+wide-FTRZ solution appeared at 720 s.
+
+The 120 s resolve interval controls detection granularity but does not cause
+the physical rejections. Shortening it would attempt the same infeasible
+geometry more often. A prototype skipped the cold retry when a warm attempt
+reported no FTRZ root and reduced this reproduction from about 35.2 to 17.4 s.
+It was removed after the full suite exposed a counterexample: following a
+large steam-duty move, the stale warm vapor state could report no root while
+the cold physical initialization converged. The authoritative cold backup
+therefore remains mandatory.
+
 ## Dimensionless DT coupling convergence metric (2026-07-24)
 
 The outer convergence gate now reports and evaluates a dimensionless maximum:

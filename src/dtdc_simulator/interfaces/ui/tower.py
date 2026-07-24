@@ -306,6 +306,7 @@ class TowerView:
             with ui.row().classes("w-full gap-4 items-start no-wrap mt-1"):
                 with ui.column().classes("gap-1").style("min-width:150px;"):
                     self._feed_widgets["flow"] = theme.compact_metric("kg/s")
+                    self._feed_widgets["dt_flow"] = theme.compact_metric("DT boundary")
                     self._feed_widgets["T"] = theme.compact_metric("°C")
                     self._feed_widgets["hex"] = theme.compact_metric("% hex")
                     self._feed_widgets["water"] = theme.compact_metric("% H2O")
@@ -665,6 +666,10 @@ class TowerView:
 
         if self._feed_widgets:
             self._feed_widgets["flow"].text = f"{feed_flow:.2f} kg/s"
+            if outputs is not None:
+                self._feed_widgets["dt_flow"].text = (
+                    f"DT boundary {outputs.dt_micro_throughflow_kg_s:.2f} kg/s"
+                )
             self._feed_widgets["T"].text = f"{theme.k_to_c(feed_temperature_k):.1f} °C"
             self._feed_widgets["hex"].text = f"{feed_hex_pct:.1f}% hex (wet)"
             self._feed_widgets["water"].text = f"{feed_water_pct:.1f}% H2O (wet)"
