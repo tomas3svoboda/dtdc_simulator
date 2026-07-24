@@ -18,6 +18,9 @@ dev = [
     "ruff",
     "black",
 ]
+performance = [
+    "numba>=0.63",
+]
 
 [project.scripts]
 dtdc-sim = "dtdc_simulator.main:main"

@@ -1,0 +1,57 @@
+id: solver_performance_v1
+description: Macro-scale solver timing and convergence matrix.
+
+levels:
+  screening:
+    nz_phz: 8
+    nz_ftrz: 8
+    nz_dcz: 8
+    outer_tol: 0.1
+    outer_max_iter: 100
+    dcz_inner_max_iter: 100
+  realtime:
+    nz_phz: 20
+    nz_ftrz: 20
+    nz_dcz: 20
+    outer_tol: 0.05
+    outer_max_iter: 150
+    dcz_inner_max_iter: 100
+  reference:
+    nz_phz: 32
+    nz_ftrz: 32
+    nz_dcz: 32
+    outer_tol: 0.01
+    outer_max_iter: 300
+    dcz_inner_max_iter: 500
+
+# End points remain within the configured UI/envelope bounds. The combined
+# trajectory deliberately makes several simultaneous, opposing moves.
+trajectories:
+  throughput_ramp:
+    steps: 5
+    start: {feed_flow_rate: 18.0}
+    end: {feed_flow_rate: 32.0}
+  feed_severity_ramp:
+    steps: 5
+    start: {feed_temperature: 323.15, feed_moisture: 0.08, feed_hexane: 0.22}
+    end: {feed_temperature: 343.15, feed_moisture: 0.16, feed_hexane: 0.38}
+  steam_swing:
+    steps: 5
+    start: {indirect_steam_factor: 0.55, direct_steam_factor: 0.65}
+    end: {indirect_steam_factor: 1.35, direct_steam_factor: 1.25}
+  combined_extreme:
+    steps: 5
+    start:
+      feed_flow_rate: 18.0
+      feed_temperature: 343.15
+      feed_moisture: 0.08
+      feed_hexane: 0.22
+      indirect_steam_factor: 1.35
+      direct_steam_factor: 1.25
+    end:
+      feed_flow_rate: 32.0
+      feed_temperature: 323.15
+      feed_moisture: 0.16
+      feed_hexane: 0.38
+      indirect_steam_factor: 0.55
+      direct_steam_factor: 0.65

@@ -121,6 +121,19 @@ def gab_hexane_content_and_slope(a_h: float, T: float, p: GabParams) -> tuple[fl
     return value, slope
 
 
+def gab_hexane_slope(a_h: float, T: float, p: GabParams) -> float:
+    """Exact ``dW2_eq/da_h`` without computing the unused loading value."""
+    if not 0.0 <= a_h <= 1.0:
+        raise ValueError(f"hexane activity a_h must be in [0,1], got {a_h}")
+    C = p.C0 * math.exp(p.dHC_R / T)
+    K = p.K0 * math.exp(p.dHK_R / T)
+    a_h = _gab_clamp_activity(a_h, K)
+    x = K * a_h
+    denominator = (1.0 - x) * (1.0 - x + C * x)
+    # d/da of Xm*C*x/((1-x)*(1+(C-1)*x)), where x=K*a.
+    return p.Xm * C * K * (1.0 + (C - 1.0) * x * x) / (denominator * denominator)
+
+
 def oil_hexane_content_and_slope(a_h: float, p: OilIsotherm) -> tuple[float, float]:
     """`(qo, dqo/da_h)` for the power-law oil isotherm `qo = A0*a_h^B` (eq. 7).
     Analytic companion to `oil_hexane_content`, same rationale as
@@ -131,6 +144,13 @@ def oil_hexane_content_and_slope(a_h: float, p: OilIsotherm) -> tuple[float, flo
     value = p.A0 * a_h**p.B
     slope = p.A0 * p.B * a_h ** (p.B - 1.0) if a_h > 0.0 else 0.0
     return value, slope
+
+
+def oil_hexane_slope(a_h: float, p: OilIsotherm) -> float:
+    """Exact ``dqo/da_h`` without computing the unused oil loading."""
+    if not 0.0 <= a_h <= 1.0:
+        raise ValueError(f"hexane activity a_h must be in [0,1], got {a_h}")
+    return p.A0 * p.B * a_h ** (p.B - 1.0) if a_h > 0.0 else 0.0
 
 
 def hexane_activity_from_loading(W2: float, T: float, p: GabParams, a_h_max: float = 1.0) -> float:
@@ -248,6 +268,34 @@ def x2_so_and_slope(
     value = W2 + X3 * qo
     slope = dW2 + X3 * dqo
     return value, slope
+
+
+def x2_so_slope(
+    a_h: float,
+    T: float,
+    X3: float,
+    gab: GabParams,
+    oil: OilIsotherm,
+) -> float:
+    """Derivative-only companion to :func:`x2_so_and_slope`."""
+    if not 0.0 <= a_h <= 1.0:
+        raise ValueError(f"hexane activity a_h must be in [0,1], got {a_h}")
+    C = gab.C0 * math.exp(gab.dHC_R / T)
+    K = gab.K0 * math.exp(gab.dHK_R / T)
+    clamped_a_h = _gab_clamp_activity(a_h, K)
+    x = K * clamped_a_h
+    denominator = (1.0 - x) * (1.0 - x + C * x)
+    gab_slope = (
+        gab.Xm
+        * C
+        * K
+        * (1.0 + (C - 1.0) * x * x)
+        / (denominator * denominator)
+    )
+    oil_slope = (
+        oil.A0 * oil.B * a_h ** (oil.B - 1.0) if a_h > 0.0 else 0.0
+    )
+    return gab_slope + X3 * oil_slope
 
 
 def x2_equilibrium(

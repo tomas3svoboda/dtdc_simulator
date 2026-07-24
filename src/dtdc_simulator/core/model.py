@@ -26,6 +26,7 @@ DC (dryer/cooler) stages now use `core/dc.py`'s real air-contacting balance
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from enum import Enum
@@ -34,6 +35,8 @@ import numpy as np
 
 from dtdc_simulator.core import dc, dt_solver
 from dtdc_simulator.core.zones import ftrz
+
+logger = logging.getLogger(__name__)
 
 R_GAS = 8.314462618  # J/(mol K)
 
@@ -593,7 +596,8 @@ class Model:
         fixed configured conductance and therefore are not exposed as fictitious
         PLC actuators. All device types currently share the calibrated closure:
 
-            m_out = (M/M_max) * (position/50) * capacity_factor
+            m_out = (M/M_max) * (position/50) * (shaft_rpm/3)
+                    * capacity_factor
                     * nominal_discharge_kg_s
 
         Separating topology from this closure lets an identified device-specific
@@ -611,6 +615,7 @@ class Model:
         return (
             (m_hold / m_max)
             * (position / 50.0)
+            * (_shaft_rpm(self.stages, u.sweep_arm_speed) / 3.0)
             * transfer.capacity_factor
             * self.nominal_discharge_kg_s
         )
@@ -632,7 +637,10 @@ class Model:
                 else transfer.fixed_position_pct
             )
             discharge_at_full = (
-                (position / 50.0) * transfer.capacity_factor * self.nominal_discharge_kg_s
+                (position / 50.0)
+                * (_shaft_rpm(self.stages, u.sweep_arm_speed) / 3.0)
+                * transfer.capacity_factor
+                * self.nominal_discharge_kg_s
             )
             if discharge_at_full <= 0.0:
                 fills[stage.id] = 1.0
@@ -737,8 +745,11 @@ class Model:
             _reconstruct_warm_start_vapor_in(x, vapor_feed, trays) if has_warm_start else None
         )
         warm_T_L_sup = x.dt_warm_start_T_L_sup if has_warm_start else None
-        try:
-            result = dt_solver.solve_dt(
+        def _solve(
+            warm_vapor: ftrz.VaporState | None,
+            warm_temperature: float | None,
+        ) -> dt_solver.DTResult:
+            return dt_solver.solve_dt(
                 trays,
                 solid_feed,
                 vapor_feed,
@@ -750,21 +761,37 @@ class Model:
                 outer_max_iter=c.dt_outer_max_iter,
                 dcz_inner_max_iter=c.dt_dcz_inner_max_iter,
                 outer_relaxation=c.dt_outer_relaxation,
-                warm_start_vapor_in=warm_vapor_in,
-                warm_start_T_L_sup=warm_T_L_sup,
+                warm_start_vapor_in=warm_vapor,
+                warm_start_T_L_sup=warm_temperature,
                 sweep_arm_rpm=_shaft_rpm(self.stages, u.sweep_arm_speed),
             )
+
+        try:
+            try:
+                result = _solve(warm_vapor_in, warm_T_L_sup)
+                dt_solver.validate_dt_result(result, solid_feed, c.dt_constants)
+            except Exception as warm_error:
+                # A previous operating point is only an accelerator, never part
+                # of the physical state. Large operator moves can put that guess
+                # outside the new solve's basin even though the new operating
+                # point has a valid solution. Retry from the solver's physical
+                # defaults before deciding that the update is inadmissible.
+                if not has_warm_start:
+                    raise
+                logger.info("DT warm-start solve rejected; retrying cold: %s", warm_error)
+                result = _solve(None, None)
+                dt_solver.validate_dt_result(result, solid_feed, c.dt_constants)
             x_next.dt_outer_iterations = result.outer_iterations
-            dt_solver.validate_dt_result(result, solid_feed, c.dt_constants)
             _apply_dt_result(x_next, result)
             x_next.dt_converged = True
             return True
-        except Exception:
+        except Exception as error:
             # Keep last accepted targets/profile; SolverStress picks up
             # dt_converged=False.  The separate last-attempt timestamp prevents
             # a persistent failure from retrying every tick without falsely
             # claiming the stale profile was freshly resolved.
             x_next.dt_converged = False
+            logger.warning("DT operating-point update rejected; retaining last valid profile: %s", error)
             return False
 
     def step(self, x: State, u: Inputs, t: float, dt: float) -> tuple[State, Outputs]:

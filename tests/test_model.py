@@ -267,6 +267,59 @@ def test_narrower_gate_raises_steady_state_bed_level(loaded) -> None:
     assert y_narrow.stage_level_pct["MN1"] > y_wide.stage_level_pct["MN1"]
 
 
+def test_faster_sweep_arm_lowers_uncontrolled_tray_levels(loaded) -> None:
+    """The sweep arm is the tray's mechanical conveyor: at the same feed and
+    drop-hole opening, faster rotation must increase discharge capacity and
+    therefore lower the settled bed level, including passive boundaries."""
+    (model, x0), cfg = loaded
+    u_slow = _default_inputs(cfg)
+    u_slow.sweep_arm_speed = {k: 1.5 for k in u_slow.sweep_arm_speed}
+    u_fast = _default_inputs(cfg)
+    u_fast.sweep_arm_speed = {k: 6.0 for k in u_fast.sweep_arm_speed}
+
+    x_slow, x_fast = x0.copy(), x0.copy()
+    for _ in range(800):
+        x_slow, y_slow = model.step(x_slow, u_slow, 0.0, 5.0)
+        x_fast, y_fast = model.step(x_fast, u_fast, 0.0, 5.0)
+
+    for stage_id in ("PD1", "PD2", "PD3", "DR1", "CL1"):
+        assert y_fast.stage_level_pct[stage_id] < y_slow.stage_level_pct[stage_id]
+
+
+def test_warmer_dryer_air_removes_more_hexane(loaded) -> None:
+    """Residual solvent volatility must rise, not fall, with dryer-air heat."""
+    (model, x0), cfg = loaded
+    dryer = next(stage for stage in model.stages if stage.role is StageRole.DRYER)
+    inlet_index = list(model.stages).index(dryer) - 1
+    T_in, X1_in, X2_in = x0.T[inlet_index], x0.X1[inlet_index], x0.X2[inlet_index]
+    u_cold = _default_inputs(cfg)
+    u_cold.heated_air_temp = 310.0
+    u_hot = _default_inputs(cfg)
+    u_hot.heated_air_temp = 370.0
+
+    cold = model._dc_equilibrium(dryer, T_in, X1_in, X2_in, u_cold, model._stage_tau(dryer, u_cold))
+    hot = model._dc_equilibrium(dryer, T_in, X1_in, X2_in, u_hot, model._stage_tau(dryer, u_hot))
+
+    assert hot[0] > cold[0]
+    assert hot[2] < cold[2]
+
+
+def test_dt_update_retries_without_stale_warm_start(loaded) -> None:
+    """A valid operator move must not leave the old DT hexane profile pinned
+    merely because the preceding operating point is a poor initial guess."""
+    (model, x0), cfg = loaded
+    u = _with_fast_resolve(_default_inputs(cfg))
+    u.indirect_steam = {
+        stage_id: (0.0 if stage_id.startswith("PD") else duty)
+        for stage_id, duty in u.indirect_steam.items()
+    }
+
+    x_next, _ = model.step(x0, u, 1.0, 1.0)
+
+    assert x_next.dt_converged
+    assert x_next.dt_target_X2.tolist() != x0.dt_target_X2.tolist()
+
+
 def test_mass_inventory_holdup_settles_at_steady_state(loaded) -> None:
     """Outputs.mass_inventory (mass/energy balance quality gate follow-up,
     DECISIONS.md): a cheap, always-on plant-wide holdup diagnostic -- "is

@@ -27,6 +27,19 @@ from dtdc_simulator.core.zones import ftrz
 from dtdc_simulator.core.zones import particle as pt
 from dtdc_simulator.core.zones import phz as phz_mod
 
+
+def test_coupling_residual_shadow_metric_uses_dimensionless_tolerances() -> None:
+    residuals = dts.DTCouplingResiduals(
+        solid_interface_T=0.025,
+        vapor_interface_T=0.05,
+        vapor_interface_hexane_fraction=0.01,
+        vapor_interface_water_flow=0.02,
+        vapor_interface_hexane_flow=0.005,
+        ftrz_length=0.0005,
+    )
+    assert residuals.maximum_scaled(0.05) == pytest.approx(1.0)
+
+
 # Reference numbers matching test_phz.py/test_ftrz.py/test_dcz.py exactly
 # (Fig. 1 base case dry-solid basis, and Coletto supp. Table 1's real
 # oil-isotherm/particle constants), so this suite is grounded in the same

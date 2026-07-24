@@ -352,7 +352,12 @@ def cell_thickness_m(
     J_Q_cs = dH_vap_water * condensed_water_kg_s / A_bed_m2
     denominator = A_bed_m2 * alpha_L * aV_m2_per_m3 * (J_Q_cs + J_Q_cv)
     if denominator <= 0.0:
-        raise ValueError("FTRZ heat-transfer driving force must be positive")
+        raise ValueError(
+            "FTRZ heat-transfer driving force must be positive "
+            f"(T_V={T_V:.6g} K, T_L={T_L:.6g} K, J_Q_cv={J_Q_cv:.6g} W/m2, "
+            f"J_Q_cs={J_Q_cs:.6g} W/m2, condensed_water={condensed_water_kg_s:.6g} kg/s, "
+            f"required_heat={required_heat_w:.6g} W)"
+        )
     return required_heat_w / denominator
 
 
@@ -369,6 +374,48 @@ class FTRZZoneResult:
     @property
     def vapor_out(self) -> VaporState:
         return self.cells[0].vapor_out
+
+
+def _thickness_bracket(
+    residual_at: Callable[[float], float],
+    minimum_dz: float,
+    warm_dz: float | None,
+) -> tuple[float, float] | None:
+    """Bracket the positive cell root, preferring a safeguarded local search."""
+
+    def search(candidates: tuple[float, ...]) -> tuple[float, float] | None:
+        previous_valid: tuple[float, float] | None = None
+        for candidate in candidates:
+            try:
+                residual = residual_at(candidate)
+            except ValueError:
+                continue
+            if abs(residual) <= 1.0e-14:
+                return candidate, candidate
+            if previous_valid is not None and residual * previous_valid[1] < 0.0:
+                return previous_valid[0], candidate
+            previous_valid = candidate, residual
+        return None
+
+    if warm_dz is not None and math.isfinite(warm_dz) and warm_dz > 0.0:
+        local_candidates = tuple(
+            sorted(
+                {
+                    max(minimum_dz, warm_dz * factor)
+                    for factor in (0.5, 1.0, 2.0)
+                }
+            )
+        )
+        local = search(local_candidates)
+        if local is not None:
+            return local
+
+    global_candidates = tuple(
+        multiplier * 10.0**exponent
+        for exponent in range(-12, 2)
+        for multiplier in (1.0, 2.0, 5.0)
+    )
+    return search(global_candidates)
 
 
 def solve_ftrz_zone(
@@ -391,12 +438,12 @@ def solve_ftrz_zone(
     """Solve the FTRZ, discretized into `nz` cells of thickness computed from
     the energy balance (eq. A.18), via the fixed-point iteration the paper
     itself describes for the free boundary `L_FTRZ` ("updated after each
-    iteration", §A.2.2): guess `L_FTRZ` -> size each cell's duty from the
-    local/length-averaged `q_Iv_w_m3` and the current guess
-    (`q_Iv_w_m3(L_FTRZ)*A_bed*(L_FTRZ/nz)`)
-    -> march the vapor bottom-to-top solving each cell (`solve_ftrz_cell` +
-    `cell_thickness_m`) -> recompute `L_FTRZ = sum(dz_j)` (eq. A.21) -> repeat
-    until it stops moving.
+    iteration", §A.2.2): guess `L_FTRZ` -> obtain its local/length-averaged
+    `q_Iv_w_m3` -> march the vapor bottom-to-top while solving each variable
+    cell's implicit `dz_j = A.18(q_Iv*A_bed*dz_j)` closure -> recompute
+    `L_FTRZ = sum(dz_j)` (eq. A.21) -> repeat until it stops moving. The outer
+    iteration remains necessary when the free boundary crosses real trays and
+    therefore changes the length-averaged duty density.
     """
     A_bed_m2 = math.pi / 4.0 * diameter_m**2
     alpha_L = 1.0 - c.bed_porosity
@@ -425,23 +472,13 @@ def solve_ftrz_zone(
 
     L_FTRZ = L_FTRZ_initial_guess_m
     cells_bottom_to_top: list[FTRZCellResult] = []
+    previous_cell_dz: tuple[float, ...] | None = None
     iterations = 0
     for iterations in range(1, max_outer_iter + 1):
         q_density_w_m3 = q_Iv_w_m3(L_FTRZ) if callable(q_Iv_w_m3) else q_Iv_w_m3
-        q_cell_w = (
-            q_density_w_m3 * A_bed_m2 * (L_FTRZ / nz)
-        )  # uniform share per cell of this iteration's guess
-
         cells_bottom_to_top = []
         vapor = vapor_in
         for k in range(nz):
-            vapor_out, condensed_kg_s, is_sat = solve_ftrz_cell(
-                vapor,
-                hexane_evap_kg_s,
-                q_cell_w,
-                c,
-                sensible_heat_to_solid_w=vapor_sensible_load_cell_w,
-            )
             # The driving force behind this cell's heat/mass transfer (hence
             # T_L, X2_cr, and dz below) reflects the solid as it ENTERS the
             # cell, still carrying its wet core — using the EXIT state here
@@ -451,42 +488,110 @@ def solve_ftrz_zone(
             # being removed within that cell (division by zero in
             # `cell_thickness_m`). k=0 is the bottommost cell.
             X2_entrance = X2_inf + (k + 1) * (hexane_evap_kg_s / m_dry_kg_s)
-            X2_cr = thermo.x2_critical(
-                c.alpha_pg,
-                thermo.rho_hexane_liquid(vapor_out.T),
-                c.alpha_ps,
-                c.rho_ps,
-                empirical=c.x2_critical_empirical,
-            )
-            T_L_front = solid_temperature(X2_entrance, X2_cr, X2_inf, c.T_boil_hexane, vapor_out.T)
             progress_from_top = (nz - k) / nz
+            # Reported/exit state (matching zones/phz.py's "cell holds the
+            # state after passing through it" convention): one increment
+            # below the entrance value.
+            X2_here = X2_inf + k * (hexane_evap_kg_s / m_dry_kg_s)
+
+            def evaluate_thickness(
+                candidate_dz_m: float,
+            ) -> tuple[float, VaporState, float, bool, float]:
+                # The mesh is energy-driven and therefore nonuniform. Jacket
+                # duty must follow this cell's own candidate volume, not the
+                # uniform L/nz share of the previous free-boundary iterate.
+                # Solving dz = A.18(duty(dz)) removes that mesh-dependent
+                # lag at the PHZ/FTRZ handover.
+                candidate_q_w = q_density_w_m3 * A_bed_m2 * candidate_dz_m
+                candidate_vapor, candidate_condensed, candidate_sat = solve_ftrz_cell(
+                    vapor,
+                    hexane_evap_kg_s,
+                    candidate_q_w,
+                    c,
+                    sensible_heat_to_solid_w=vapor_sensible_load_cell_w,
+                )
+                candidate_T_L_front = min(
+                    solid_temperature(
+                        X2_entrance,
+                        thermo.x2_critical(
+                            c.alpha_pg,
+                            thermo.rho_hexane_liquid(candidate_vapor.T),
+                            c.alpha_ps,
+                            c.rho_ps,
+                            empirical=c.x2_critical_empirical,
+                        ),
+                        X2_inf,
+                        c.T_boil_hexane,
+                        candidate_vapor.T,
+                    ),
+                    vapor_in.T,
+                )
+                predicted_dz = cell_thickness_m(
+                    hexane_evap_kg_s,
+                    c.dH_vap_hexane,
+                    candidate_condensed,
+                    c.vapor_enthalpy_ref.dH_vap_water,
+                    hQ,
+                    candidate_vapor.T,
+                    candidate_T_L_front,
+                    A_bed_m2,
+                    alpha_L,
+                    aV_m2_per_m3,
+                    sensible_heat_w=front_sensible_adjustment_cell_w,
+                    minimum_thickness_m=1.0e-9 / nz,
+                )
+                return (
+                    candidate_dz_m - predicted_dz,
+                    candidate_vapor,
+                    candidate_condensed,
+                    candidate_sat,
+                    candidate_T_L_front,
+                )
+
+            minimum_dz = 1.0e-9 / nz
+            cell_heat_requirement_w = (
+                hexane_evap_kg_s * c.dH_vap_hexane
+                + front_sensible_adjustment_cell_w
+            )
+            collapsed_heat_tolerance_w = max(
+                1.0e-9, 1.0e-12 * abs(hexane_evap_kg_s * c.dH_vap_hexane)
+            )
+            bracket: tuple[float, float] | None = (
+                (minimum_dz, minimum_dz)
+                if cell_heat_requirement_w <= collapsed_heat_tolerance_w
+                else None
+            )
+            if bracket is None:
+                warm_dz = previous_cell_dz[k] if previous_cell_dz is not None else None
+                bracket = _thickness_bracket(
+                    lambda candidate: evaluate_thickness(candidate)[0],
+                    minimum_dz,
+                    warm_dz,
+                )
+            if bracket is None:
+                raise ValueError(
+                    "FTRZ cell duty/thickness closure has no positive root; "
+                    f"bottom-index={k}/{nz - 1}, vapor_in_T={vapor.T:.6g} K, "
+                    f"X2_entrance={X2_entrance:.6g}, X2_inf={X2_inf:.6g}, "
+                    f"L_guess={L_FTRZ:.6g} m, q_density={q_density_w_m3:.6g} W/m3"
+                )
+            dz = (
+                bracket[0]
+                if bracket[0] == bracket[1]
+                else brentq(lambda value: evaluate_thickness(value)[0], *bracket)
+            )
+            _, vapor_out, condensed_kg_s, is_sat, T_L_front = evaluate_thickness(dz)
             if T_solid_in <= c.T_boil_hexane:
                 # Cold meal approaches the receding-front temperature.
-                T_L = T_L_front + (1.0 - progress_from_top) * (T_solid_in - c.T_boil_hexane)
+                T_L = T_L_front + (1.0 - progress_from_top) * (
+                    T_solid_in - c.T_boil_hexane
+                )
             else:
                 # A hot matrix cools only by the energy actually credited to
                 # pore evaporation; a vanishing front cannot dump all stored
                 # sensible heat into the vapor.
                 T_matrix = T_solid_in - progress_from_top * matrix_temperature_drop_k
                 T_L = max(T_L_front, T_matrix)
-            # Reported/exit state (matching zones/phz.py's "cell holds the
-            # state after passing through it" convention): one increment
-            # below the entrance value.
-            X2_here = X2_inf + k * (hexane_evap_kg_s / m_dry_kg_s)
-            dz = cell_thickness_m(
-                hexane_evap_kg_s,
-                c.dH_vap_hexane,
-                condensed_kg_s,
-                c.vapor_enthalpy_ref.dH_vap_water,
-                hQ,
-                vapor_out.T,
-                T_L_front,
-                A_bed_m2,
-                alpha_L,
-                aV_m2_per_m3,
-                sensible_heat_w=front_sensible_adjustment_cell_w,
-                minimum_thickness_m=1.0e-9 / nz,
-            )
             cells_bottom_to_top.append(
                 FTRZCellResult(
                     solid=SolidState(T=T_L, X1=0.0, X2=X2_here),  # X1 filled in below
@@ -503,6 +608,7 @@ def solve_ftrz_zone(
             vapor = vapor_out
 
         L_FTRZ_new = sum(cell.dz_m for cell in cells_bottom_to_top)
+        previous_cell_dz = tuple(cell.dz_m for cell in cells_bottom_to_top)
         if abs(L_FTRZ_new - L_FTRZ) < outer_tol_m:
             L_FTRZ = L_FTRZ_new
             break

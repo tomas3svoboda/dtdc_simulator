@@ -3,6 +3,163 @@
 Log of `DECIDE` choices made while building the DTDC simulator, per
 `Specifications/DTDC_Simulator_BuildSpec.md`. Newest entries at the top.
 
+## Dimensionless DT coupling convergence metric (2026-07-24)
+
+The outer convergence gate now reports and evaluates a dimensionless maximum:
+temperature, vapor fraction, and component-flow residuals are divided by the
+existing `outer_tol`; FTRZ length is divided by `min(outer_tol, 1 mm)`. These
+are exactly the previous thresholds expressed explicitly, so this is an
+algebraic normalization rather than tolerance retuning.
+
+Shadow evaluation over the screening matrix classified the same 32 valid and
+3 invalid records; the largest valid scaled residual was 0.983. Iteration
+counts and outputs remained unchanged before adopting the normalized form.
+
+## Screening-envelope infeasibilities classified (2026-07-24)
+
+The three invalid screening records are two physical endpoints, not iteration
+failures. The minimum-steam `steam_swing` point supplies FTRZ vapor at
+339.48 K, below the 341.9 K hexane front, producing a negative convective heat
+driving force with no compensating condensation. The minimum-steam endpoint of
+`combined_extreme` combines 32 kg/s with the coldest, wettest, highest-hexane
+feed and only 1266 W/m3 jacket density; both warm and cold starts independently
+have no positive FTRZ duty/thickness root. Its adjacent 75% point succeeds from
+both starts. These cases remain honestly rejected as operationally infeasible.
+
+## Immutable particle-cascade invariants retained (2026-07-24)
+
+The DCZ now materializes read-only NumPy arrays for initial particle loading,
+initial temperature, shell volumes, and face areas once per zone solve and
+shares them with the mass and energy JIT cascades. Dynamic profiles and solver
+work arrays remain private per call. Reference timing improved modestly from
+7.59 to 7.26 s with identical iterations and outputs.
+
+## Solve-local FTRZ cell-root warm brackets retained (2026-07-24)
+
+Each FTRZ cell now tries a safeguarded `(0.5, 1, 2) × previous dz` bracket from
+the preceding free-boundary iteration before using the original logarithmic
+global scan. The warm thicknesses exist only inside one `solve_ftrz_zone`
+invocation; a new GUI solve starts with no root history. Invalid local
+evaluations and unbracketed local roots unconditionally fall back to the
+unchanged global search.
+
+Brent's root equation, tolerance, and physical phase calculations are
+unchanged. At 32 kg/s the realtime/reference solves retained 57/263 outer
+iterations, both handovers, and sub-`1e-9 ppm` output differences. Measured
+warm-cache time improved to 2.76/7.59 s from the preceding 3.74/11.23 s
+particle-JIT measurements. The full test suite and the 35-case screening
+matrix retained their established outcomes.
+
+## DCZ bed-energy smooth-path JIT rejected (2026-07-24)
+
+Post-particle-JIT profiling still showed meaningful scalar work in the
+bottom-to-top DCZ vapor-energy march. A conservative compiled prototype handled
+only the smooth algebraic regime and requested a complete Python recomputation
+whenever either condensation branch activated; wet-temperature pinning remained
+an exact deterministic clamp. Kernel and complete-solver equivalence passed.
+
+The production stress cases cross condensation branches frequently, so the
+compiled attempt was commonly discarded. Array conversion plus recomputation
+slowed realtime/reference runs to about 6.33/14.70 s versus the retained
+3.74/11.23 s particle-JIT baseline. The prototype and its tests were removed.
+Compiling the entire branch-heavy active-set loop is not justified while FTRZ
+root evaluation is the larger measured hotspot.
+
+## Optional LLVM-JIT particle energy cascade (2026-07-24)
+
+The Numba backend now compiles the complete sequential particle energy cascade
+in one call: GAB/oil slopes, bounded heat of sorption, axial source addition,
+moisture-weighted heat capacity, tridiagonal assembly and solve, and the
+off-design temperature clamp. Cell `j` still consumes cell `j-1`'s updated
+temperature, exactly matching the authoritative Python march. Strict float64
+semantics are retained and fast-math remains disabled.
+
+Layer-level comparison matches the Python cascade within `2e-14` relative
+error. A complete realtime 32 kg/s JIT/Python comparison retained 57 outer
+iterations, both handovers, and differed by less than `1e-9 ppm` meal hexane.
+Warm-cache measurements were 3.74 s realtime and 11.23 s reference, versus the
+previous mass-only JIT measurements of 7.51 s and 19.42 s. Timing varies by
+machine load, so these remain indicative rather than contractual.
+
+## Optional LLVM-JIT particle mass cascade (2026-07-24)
+
+Numba 0.66 (Python 3.14 compatible) is available through the optional
+`performance` dependency. When installed, one compiled call performs the
+complete DCZ particle mass cascade across all axial cells: derivative-only
+GAB/oil slopes, tridiagonal assembly, Thomas solve, rate calculation, and bulk
+particle loading. This avoids crossing Python/JIT boundaries per particle or
+layer. `float64` is used throughout and `fastmath` is deliberately disabled.
+
+The compiled backend is selected automatically when available. The exact
+Python implementation remains authoritative fallback behavior when Numba is
+absent or `DTDC_DISABLE_JIT=1`. The first call compiles during model
+initialization; Numba's disk cache serves subsequent processes.
+
+At the 32 kg/s stress point, realtime improved 11.92→7.51 s and reference
+~28.0→19.42 s. Outer iterations stayed exactly 57/263, both handovers passed,
+and output differences were below 4e-9 ppm meal hexane. Focused cascade tests
+match the Python kernel within 2e-14 relative error. The JIT backend is
+therefore preferred when installed, unlike the outer acceleration and inexact
+DCZ maps, which were removed because they change the nonlinear iteration path.
+
+## Exact DCZ constitutive-kernel deduplication (2026-07-24)
+
+The exact solver path now avoids three repeated calculations:
+
+1. The particle mass Jacobian uses a derivative-only
+   `x2_so_slope`/`gab_hexane_slope` kernel instead of computing and discarding
+   the GAB/oil loading values.
+2. The shell geometry stores its invariant total volume, so every particle
+   bulk mean no longer re-sums the same 12 shell volumes.
+3. DCZ reuses the already-computed final `x2_particle` values for convergence
+   and result assembly instead of recomputing the exit and all final cells.
+
+The accumulation slope is evaluated inline while assembling the tridiagonal
+mass matrix, removing a separate 12-layer tuple and loop. The derivative-only
+kernel is algebraically identical to the combined value/slope formula and is
+covered across activity and temperature. A 500k-call microbenchmark improved
+from 0.78 to 0.48 s. At the 32 kg/s stress point, realtime improved
+13.09→11.92 s and reference repeated at 27.57/28.44 s versus the comparable
+29.57 s baseline. Iterations remained exactly 57/263; output differences were
+below 3e-9 ppm (realtime) and 3e-8 ppm (reference). This optimization is always
+enabled because it changes neither the nonlinear map nor its iteration path.
+
+## Rejected outer-map experiments removed (2026-07-24)
+
+Depth-one outer acceleration and cap-limited DCZ outer maps were tested and
+rejected. Acceleration was not consistently faster and shifted meal hexane by
+up to 170 ppm. Publishing partial DCZ maps reduced some timings but changed the
+nonlinear path, shifted outputs by 25-66 ppm, and could hit the reference
+iteration cap. Their solver parameters, state machinery, CLI switches, tests,
+and generated result files were removed rather than retained as dormant
+options. Only exact, fully converged DCZ maps reach the outer update.
+
+## Mesh-consistent FTRZ jacket duty and PHZ/FTRZ feasibility (2026-07-24)
+
+The performance matrix exposed a false mesh-dependent feasibility result at
+32 kg/s: 8/20-cell FTRZ meshes converged while 32 cells raised a negative
+heat-transfer-driving-force error. The failing fine cell had `T_V=341.860 K`
+and `T_L=341.900 K`; it received only 40.7 W of jacket duty from the previous
+`L_FTRZ/nz` guess while carrying 123 kW of latent/sensible demand.
+
+The cause was inconsistent with the variable-cell A.18 geometry. FTRZ cells
+have individually solved `dz_j`, but jacket duty was distributed as though
+they were uniform: `q_Iv*A*(L_previous/nz)`. Each cell now solves the implicit
+local closure
+
+`dz_j = A.18(q_cell)`, where `q_cell = q_Iv*A*dz_j`,
+
+with a bracketed scalar root. The outer loop remains because the tray-averaged
+`q_Iv` can change when the total free boundary crosses a real tray boundary.
+The wet-front bulk temperature remains capped by the zone inlet vapor
+temperature, preserving Coletto's approach-to-`T_V,inf` behavior.
+
+At 32 kg/s all 8/20/32 meshes now converge from cold starts and pass both
+handover gates. Measured costs were 2.93/13.09/29.57 s and 22/57/263 outer
+iterations. Feasibility is resolved, but the tighter solve's iteration count
+and the remaining mesh dependence of meal hexane (836/491/716 ppm) are now
+separate performance/accuracy targets rather than hidden interface failures.
+
 ## Equipment envelope locked; DC steam-drying trays not supported (2026-07-24)
 
 Foundation for the strict/superset OPC UA interface: a fixed *equipment

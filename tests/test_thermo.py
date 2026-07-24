@@ -218,3 +218,25 @@ def test_dew_point_enthalpy_matches_curve_at_its_own_dew_temperature() -> None:
     T_dew = th.dew_point_temperature(Y_V2, ANTOINE_WATER)
     H_sat = th.dew_point_enthalpy_water_basis(Y_V2, ANTOINE_WATER, ref)
     assert H_sat == pytest.approx(th.vapor_enthalpy_water_basis(Y_V2, T_dew, ref))
+
+
+@pytest.mark.parametrize("activity", [1.0e-6, 0.1, 0.5, 0.9])
+@pytest.mark.parametrize("temperature", [320.0, 380.0, 450.0])
+def test_derivative_only_isotherm_kernels_match_combined_kernels(
+    activity: float, temperature: float
+) -> None:
+    _, gab_slope = th.gab_hexane_content_and_slope(activity, temperature, SOYBEAN_GAB)
+    _, oil_slope = th.oil_hexane_content_and_slope(activity, SOYBEAN_OIL)
+    _, total_slope = th.x2_so_and_slope(
+        activity, temperature, 0.0139, SOYBEAN_GAB, SOYBEAN_OIL
+    )
+
+    assert th.gab_hexane_slope(activity, temperature, SOYBEAN_GAB) == pytest.approx(
+        gab_slope, rel=2.0e-15
+    )
+    assert th.oil_hexane_slope(activity, SOYBEAN_OIL) == pytest.approx(
+        oil_slope, rel=2.0e-15
+    )
+    assert th.x2_so_slope(
+        activity, temperature, 0.0139, SOYBEAN_GAB, SOYBEAN_OIL
+    ) == pytest.approx(total_slope, rel=2.0e-15)

@@ -186,6 +186,43 @@ def test_zone_length_is_thin_relative_to_a_full_tray() -> None:
     assert result.iterations < 50  # the outer L_FTRZ fixed-point loop converged
 
 
+def test_variable_cell_jacket_duty_is_mesh_independent() -> None:
+    """Each nonuniform A.18 cell owns q_Iv*A*dz, not a stale L/nz share."""
+    vapor_in = ftrz.VaporState(m_water_kg_s=5.0, m_hex_kg_s=0.5, T=373.0)
+    results = [
+        _solve(vapor_in, X2_sup=0.10, q_Iv_w_m3=2.0e5, nz=nz)
+        for nz in (8, 20, 32)
+    ]
+
+    lengths = [result.L_FTRZ_m for result in results]
+    assert max(lengths) - min(lengths) < 0.01
+    assert results[-1].solid_out.X2 == pytest.approx(results[0].solid_out.X2, abs=1.0e-12)
+    assert results[-1].vapor_out.T == pytest.approx(results[0].vapor_out.T, abs=1.0)
+
+
+def test_thickness_bracket_prefers_local_root_and_falls_back_globally() -> None:
+    local_calls: list[float] = []
+
+    def local_residual(value: float) -> float:
+        local_calls.append(value)
+        return value - 0.01
+
+    local = ftrz._thickness_bracket(local_residual, 1.0e-12, 0.01)
+    assert local == (0.01, 0.01)
+    assert len(local_calls) == 2
+
+    fallback_calls: list[float] = []
+
+    def distant_residual(value: float) -> float:
+        fallback_calls.append(value)
+        return value - 0.01
+
+    fallback = ftrz._thickness_bracket(distant_residual, 1.0e-12, 1.0e-8)
+    assert fallback is not None
+    assert fallback[0] <= 0.01 <= fallback[1]
+    assert len(fallback_calls) > 3
+
+
 def test_zone_solid_temperature_approaches_but_never_exceeds_vapor_inlet() -> None:
     vapor_in = ftrz.VaporState(m_water_kg_s=5.0, m_hex_kg_s=0.5, T=373.0)
     result = _solve(vapor_in, X2_sup=0.10, q_Iv_w_m3=2.0e5)

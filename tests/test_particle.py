@@ -13,6 +13,7 @@ import pytest
 
 from dtdc_simulator.core import thermo
 from dtdc_simulator.core.zones import particle as p
+from dtdc_simulator.core.zones import particle_jit
 
 GAB = thermo.GabParams(Xm=5.183e-3, C0=3.117e-3, dHC_R=2262.0, K0=9.172e-2, dHK_R=729.6)
 OIL = thermo.OilIsotherm(A0=0.9635, B=2.7036)
@@ -294,3 +295,151 @@ def test_outer_layer_value_and_volumetric_mean() -> None:
     mean = p.volumetric_mean(values, GEOMETRY.volumes)
     # Volumetric mean should be pulled toward the outer (larger-volume, higher-value) layers.
     assert mean > sum(values) / len(values)
+    assert p.shell_volumetric_mean(values, GEOMETRY) == mean
+
+
+def test_compiled_cascade_invariants_are_read_only() -> None:
+    initial = p.ParticleState(
+        wpg2=tuple(0.05 for _ in range(CONSTANTS.Np)),
+        Tp=tuple(365.0 for _ in range(CONSTANTS.Np)),
+    )
+    invariants = particle_jit.build_invariants(initial, GEOMETRY)
+    assert not invariants.initial_w.flags.writeable
+    assert not invariants.initial_T.flags.writeable
+    assert not invariants.volumes.flags.writeable
+    assert not invariants.face_areas.flags.writeable
+
+
+@pytest.mark.skipif(
+    not particle_jit.NUMBA_AVAILABLE or particle_jit.JIT_DISABLED,
+    reason="optional Numba backend unavailable or disabled",
+)
+def test_compiled_energy_cascade_matches_python_reference() -> None:
+    initial = p.ParticleState(
+        wpg2=tuple(0.08 - 0.002 * i for i in range(CONSTANTS.Np)),
+        Tp=tuple(350.0 + 0.2 * i for i in range(CONSTANTS.Np)),
+    )
+    particles = [
+        p.ParticleState(
+            wpg2=tuple(0.07 - 0.003 * j - 0.001 * i for i in range(CONSTANTS.Np)),
+            Tp=initial.Tp,
+        )
+        for j in range(3)
+    ]
+    rates = [
+        tuple(-1.0e-4 * (j + 1) * (i + 1) for i in range(CONSTANTS.Np))
+        for j in range(3)
+    ]
+    vapor = [365.0, 370.0, 375.0]
+    axial_sources = (120.0, -80.0, 30.0)
+    moisture = [0.08, 0.11, 0.14]
+    compiled = particle_jit.energy_cascade(
+        initial,
+        particles,
+        rates,
+        vapor,
+        axial_sources,
+        moisture,
+        25.0,
+        2.0,
+        GEOMETRY,
+        CONSTANTS,
+        250.0,
+        480.0,
+    )
+    assert compiled is not None
+
+    running_T = initial.Tp
+    for j in range(3):
+        seed = p.ParticleState(wpg2=particles[j].wpg2, Tp=running_T)
+        sorption = p.sorption_heat_source_per_layer_w_m3(seed, rates[j], CONSTANTS)
+        sources = tuple(value + axial_sources[j] for value in sorption)
+        updated, _ = p.march_particle_energy(
+            seed,
+            vapor[j],
+            25.0,
+            sources,
+            2.0,
+            GEOMETRY,
+            CONSTANTS,
+            X1=moisture[j],
+        )
+        expected = tuple(min(max(value, 250.0), 480.0) for value in updated.Tp)
+        assert tuple(compiled[j]) == pytest.approx(expected, rel=2.0e-14, abs=1.0e-12)
+        running_T = expected
+
+
+@pytest.mark.skipif(
+    not particle_jit.NUMBA_AVAILABLE or particle_jit.JIT_DISABLED,
+    reason="optional Numba backend unavailable or disabled",
+)
+def test_compiled_mass_cascade_matches_python_reference() -> None:
+    initial = p.ParticleState(
+        wpg2=tuple(0.08 - 0.002 * i for i in range(CONSTANTS.Np)),
+        Tp=tuple(365.0 + 0.2 * i for i in range(CONSTANTS.Np)),
+    )
+    particles = [
+        p.ParticleState(
+            wpg2=initial.wpg2,
+            Tp=tuple(365.0 + j + 0.1 * i for i in range(CONSTANTS.Np)),
+        )
+        for j in range(3)
+    ]
+    vapor = [0.04, 0.03, 0.02]
+    compiled = particle_jit.mass_cascade(
+        initial, particles, vapor, 0.05, 0.6, 2.0, GEOMETRY, CONSTANTS
+    )
+    assert compiled is not None
+    compiled_w, compiled_rates, compiled_x2 = compiled
+
+    running = initial.wpg2
+    for j in range(3):
+        seed = p.ParticleState(wpg2=running, Tp=particles[j].Tp)
+        updated, diagnostics = p.march_particle_mass(
+            seed, vapor[j], 0.05, 0.6, 2.0, GEOMETRY, CONSTANTS
+        )
+        expected_x2 = p.shell_volumetric_mean(
+            tuple(
+                thermo.gab_hexane_content(w, t, CONSTANTS.gab)
+                + CONSTANTS.X3 * thermo.oil_hexane_content(w, CONSTANTS.oil)
+                for w, t in zip(updated.wpg2, updated.Tp)
+            ),
+            GEOMETRY,
+        )
+        assert tuple(compiled_w[j]) == pytest.approx(updated.wpg2, rel=2.0e-14, abs=1.0e-15)
+        assert tuple(compiled_rates[j]) == pytest.approx(
+            diagnostics.dwpg2_dt, rel=2.0e-14, abs=1.0e-15
+        )
+        assert compiled_x2[j] == pytest.approx(expected_x2, rel=2.0e-14)
+        running = updated.wpg2
+
+
+def test_compiled_backend_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(particle_jit, "JIT_DISABLED", True)
+    initial = p.ParticleState(
+        wpg2=tuple(0.05 for _ in range(CONSTANTS.Np)),
+        Tp=tuple(365.0 for _ in range(CONSTANTS.Np)),
+    )
+    assert (
+        particle_jit.mass_cascade(
+            initial, [initial], [0.02], 0.05, 0.6, 1.0, GEOMETRY, CONSTANTS
+        )
+        is None
+    )
+    assert (
+        particle_jit.energy_cascade(
+            initial,
+            [initial],
+            [tuple(0.0 for _ in range(CONSTANTS.Np))],
+            [365.0],
+            (0.0,),
+            [0.1],
+            25.0,
+            1.0,
+            GEOMETRY,
+            CONSTANTS,
+            250.0,
+            480.0,
+        )
+        is None
+    )

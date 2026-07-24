@@ -483,6 +483,18 @@ class DTCouplingResiduals:
     vapor_interface_hexane_flow: float = math.inf
     ftrz_length: float = math.inf
 
+    def maximum_scaled(self, outer_tol: float) -> float:
+        """Dimensionless shadow metric using the current physical tolerances."""
+        length_tol = min(outer_tol, 1.0e-3)
+        return max(
+            self.solid_interface_T / outer_tol,
+            self.vapor_interface_T / outer_tol,
+            self.vapor_interface_hexane_fraction / outer_tol,
+            self.vapor_interface_water_flow / outer_tol,
+            self.vapor_interface_hexane_flow / outer_tol,
+            self.ftrz_length / length_tol,
+        )
+
 
 @dataclass(frozen=True)
 class DTResult:
@@ -823,6 +835,7 @@ def solve_dt(
             vapor_interface_hexane_flow=d_m_hex,
             ftrz_length=d_length,
         )
+        maximum_scaled_coupling_residual = coupling_residuals.maximum_scaled(outer_tol)
 
         T_L_sup = T_L_sup + temperature_relaxation * (new_T_L_sup - T_L_sup)
         vapor_in = ftrz.VaporState(
@@ -871,13 +884,13 @@ def solve_dt(
                 )
             )
 
-        # Finite-rate FTRZ water uptake makes the total vapor flow a genuine
-        # coupling variable: matching only temperature and composition can
-        # falsely declare convergence while kg/s is still changing.  Include
-        # both component flow residuals in the same physical outer gate.
+        # The dimensionless metric makes every physical tolerance explicit.
+        # Its scales intentionally reproduce the established gate exactly:
+        # outer_tol for temperatures, fraction and component flows, and the
+        # historical 1 mm ceiling for FTRZ length.
         if (
-            max(d_T, d_TV, d_wV2, d_m_water, d_m_hex) <= outer_tol
-            and d_length <= min(outer_tol, 1.0e-3)
+            maximum_scaled_coupling_residual <= 1.0
+            and dcz_result.converged
         ):
             converged = True
             break

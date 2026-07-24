@@ -83,6 +83,7 @@ class ShellGeometry:
     face_radii: tuple[float, ...]  # Np entries: Np-1 internal faces, then the outer surface
     face_areas: tuple[float, ...]  # matches face_radii
     volumes: tuple[float, ...]  # Np shell volumes, center (index 0) to surface
+    total_volume: float
 
 
 def build_shell_geometry(r_P: float, Np: int) -> ShellGeometry:
@@ -92,7 +93,13 @@ def build_shell_geometry(r_P: float, Np: int) -> ShellGeometry:
     volumes = tuple(
         (4.0 / 3.0) * math.pi * (((i + 1) * dr) ** 3 - (i * dr) ** 3) for i in range(Np)
     )
-    return ShellGeometry(dr=dr, face_radii=face_radii, face_areas=face_areas, volumes=volumes)
+    return ShellGeometry(
+        dr=dr,
+        face_radii=face_radii,
+        face_areas=face_areas,
+        volumes=volumes,
+        total_volume=sum(volumes),
+    )
 
 
 @dataclass(frozen=True)
@@ -115,35 +122,9 @@ def volumetric_mean(values: tuple[float, ...], volumes: tuple[float, ...]) -> fl
     return sum(v * vol for v, vol in zip(values, volumes)) / total_v
 
 
-def _accumulation_jacobian_per_layer(
-    state: ParticleState, c: ParticleConstants
-) -> tuple[float, ...]:
-    """M_i = dX2,total/dwpg2|_local (eq. A.22's own accumulation term,
-    X2,total = alpha_pg*rho_pg*wpg2 + alpha_ps*rho_ps*X2,so, differentiated
-    via the chain rule) at each layer, from the local isotherm slope --
-    replaces the old `Ca` (eq. A.28) entirely, see
-    `march_particle_mass`'s own docstring for why."""
-    ms = []
-    for wpg2_i, Tp_i in zip(state.wpg2, state.Tp):
-        _, slope = thermo.x2_so_and_slope(wpg2_i, Tp_i, c.X3, c.gab, c.oil)
-        ms.append(c.alpha_pg * c.rho_pg + c.alpha_ps * c.rho_ps * slope)
-    return tuple(ms)
-
-
-def _component_slopes(
-    wpg2: float, T: float, c: ParticleConstants, h: float = 1.0e-5
-) -> tuple[float, float]:
-    """(dW2/dwpg2, dqo/dwpg2) separately (unlike `thermo.x2_so_and_slope`,
-    which only returns their combined sum) -- eq. A.30's sorption-heat source
-    needs them apart since they carry different latent heats.
-
-    Exact analytic derivatives of the two closed-form isotherms (was a central
-    finite difference, h=1e-5; verified equal to ~1e-9 relative). `h` is kept
-    in the signature (unused) for backward compatibility."""
-    del h  # retained for signature compatibility; the analytic slope needs no step
-    _, dW2 = thermo.gab_hexane_content_and_slope(wpg2, T, c.gab)
-    _, dqo = thermo.oil_hexane_content_and_slope(wpg2, c.oil)
-    return dW2, dqo
+def shell_volumetric_mean(values: tuple[float, ...], geometry: ShellGeometry) -> float:
+    """Particle-shell mean using the geometry's precomputed total volume."""
+    return sum(v * vol for v, vol in zip(values, geometry.volumes)) / geometry.total_volume
 
 
 def sorption_heat_source_per_layer_w_m3(
@@ -183,7 +164,7 @@ def sorption_heat_source_per_layer_w_m3(
     sources = []
     for wpg2_i, Tp_i, rate_i in zip(state.wpg2, state.Tp, dwpg2_dt_prev):
         # One analytic isotherm evaluation yields BOTH W2_i and dW2/dwpg2 (was
-        # a finite-difference `_component_slopes` call PLUS a separate
+        # a finite-difference component-slope calculation PLUS a separate
         # `gab_hexane_content` re-eval for W2_i -- ~5 isotherm evals collapsed
         # to 2, bit-equivalent to ~1e-9).
         W2_i, dW2_dwpg2 = thermo.gab_hexane_content_and_slope(wpg2_i, Tp_i, c.gab)
@@ -306,9 +287,9 @@ def march_particle_mass(
     hexane adsorbed/absorbed in the solid and oil phases) is the finite
     -volume method's own accumulation variable here, not `wpg2` alone. Its
     own rate of change is linearized via the frozen-coefficient Jacobian
-    `M_i = dX2,total/dwpg2|_local` (`_accumulation_jacobian_per_layer`,
-    evaluated from the state entering this step, same stability rationale as
-    every other frozen-coefficient march in this codebase) -- but, UNLIKE
+    `M_i = dX2,total/dwpg2|_local` (evaluated inline from the state entering
+    this step, same stability rationale as every other frozen-coefficient
+    march in this codebase) -- but, UNLIKE
     the old `Ca`-based scheme, this Jacobian appears ONLY in the accumulation
     term. The DIFFUSIVE flux terms use the literal, CONSTANT coefficient
     `alpha_pg*rho_pg*D_eff` straight from eq. A.22 (no face-averaging of a
@@ -349,7 +330,6 @@ def march_particle_mass(
     """
     Np = c.Np
     dr = geometry.dr
-    M = _accumulation_jacobian_per_layer(state, c)
     const_diff = c.alpha_pg * c.rho_pg * c.D_eff  # eq. A.22's own diffusive flux coefficient,
     # CONSTANT (not face-averaged) -- unlike the old Ca-based scheme, nothing here varies
     # spatially, since M (the only local/nonlinear factor) lives solely in the accumulation term.
@@ -362,8 +342,13 @@ def march_particle_mass(
     sup = [0.0] * Np
     b = [0.0] * Np
     for i in range(Np):
-        diag = geometry.volumes[i] * M[i] / dt
-        b[i] = geometry.volumes[i] * M[i] / dt * state.wpg2[i]
+        slope = thermo.x2_so_slope(
+            state.wpg2[i], state.Tp[i], c.X3, c.gab, c.oil
+        )
+        accumulation = c.alpha_pg * c.rho_pg + c.alpha_ps * c.rho_ps * slope
+        accumulation_volume_rate = geometry.volumes[i] * accumulation / dt
+        diag = accumulation_volume_rate
+        b[i] = accumulation_volume_rate * state.wpg2[i]
         if i > 0:
             coeff_in = const_diff * geometry.face_areas[i - 1] / dr
             sub[i] = -coeff_in

@@ -133,6 +133,7 @@ import numpy as np
 
 from dtdc_simulator.core import thermo
 from dtdc_simulator.core.zones import particle as pt
+from dtdc_simulator.core.zones import particle_jit
 
 # Free-water floor for the evaporative-pinning cap (see solve_dcz_zone step 2): above
 # this moisture the meal holds free/loosely-bound water that flashes off to pin its
@@ -441,7 +442,7 @@ class DCZZoneResult:
 def bulk_temperature(cell: DCZCellResult, geometry: pt.ShellGeometry) -> float:
     """Volumetric-mean particle temperature (eq. 8) for a cell -- the bulk
     solid temperature a caller would report/compare against Fig. 9."""
-    return pt.volumetric_mean(cell.particle.Tp, geometry.volumes)
+    return pt.shell_volumetric_mean(cell.particle.Tp, geometry)
 
 
 def axial_laplacian(profile: tuple[float, ...], dz: float) -> tuple[float, ...]:
@@ -516,6 +517,7 @@ def solve_dcz_zone(
         wpg2=tuple(1.0 for _ in range(c.particle.Np)),
         Tp=tuple(T_L_sup for _ in range(c.particle.Np)),
     )
+    cascade_invariants = particle_jit.build_invariants(initial_particle, geometry)
     m_water_bottom_kg_s = (1.0 - vapor_inf.wV2) * m_vapor_kg_s
     m_hex_bottom_kg_s = vapor_inf.wV2 * m_vapor_kg_s
     if warm_start is None:
@@ -631,7 +633,7 @@ def solve_dcz_zone(
         acc_x_k = np.array(vapor_T)
         # -- axial correction sources, lagged from the previous iteration's profile --
         Tp_bulk_profile = tuple(
-            pt.volumetric_mean(particles[j].Tp, geometry.volumes) for j in range(nz)
+            pt.shell_volumetric_mean(particles[j].Tp, geometry) for j in range(nz)
         )
         q_condL = axial_laplacian(Tp_bulk_profile, dz)
         q_condL = tuple(c.k_mixL * q for q in q_condL)
@@ -650,42 +652,64 @@ def solve_dcz_zone(
         # identical residence time regardless of axial position). Each
         # cell's own wpg2 (from the previous iteration's mass cascade, step
         # 3 below) is carried through unchanged -- only Tp cascades here.
-        new_particles_energy = []
-        running_Tp = initial_particle.Tp
-        for j in range(nz):
-            seed = pt.ParticleState(wpg2=particles[j].wpg2, Tp=running_Tp)
-            # eq. A.30 sorption/desorption heat source for the PARTICLE energy
-            # march (step 1). No longer also fed to the vapor balance -- the
-            # vapor now uses Coletto's own SVm2·Ĥ2 mass-enthalpy term (step 2),
-            # not this particle-volume sorption sink.
-            sorption_sources = pt.sorption_heat_source_per_layer_w_m3(
-                seed, dwpg2_dt_prev[j], c.particle
-            )
-            full_sources = tuple(s + q_condL[j] for s in sorption_sources)
-            updated, _ = pt.march_particle_energy(
-                seed,
-                vapor_T[j],
-                c.hQ,
-                full_sources,
-                dt,
-                geometry,
-                c.particle,
-                X1=X1_profile[j],  # lagged one outer iteration, same category as dwpg2_dt_prev
-            )
-            # Robustness clamp to a physical DT temperature band (see _TP_MIN_K/_TP_MAX_K):
-            # keeps the coupled sorption<->energy iterate finite at deeply off-design inputs
-            # so it degrades gracefully instead of running away to overflow. Never engages
-            # at realistic operating points.
-            if updated.Tp[0] < _TP_MIN_K or updated.Tp[-1] > _TP_MAX_K or any(
-                t < _TP_MIN_K or t > _TP_MAX_K for t in updated.Tp
-            ):
-                updated = pt.ParticleState(
-                    wpg2=updated.wpg2,
-                    Tp=tuple(min(max(t, _TP_MIN_K), _TP_MAX_K) for t in updated.Tp),
+        compiled_energy = particle_jit.energy_cascade(
+            initial_particle,
+            particles,
+            dwpg2_dt_prev,
+            vapor_T,
+            q_condL,
+            X1_profile,
+            c.hQ,
+            dt,
+            geometry,
+            c.particle,
+            _TP_MIN_K,
+            _TP_MAX_K,
+            cascade_invariants,
+        )
+        if compiled_energy is not None:
+            particles = [
+                pt.ParticleState(
+                    wpg2=particles[j].wpg2,
+                    Tp=tuple(float(value) for value in compiled_energy[j]),
                 )
-            new_particles_energy.append(updated)
-            running_Tp = updated.Tp
-        particles = new_particles_energy
+                for j in range(nz)
+            ]
+        else:
+            new_particles_energy = []
+            running_Tp = initial_particle.Tp
+            for j in range(nz):
+                seed = pt.ParticleState(wpg2=particles[j].wpg2, Tp=running_Tp)
+                # eq. A.30 sorption/desorption heat source for the PARTICLE energy
+                # march (step 1). No longer also fed to the vapor balance -- the
+                # vapor now uses Coletto's own SVm2·Ĥ2 mass-enthalpy term (step 2),
+                # not this particle-volume sorption sink.
+                sorption_sources = pt.sorption_heat_source_per_layer_w_m3(
+                    seed, dwpg2_dt_prev[j], c.particle
+                )
+                full_sources = tuple(s + q_condL[j] for s in sorption_sources)
+                updated, _ = pt.march_particle_energy(
+                    seed,
+                    vapor_T[j],
+                    c.hQ,
+                    full_sources,
+                    dt,
+                    geometry,
+                    c.particle,
+                    X1=X1_profile[j],
+                )
+                # Robustness clamp to a physical DT temperature band (see
+                # _TP_MIN_K/_TP_MAX_K). It never engages at realistic points.
+                if updated.Tp[0] < _TP_MIN_K or updated.Tp[-1] > _TP_MAX_K or any(
+                    t < _TP_MIN_K or t > _TP_MAX_K for t in updated.Tp
+                ):
+                    updated = pt.ParticleState(
+                        wpg2=updated.wpg2,
+                        Tp=tuple(min(max(t, _TP_MIN_K), _TP_MAX_K) for t in updated.Tp),
+                    )
+                new_particles_energy.append(updated)
+                running_Tp = updated.Tp
+            particles = new_particles_energy
 
         # 2. energy balance at bed scale (bottom -> top). A per-cell IMPLICIT
         # (backward) relaxation step -- not the naive explicit forward step
@@ -823,32 +847,57 @@ def solve_dcz_zone(
         # logic as step 1: a fresh wpg2 cascade from the zone entry
         # condition through all nz cells, each seeded with that cell's own
         # (just-updated in step 1) Tp.
-        new_particles_mass = []
-        new_rates = []
-        running_wpg2 = initial_particle.wpg2
-        for j in range(nz):
-            seed = pt.ParticleState(wpg2=running_wpg2, Tp=particles[j].Tp)
-            updated, diag = pt.march_particle_mass(
-                seed, vapor_wV2[j], c.hM, c.rho_V, dt, geometry, c.particle
-            )
-            new_particles_mass.append(updated)
-            new_rates.append(diag.dwpg2_dt)
-            running_wpg2 = updated.wpg2
-        particles = new_particles_mass
-        dwpg2_dt_prev = new_rates
+        compiled_mass = particle_jit.mass_cascade(
+            initial_particle,
+            particles,
+            vapor_wV2,
+            c.hM,
+            c.rho_V,
+            dt,
+            geometry,
+            c.particle,
+            cascade_invariants,
+        )
+        if compiled_mass is None:
+            new_particles_mass = []
+            new_rates = []
+            running_wpg2 = initial_particle.wpg2
+            for j in range(nz):
+                seed = pt.ParticleState(wpg2=running_wpg2, Tp=particles[j].Tp)
+                updated, diag = pt.march_particle_mass(
+                    seed, vapor_wV2[j], c.hM, c.rho_V, dt, geometry, c.particle
+                )
+                new_particles_mass.append(updated)
+                new_rates.append(diag.dwpg2_dt)
+                running_wpg2 = updated.wpg2
+            particles = new_particles_mass
+            dwpg2_dt_prev = new_rates
+            x2_particle = [
+                pt.shell_volumetric_mean(
+                    tuple(_x2_so(w, t, c.particle) for w, t in zip(cell.wpg2, cell.Tp)),
+                    geometry,
+                )
+                for cell in particles
+            ]
+        else:
+            compiled_w, compiled_rates, compiled_x2 = compiled_mass
+            particles = [
+                pt.ParticleState(
+                    wpg2=tuple(float(value) for value in compiled_w[j]),
+                    Tp=particles[j].Tp,
+                )
+                for j in range(nz)
+            ]
+            dwpg2_dt_prev = [
+                tuple(float(value) for value in compiled_rates[j]) for j in range(nz)
+            ]
+            x2_particle = [float(value) for value in compiled_x2]
 
         # 4. hexane component balance at bed scale (bottom -> top). The
         # particle cascade is the authoritative interphase ledger: vapor
         # gains exactly the dry-solid-flow-scaled X2 loss of each cell. This
         # is the discrete conservative counterpart of A.24's SVm2 source and
         # avoids evaluating the same interface twice with mismatched closures.
-        x2_particle = [
-            pt.volumetric_mean(
-                tuple(_x2_so(w, t, c.particle) for w, t in zip(cell.wpg2, cell.Tp)),
-                geometry.volumes,
-            )
-            for cell in particles
-        ]
         x2_zone_in = thermo.x2_equilibrium(
             T_L_sup,
             c.particle.X3,
@@ -1029,11 +1078,8 @@ def solve_dcz_zone(
         # moving by several kelvin.  Check both exported boundaries and maximum
         # full-profile residuals of all vapor states.
         last = particles[-1]
-        x2_exit = pt.volumetric_mean(
-            tuple(_x2_so(w, t, c.particle) for w, t in zip(last.wpg2, last.Tp)),
-            geometry.volumes,
-        )
-        T_exit = pt.volumetric_mean(last.Tp, geometry.volumes)
+        x2_exit = x2_particle[-1]
+        T_exit = pt.shell_volumetric_mean(last.Tp, geometry)
         x1_exit = X1_profile[-1]
         d_x2 = abs(x2_exit - prev_x2_exit)
         d_T = abs(T_exit - prev_T_exit)
@@ -1095,13 +1141,7 @@ def solve_dcz_zone(
 
     cells = []
     for j in range(nz):
-        X2_bulk = pt.volumetric_mean(
-            tuple(
-                _x2_so(wpg2_i, Tp_i, c.particle)
-                for wpg2_i, Tp_i in zip(particles[j].wpg2, particles[j].Tp)
-            ),
-            geometry.volumes,
-        )
+        X2_bulk = x2_particle[j]
         # X1_profile/condensed_profile_kg_s are already the FINAL outer iteration's
         # own converged values (step 4.5 above, top-j=0-to-bottom-j=nz-1,
         # same order as this loop) -- no separate recomputation needed here.
