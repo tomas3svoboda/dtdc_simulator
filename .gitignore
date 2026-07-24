@@ -13,3 +13,6 @@ literature_sources/
 
 # LaTeX manuscript + build artifacts (paper/) — keep local only, not in the repo.
 paper/
+
+# OPC UA PKI store — generated certs + PRIVATE KEYS, never commit.
+pki/

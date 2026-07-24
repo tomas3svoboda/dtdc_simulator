@@ -3,6 +3,24 @@
 Log of `DECIDE` choices made while building the DTDC simulator, per
 `Specifications/DTDC_Simulator_BuildSpec.md`. Newest entries at the top.
 
+## Equipment envelope locked; DC steam-drying trays not supported (2026-07-24)
+
+Foundation for the strict/superset OPC UA interface: a fixed *equipment
+envelope* (`envelope.yaml`, rationale in
+`app_specifications/DTDC_Equipment_Envelope.md`) defines the largest realistic
+DTDC the address space is built against. Caps are literature-derived (Kemper
+2019, Ch. 4, `literature_sources/Kemper_Solvent_Extraction.pdf`): PREDESOLV ≤ 7
+(p.109), MAIN/countercurrent ≤ 4 (p.111), SPARGE = 1 (p.111), DRYER/air-drying
+≤ 3, COOLER/air-cooling ≤ 2 → 17 canonical stage slots. Cross-checked against
+the Paraíso/COAMO 7-stage DT and Coletto's 6-tray base case.
+
+**This version does NOT support DC steam-drying trays.** Kemper p.114 documents
+conductive/jacketed DC steam-drying trays (0–5), but the model's DC is
+air-contact only (`core/dc.py`), so `DRYER` maps to Kemper's air-drying trays
+and there is no `STEAM_DRYER` role/zone. Deferred rather than reserved as
+always-inactive nodes: reserving nodes for unmodeled physics is speculative,
+and the envelope is versioned so a later addition is explicit and traceable.
+
 ## Jacket-driven falling-rate PREDESOLV and extreme-operation envelope (2026-07-23)
 
 **Physical distinction.** The critical loading `X2_cr` is a particle-mechanism

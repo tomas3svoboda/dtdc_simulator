@@ -86,6 +86,31 @@ class TransferBoundaryInfo:
     vapor_seal: bool
 
 
+@dataclass(frozen=True)
+class StageGeometryInfo:
+    """Cold geometry for one build stage — the provenance the OPC UA
+    ``Constants/Geometry`` folder exposes read-only (BuildSpec §9.1)."""
+
+    id: str
+    role: str
+    diameter_m: float
+    bed_height_m: float
+    vapor_path: str
+    arm_mixing_factor: float
+
+
+@dataclass
+class ColdConfigSnapshot:
+    """Read-only view of the assembled cold config for the OPC UA
+    ``Constants/`` folder. ``physical``/``model`` are the pydantic
+    ``model_dump()`` dicts (nested param groups stay nested); ``geometry`` is
+    keyed by build stage id."""
+
+    physical: dict
+    model: dict
+    geometry: dict[str, StageGeometryInfo]
+
+
 @dataclass
 class Snapshot:
     state: SimState
@@ -267,9 +292,7 @@ class RuntimeFacade:
 
         self._mvs = mvs
         self._stage_roles = {s.id: s.role.value for s in config.geometry.stages}
-        self._stage_vapor_paths = {
-            s.id: s.vapor_path.value for s in config.geometry.stages
-        }
+        self._stage_vapor_paths = {s.id: s.vapor_path.value for s in config.geometry.stages}
         self._stage_order = all_ids
         self._transfer_boundaries = tuple(
             TransferBoundaryInfo(
@@ -282,9 +305,7 @@ class RuntimeFacade:
             )
             for boundary in config.topology.solid_transfers
         )
-        self._control_bindings = {
-            binding.tag: binding for binding in build_control_catalog(config)
-        }
+        self._control_bindings = {binding.tag: binding for binding in build_control_catalog(config)}
 
         dd = config.disturbance_defaults
         self._dvs = {
@@ -605,6 +626,31 @@ class RuntimeFacade:
                 actuator_keys=binding.mv_keys,
             )
         return loops
+
+    def get_cold_config(self) -> ColdConfigSnapshot | None:
+        """The assembled cold config for the OPC UA ``Constants/`` folder, or
+        ``None`` before a config is loaded (e.g. transiently during reconfigure).
+        Read-only provenance — the physics uses the frozen Model, not this."""
+        with self._lock:
+            if self._config is None:
+                return None
+            cfg = self._config
+            geometry = {
+                s.id: StageGeometryInfo(
+                    id=s.id,
+                    role=s.role.value,
+                    diameter_m=s.diameter_m,
+                    bed_height_m=s.bed_height_m,
+                    vapor_path=s.vapor_path.value if s.vapor_path is not None else "",
+                    arm_mixing_factor=s.arm_mixing_factor,
+                )
+                for s in cfg.geometry.stages
+            }
+            return ColdConfigSnapshot(
+                physical=cfg.physical.model_dump(),
+                model=cfg.model.model_dump(),
+                geometry=geometry,
+            )
 
     def get_snapshot(self) -> Snapshot:
         with self._lock:

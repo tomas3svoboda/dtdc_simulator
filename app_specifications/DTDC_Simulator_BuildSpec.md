@@ -624,50 +624,75 @@ configured `max_control_interval`, clamp `speed_factor` and surface a warning no
 
 - Library: `asyncua`. Endpoint `opc.tcp://0.0.0.0:4840/dtdc/` (`DECIDE` port).
 - Security: `SecurityPolicy#None`, allow anonymous. **No encryption/auth.** Document the risk.
+  (Runtime security/certificate control is a later milestone.)
 - Namespace: one custom namespace URI, e.g. `http://dtdc.sim/`.
 
-### 9.1 Address space (folders → nodes)
+### 9.1 Strict superset address space (Phase 1, 2026-07-24)
+
+The address space is rendered from the fixed **equipment envelope**
+(`envelope.yaml`, `config/envelope.py`; rationale in
+`app_specifications/DTDC_Equipment_Envelope.md`), **not** from the loaded
+scenario. Every canonical stage, actuator, KPI and control loop of the maximal
+realistic DTDC (PREDESOLV ≤ 7, MAIN ≤ 4, SPARGE 1, DRYER ≤ 3, COOLER ≤ 2 → 17
+canonical stage slots) is created **once** at a fixed path. A given build only
+marks each node:
+
+- **active** — bound to a live model quantity, `StatusCode = Good`; or
+- **placeholder** — present, value nulled, `StatusCode = Bad_NotConnected`, with a
+  sibling `Present = false` boolean.
+
+Reconfiguring therefore never adds or removes a node — it only flips the active
+mask — so an APC/DCS tag map written once against the canonical names never
+needs remapping. Canonical stage slots bind to build stages by **(role, order)**
+(`interfaces/opcua/address_space.py::compute_active_mask`), so the interface is
+stable even if a scenario uses non-canonical stage ids.
+
 ```
 Objects/DTDC/
-  Constants/        (read-only in RUNNING; writable in CONFIGURED)
-    Physical/...    (all PhysicalParams as read-only vars for provenance)
-    Model/...       (all ModelParams)
-    Geometry/...    (stage list, roles, dims)
-  Control/
-    <PLC_loop_tag>/
-      Mode          (RW enum MANUAL|AUTO)
-      SP             (RW; AUTO-side setpoint)
-      PV             (RO)
-      OP             (RW in MANUAL; current actuator output otherwise)
-      Units, Status, Description, Min, Max (RO)
-  SimulationInputs/
-    <dv_key>         (RW; scenario/disturbance injection, not PLC control)
-  Measurements/     (all RO)
-    Stage/<i>/{T, X_hex, X_w, VaporTemp}
-    KPI/{residual_hexane, meal_moisture,
-         steam_consumption, throughput}
+  Config/                        (RO; how to read this build against the superset)
+    EnvelopeVersion              (RO int)
+    ActiveStageCount             (RO int)
+    BuildManifest                (RO String; JSON: active_stages, stage_binding,
+                                  active_control_loops, role_counts)
+  Constants/                     (RO provenance; structure schema-fixed, values per build)
+    Physical/...                 (all PhysicalParams; nested groups as sub-objects)
+    Model/...                    (all ModelParams)
+    Geometry/Stage/<CANON>/      {Role, Diameter, BedHeight, VaporPath, ArmMixing, Present}
+  Control/<PLC_loop_tag>/        (canonical loop superset; ZIC_<CANON> per stage outlet)
+    Mode (RW enum MANUAL|AUTO), SP (RW), PV (RO), OP (RW),
+    Units, Status, Description, Min, Max (RO), Present (RO bool)
+  SimulationInputs/<dv_key>      (RW; the 6 disturbances, always active)
+  Measurements/
+    Stage/<CANON>/               {T, X_hex, X_w, VaporTemp, Level, Role, Present} (RO)
+    KPI/<name>                   (RO; the 13 fixed KPIs)
   Diagnostics/
-    InternalMV/<internal_key>/{Mode, ManualSetpoint, AutoSetpoint, EffectiveValue} (RO)
+    InternalMV/<CANON_key>/      {Mode, ManualSetpoint, AutoSetpoint, EffectiveValue, Present} (RO)
   Simulation/
-    SpeedFactor     (RW)
-    SimTime         (RO)
-    ActualSpeed     (RO)
-    State           (RO enum)
-    GlobalMode      (RW enum)
-    UndersampleWarning (RO bool)
-    SolverStress    (RO bool/float; DT fixed-point failed to converge within tick budget)
+    SpeedFactor (RW), DTResolveIntervalS (RW), SimTime (RO), ActualSpeed (RO),
+    State (RO enum), GlobalMode (RW enum), UndersampleWarning (RO bool),
+    SolverStress (RO bool), DTSolverOuterIterations (RO int)
     Methods: Run(), Pause(), Stop(), Reset(), Reconfigure()
 ```
+
+`<CANON>` = a canonical id (`PD1..PD7`, `MN1..MN4`, `SP1`, `DR1..DR3`, `CL1..CL2`).
+DC steam-drying trays are **not modeled** in this version (see
+`DECISIONS.md` 2026-07-24), so there is no such zone/node.
 
 ### 9.2 Behaviors
 - Writes to `SP` feed the bound actuator target when the loop is in `AUTO`.
 - Writes to `OP` feed the bound manual actuator target when the loop is in `MANUAL`.
+- Only **active** loops route client writes to the facade; writes to placeholder
+  (inactive) loops are ignored.
 - Zone-total and common-shaft loops map atomically to internal per-stage values
   using fixed scenario allocation weights.
 - Mode changes trigger bumpless transfer (§6).
-- `Constants/*` reject writes unless state ∈ {CONFIGURED, UNCONFIGURED}.
 - Method calls drive the state machine (§4.1) and return success/failure.
-- Measurement/Simulation nodes are refreshed every tick from the facade snapshot.
+- Every refresh cycle **pulls** changed writable nodes into the facade, then
+  **pushes** a fresh facade snapshot back out (push-follows-pull, so a
+  UI-originated change and a client write each converge within one cycle). The
+  active mask and `BuildManifest` are recomputed each push, so a reconfigure is
+  reflected without rebuilding the tree. `Constants/*` are read-only here
+  (writing constants in CONFIGURED is a later milestone).
 
 ---
 

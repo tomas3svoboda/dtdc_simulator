@@ -23,7 +23,6 @@ from collections import defaultdict, deque
 
 from nicegui import app, ui
 
-from dtdc_simulator.config.loader import load_scenario
 from dtdc_simulator.engine.facade import RuntimeFacade
 from dtdc_simulator.engine.mv import Mode
 from dtdc_simulator.engine.state_machine import SimState
@@ -122,17 +121,22 @@ def create_app(
     """Register the OPC UA startup task (if any) and the single dashboard page.
     Caller is responsible for calling `ui.run(...)` afterward."""
 
+    opcua_service = None
     if opcua_endpoint:
-        from dtdc_simulator.interfaces.opcua.server import serve as opcua_serve
+        from dtdc_simulator.interfaces.opcua.service import Endpoint, OpcUaService
         import asyncio
+
+        opcua_service = OpcUaService(facade)
+        parsed = Endpoint.parse(opcua_endpoint)
+        opcua_service.set_endpoint(parsed.host, parsed.port, parsed.path)
 
         async def _start_opcua() -> None:
             while facade.state in (SimState.UNCONFIGURED, SimState.CONFIGURED):
                 await asyncio.sleep(0.2)  # wait for setup to assemble MV/DV/stage keys
             try:
-                await opcua_serve(facade, opcua_endpoint)
+                await opcua_service.start()  # the GUI panel can later stop/restart it
             except Exception:
-                logger.exception("OPC UA server crashed")
+                logger.exception("OPC UA server autostart failed")
 
         app.on_startup(_start_opcua)
 
@@ -172,31 +176,16 @@ def create_app(
         dashboard_container = ui.column().classes("w-full gap-3 p-4")
         dashboard_container.visible = False
 
-        with setup_container, ui.card().classes("w-full max-w-2xl"):
-            ui.label("Setup").classes("text-lg font-semibold")
-            path_input = ui.input("Scenario YAML path", value=default_scenario).classes("w-full")
-            start_empty_checkbox = ui.checkbox(
-                "Start empty (watch material propagate through the unit)"
-            )
-            error_label = ui.label("").classes("text-red-600")
+        with setup_container:
+            from dtdc_simulator.interfaces.ui.wizard import create_wizard
 
-            def do_load() -> None:
-                try:
-                    cfg = load_scenario(path_input.value)
-                    cfg.sim.dt_start_empty = start_empty_checkbox.value
-                    facade.configure(cfg)
-                    facade.assemble()
-                    error_label.text = ""
-                    # Operator sliders are (re)built + seeded from the assembled
-                    # snapshot inside TowerView.build() on the next sync -- no
-                    # separate seeding pass needed.
-                    resolve_interval_input.value = cfg.operating_defaults.dt_resolve_interval_s
-                except (
-                    Exception
-                ) as exc:  # noqa: BLE001 - surface load/validation errors to the user
-                    error_label.text = f"{type(exc).__name__}: {exc}"
+            def _on_assembled(cfg) -> None:
+                # Operator sliders are (re)built + seeded from the assembled
+                # snapshot inside TowerView.build() on the next sync; here we only
+                # seed the live DT-resolve-interval control (defined below).
+                resolve_interval_input.value = cfg.operating_defaults.dt_resolve_interval_s
 
-            ui.button("Validate & Assemble", on_click=do_load)
+            create_wizard(facade, template_path=default_scenario, on_assembled=_on_assembled)
 
         with dashboard_container:
             with ui.row().classes("w-full items-center gap-4"):
@@ -277,7 +266,9 @@ def create_app(
 
                 # ---- right: DT axial profiles + live trend plots, filling the
                 # space beside the tall tower column (equal 50/50 width) ----
-                profile_container = ui.column().classes("gap-2").style("flex: 1 1 460px; min-width: 460px")
+                profile_container = (
+                    ui.column().classes("gap-2").style("flex: 1 1 460px; min-width: 460px")
+                )
                 profile_view = DTProfileView(profile_container)
                 with profile_container:
                     ui.label("Trends").classes("hmi-section-title mt-3")
@@ -288,7 +279,10 @@ def create_app(
                     with ui.row().classes("w-full gap-3 flex-wrap"):
                         outlet_hex_plot = ui.echart(
                             {
-                                "title": {"text": "Outlet hexane [ppm]", "textStyle": {"fontSize": 12}},
+                                "title": {
+                                    "text": "Outlet hexane [ppm]",
+                                    "textStyle": {"fontSize": 12},
+                                },
                                 "xAxis": {
                                     "type": "value",
                                     "name": "sim time [s]",
@@ -314,9 +308,7 @@ def create_app(
                                 ],
                                 "tooltip": {"trigger": "axis"},
                             }
-                        ).style(
-                            f"height:{TREND_HEIGHT_PX}px; flex:1 1 200px;"
-                        )
+                        ).style(f"height:{TREND_HEIGHT_PX}px; flex:1 1 200px;")
                         outlet_moist_plot = ui.echart(
                             {
                                 "title": {
@@ -348,9 +340,7 @@ def create_app(
                                 ],
                                 "tooltip": {"trigger": "axis"},
                             }
-                        ).style(
-                            f"height:{TREND_HEIGHT_PX}px; flex:1 1 200px;"
-                        )
+                        ).style(f"height:{TREND_HEIGHT_PX}px; flex:1 1 200px;")
 
                     # Quality is the operator's primary outcome; temperature
                     # diagnostics follow it. Separate plots let each physical
@@ -388,9 +378,7 @@ def create_app(
                                     "legend": {"data": []},
                                     "tooltip": {"trigger": "axis"},
                                 }
-                            ).style(
-                                f"height:{TREND_HEIGHT_PX}px; flex:1 1 250px;"
-                            )
+                            ).style(f"height:{TREND_HEIGHT_PX}px; flex:1 1 250px;")
 
             with ui.expansion("Advanced: full MV table & manual drive", value=False).classes(
                 "w-full"
@@ -403,9 +391,9 @@ def create_app(
                             {Mode.MANUAL.value: "MANUAL", Mode.AUTO.value: "AUTO"},
                             value=Mode.MANUAL.value,
                         )
-                        mv_setpoint_input = ui.number(
-                            label="Manual setpoint", value=0.0
-                        ).classes("w-40")
+                        mv_setpoint_input = ui.number(label="Manual setpoint", value=0.0).classes(
+                            "w-40"
+                        )
 
                         def _update_setpoint_label() -> None:
                             key = mv_select.value
@@ -443,6 +431,14 @@ def create_app(
                         row_key="key",
                         pagination=10,
                     ).classes("w-full")
+
+            if opcua_service is not None:
+                with ui.expansion(
+                    "OPC UA Server — control & address-space browser", value=False
+                ).classes("w-full"):
+                    from dtdc_simulator.interfaces.ui.opcua_panel import create_opcua_panel
+
+                    create_opcua_panel(opcua_service, facade)
 
         # The trend charts now live in the always-visible right column (beside
         # the tower), not in a collapsed expansion, so they draw immediately --
@@ -536,14 +532,10 @@ def create_app(
             if snap.stage_order:
                 last_sid = snap.stage_order[-1]
                 outlet_hex_history.append(
-                    _whole_trend_point(
-                        t_now, outputs.stage_X_hex_ppm[last_sid]
-                    )
+                    _whole_trend_point(t_now, outputs.stage_X_hex_ppm[last_sid])
                 )
                 outlet_moisture_history.append(
-                    _whole_trend_point(
-                        t_now, outputs.stage_X_w_pct[last_sid]
-                    )
+                    _whole_trend_point(t_now, outputs.stage_X_w_pct[last_sid])
                 )
                 for hist in (outlet_hex_history, outlet_moisture_history):
                     while hist and hist[0][0] < window_start:
@@ -568,11 +560,7 @@ def create_app(
                         dq.popleft()
 
             for group_key, (_title, roles) in temperature_groups.items():
-                stage_ids = [
-                    sid
-                    for sid in outputs.stage_T
-                    if snap.stage_roles.get(sid) in roles
-                ]
+                stage_ids = [sid for sid in outputs.stage_T if snap.stage_roles.get(sid) in roles]
                 chart = temp_trend_plots[group_key]
                 chart.options["series"] = [
                     {

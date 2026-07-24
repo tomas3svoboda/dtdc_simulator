@@ -1,0 +1,141 @@
+# DTDC Equipment Envelope — the maximal realistic DTDC that the fixed OPC UA
+# address space and the design validator are built against.
+#
+# PURPOSE
+#   The OPC UA server renders THIS envelope (not the loaded scenario) into a
+#   fixed node tree. Every zone slot below is ALWAYS present at a canonical
+#   path. A given build marks each slot active or placeholder:
+#     - active      -> bound to a live model quantity, Good quality
+#     - placeholder -> present, value = sentinel, StatusCode = Bad_NotConnected,
+#                      sibling `Present` flag = false
+#   A client maps against the envelope ONCE; reconfiguration only flips the
+#   active mask, so tags never need remapping.
+#
+# CAPS ARE LITERATURE-DERIVED. Full cited rationale + page numbers:
+#   app_specifications/DTDC_Equipment_Envelope.md
+# Primary source: Kemper, T.G. (2019) "Solvent Extraction", Ch. 4 of
+#   Edible Oil Processing, 2nd ed. (Desmet Ballestra). In repo:
+#   literature_sources/Kemper_Solvent_Extraction.pdf
+# Cross-checks: Paraíso et al. (2008) COAMO 7-stage DT (Svoboda report);
+#   Coletto et al. (2022) 6-tray base case.
+
+version: 1
+
+# ------------------------------------------------------------------ zones
+# One entry per model role (config/schema.py::StageRole). `id_prefix` + the
+# 1..max_count index give the canonical stage IDs (PD1..PD7, MN1..MN4, ...).
+# `min_count` is the realism floor the validator enforces (Phase 2); the OPC UA
+# superset always emits max_count slots regardless.
+zones:
+  - role: PREDESOLV
+    section: DT              # Desolventiser-Toaster (Objects/DTDC/Toaster)
+    id_prefix: PD
+    min_count: 1
+    max_count: 7            # Kemper p.109: "as many as seven predesolventising trays, or as few as one"
+    vapor_path: BYPASS
+    stage_signals: [T, X_hex, X_w, VaporTemp, Level]
+    per_stage_actuators: [indirect_steam, sweep_arm_speed]
+
+  - role: MAIN
+    section: DT
+    id_prefix: MN
+    min_count: 1            # the top countercurrent tray is "perhaps the most critical tray of the DT" (Kemper p.112)
+    max_count: 4            # Kemper p.111: "A DT will have from one to four countercurrent trays"
+    vapor_path: THROUGH_BED
+    stage_signals: [T, X_hex, X_w, VaporTemp, Level]
+    per_stage_actuators: [indirect_steam, sweep_arm_speed]
+
+  - role: SPARGE
+    section: DT
+    id_prefix: SP
+    min_count: 1            # required whenever direct steam is used
+    max_count: 1            # Kemper p.111 §4.3.3: a single sparge tray
+    vapor_path: STEAM_SOURCE
+    stage_signals: [T, X_hex, X_w, VaporTemp, Level]
+    per_stage_actuators: [indirect_steam, direct_steam, sweep_arm_speed]
+
+  - role: DRYER
+    section: DC             # Dryer-Cooler (Objects/DTDC/DryerCooler)
+    id_prefix: DR
+    min_count: 0            # DC is optional; a DT-only unit is valid
+    max_count: 3            # DC air-drying trays (Kemper p.114-115 §4.4.2; Fig 4.7 shows 2) + headroom
+    vapor_path: THROUGH_BED
+    stage_signals: [T, X_hex, X_w, VaporTemp, Level]
+    per_stage_actuators: [sweep_arm_speed]   # dryer air temp/flow are unit-level, not per-tray
+
+  - role: COOLER
+    section: DC
+    id_prefix: CL
+    min_count: 0
+    max_count: 2            # DC air-cooling trays (Kemper p.116 §4.4.3)
+    vapor_path: THROUGH_BED
+    stage_signals: [T, X_hex, X_w, VaporTemp, Level]
+    per_stage_actuators: [sweep_arm_speed]
+
+# Maximal DT = 7 + 4 + 1 = 12 trays; maximal DC (modeled) = 3 + 2 = 5 trays.
+# Total canonical stage slots = 17.
+
+# ------------------------------------------ NOT SUPPORTED in this version
+# Kemper p.114 §4.4.1 documents DC *steam-drying* trays (conductive, jacketed,
+# like DT predesolv trays but in the DC): "A DC may have as many as five
+# steam-drying trays, or as none." The current model's DC is AIR-CONTACT only
+# (core/dc.py), so it has no steam-drying-tray role.
+#
+# DECIDED 2026-07-24: this version does NOT support DC steam-drying trays. No
+# STEAM_DRYER zone is defined and the OPC UA superset emits no such nodes.
+# Adding them later is an explicit envelope version bump (one-time client remap
+# at that point). See DECISIONS.md and app_specifications/DTDC_Equipment_Envelope.md.
+
+# --------------------------------------------------- unit-level actuators (fixed)
+# Present in every build (not per-stage). Keys match engine/facade.py MV_LIMITS.
+unit_actuators:
+  - {key: feed_flow_rate,  units: "kg/s", min: 0.0, max: 100.0}
+  - {key: heated_air_temp, units: "K",    min: 280.0, max: 450.0}   # DRYER inlet air
+  - {key: heated_air_flow, units: "kg/s", min: 0.0, max: 200.0}     # DRYER
+  - {key: ambient_air_flow, units: "kg/s", min: 0.0, max: 800.0}    # COOLER
+
+# --------------------------------------------------- disturbance variables (fixed)
+# SimulationInputs/<key>. Config-independent; always present & active.
+disturbances:
+  - {key: feed_temperature,          units: "K"}
+  - {key: feed_moisture,             units: "kg/kg dry solid"}
+  - {key: feed_hexane,               units: "kg/kg dry solid"}
+  - {key: feed_oil,                  units: "kg/kg dry solid"}
+  - {key: ambient_air_temp,          units: "K"}
+  - {key: ambient_relative_humidity, units: "0-1"}
+
+# ------------------------------------------------------------------ KPIs (fixed)
+# Measurements/KPI/<name>. Config-independent; always present & active.
+kpis:
+  - residual_hexane
+  - meal_moisture
+  - steam_consumption
+  - throughput
+  - exhaust_hexane
+  - direct_steam
+  - indirect_heating
+  - drying_air_heating
+  - total_energy
+  - outlet_vapor
+  - outlet_vapor_hexane
+  - outlet_vapor_water
+  - condenser_duty
+
+# ------------------------------------------------- control-loop superset (fixed)
+# Control/<tag>/{Mode,SP,PV,OP,Units,Status,Description,Min,Max}. The full set of
+# PLC loop tags any build can expose (engine/control_interface.py). A loop is
+# active when its bound zone/actuators exist in the build, else placeholder.
+control_loops:
+  - {tag: FIC_DT_FEED,        units: "kg/s", active_when: always,          desc: "Wet meal dry-solids feed flow"}
+  - {tag: FIC_DT_PD_IND_STM,  units: "kW",   active_when: "PREDESOLV>=1",  desc: "Predesolventizer indirect-steam duty"}
+  - {tag: FIC_DT_MN_IND_STM,  units: "kW",   active_when: "MAIN+SPARGE>=1", desc: "Main/toast indirect-steam duty"}
+  - {tag: FIC_DT_DIRECT_STM,  units: "kg/s", active_when: "SPARGE>=1",     desc: "Sparge direct-steam mass flow"}
+  - {tag: SIC_DT_SHAFT,       units: "rpm",  active_when: always,          desc: "Common central-shaft speed"}
+  - {tag: TIC_DC_DRY_AIR,     units: "degC", active_when: "DRYER>=1",      desc: "Dryer inlet-air temperature"}
+  - {tag: FIC_DC_DRY_AIR,     units: "kg/s", active_when: "DRYER>=1",      desc: "Dryer air mass flow"}
+  - {tag: FIC_DC_COOL_AIR,    units: "kg/s", active_when: "COOLER>=1",     desc: "Cooler air mass flow"}
+  # ZIC_<boundary>: one per canonical inter-stage boundary in the max cascade,
+  # active only where the build marks that boundary a CONTROLLED device.
+  # Canonical boundary sequence is derived in Phase 1 from the stage order
+  # PD1..PD7 -> MN1..MN4 -> SP1 -> DR1..DR3 -> CL1..CL2 -> PRODUCT (16 + 1 slots).
+  - {tag: "ZIC_<boundary>",   units: "%",    active_when: "boundary.controlled", desc: "Solids-transfer device position"}
